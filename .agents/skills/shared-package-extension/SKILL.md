@@ -175,13 +175,15 @@ client using the new protocol connects through a relay running the old one.
 "relay sync" section confirming `discovery.py` and `protocol.py` were reviewed and
 updated if necessary. Community PR reviewers: look for this section.
 
-## Procedure D: Workspace Dependency Version Bumping
+## Procedure D: Workspace Dependency Version Alignment
 
-When `unifi-core` is released at a new version, all dependents must be updated in
-lockstep. `uv` workspace constraints enforce Python 3.13+ and will reject inconsistent
-version pins.
+When `unifi-core` or `unifi-mcp-shared` is released at a new version, downstream
+packages may need their published dependency ranges tightened before tags are placed.
+This is required when the downstream release uses API surface that only exists in the
+new upstream release. `uv` workspace sources make local tests pass, but PyPI users get
+the dependency ranges embedded in the wheel metadata.
 
-**Dependent `pyproject.toml` files to update (five total):**
+**Core-dependent `pyproject.toml` files to audit:**
 
 - `packages/unifi-mcp-shared/pyproject.toml`
 - `apps/network/pyproject.toml`
@@ -189,20 +191,26 @@ version pins.
 - `apps/access/pyproject.toml`
 - `apps/api/pyproject.toml`
 
+**Shared-dependent `pyproject.toml` files to audit:**
+
+- `apps/network/pyproject.toml`
+- `apps/protect/pyproject.toml`
+- `apps/access/pyproject.toml`
+- `packages/unifi-mcp-relay/pyproject.toml`
+
 **Steps:**
 
-1. Confirm the new `unifi-core` version (e.g., `0.4.0`).
-2. Update the `unifi-core` entry in each of the five files:
+1. Confirm the new upstream package line (for example, `unifi-core` `0.4.x`).
+2. Identify which downstream packages are being released because they use that new upstream code.
+3. Update only those downstream dependency ranges:
    ```toml
-   unifi-core = ">=0.4.0"
+   "unifi-core[protect]>=0.4,<0.5"
+   "unifi-mcp-shared>=0.5,<0.6"
    ```
-3. From the repo root, run `uv sync` to validate workspace constraints resolve cleanly.
-   A failure here usually means a file was missed.
-4. Commit all six files together (the `unifi-core` bump commit plus all five dependents)
-   in a single commit. Never split — an intermediate state where some dependents still
-   reference the old version breaks CI for any checkout between the two commits.
-5. Tag `unifi-core` before tagging any dependent package. Dependency order and no-batching
-   rules apply (see tag-push ordering gotcha in project memory).
+4. From the repo root, run `uv lock --check` to validate workspace constraints resolve cleanly.
+5. Commit dependency-bound changes before creating local release tags.
+6. Tag `unifi-core` before tagging any dependent package. Dependency order and no-batching
+   rules apply (see `monorepo-release-pipeline`).
 
 ## Cross-Cutting Gotchas
 
@@ -215,10 +223,10 @@ which misleads debugging toward the symptom rather than the cause.
 sides appear healthy until a real client exercises the changed protocol path. Manual
 review on every protocol-touching PR is the only protection.
 
-**All five pyproject.toml files, every time.** Forgetting even one creates a workspace
-inconsistency that `uv` may not surface immediately but will fail in CI or on a fresh
-`uv sync`. Use `grep -r "unifi-core" apps/ packages/unifi-mcp-shared/` to audit
-before committing.
+**Dependency ranges are release artifacts.** A downstream release can publish
+successfully while still installing an older upstream package if its wheel metadata
+allows only the old line. Use `rg "unifi-core|unifi-mcp-shared" apps/ packages/` to
+audit ranges before tagging coordinated releases.
 
 **DI parameters document the contract.** When a new shared entrypoint accepts injected
 callables, name the parameters descriptively (`get_tools_fn`, `permission_checker`) and

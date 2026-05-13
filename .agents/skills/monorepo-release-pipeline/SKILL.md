@@ -9,9 +9,9 @@ allowed-tools: Read, Edit, Write, Bash, Grep, Glob
 
 # Monorepo Release Pipeline
 
-The unifi-mcp repo ships six independently versioned Python packages: `unifi-core`
+The unifi-mcp repo ships seven independently versioned Python packages: `unifi-core`
 and `unifi-mcp-shared` live under `packages/`; `unifi-mcp-network`, `unifi-mcp-protect`,
-and `unifi-mcp-access` live under `apps/`; `unifi-mcp-relay` lives under `packages/`
+`unifi-mcp-access`, and `unifi-api-server` live under `apps/`; `unifi-mcp-relay` lives under `packages/`
 alongside core and shared. Each has its own PyPI identity, tag namespace, publish
 workflow, and release-notes scope. Getting the release sequence wrong leaves downstream
 packages referencing non-existent PyPI versions or produces contaminated release notes
@@ -30,15 +30,16 @@ that bleed across package boundaries.
 
 | Package | Directory | Tag namespace | Publish workflow |
 |---|---|---|---|
-| `unifi-core` | `packages/unifi-core/` | `core/v*` | `publish-core.yml` |
-| `unifi-mcp-shared` | `packages/unifi-mcp-shared/` | `shared/v*` | `publish-shared.yml` |
-| `unifi-mcp-network` | `apps/network/` | `network/v*` | `publish-network.yml` |
-| `unifi-mcp-protect` | `apps/protect/` | `protect/v*` | `publish-protect.yml` |
-| `unifi-mcp-access` | `apps/access/` | `access/v*` | `publish-access.yml` |
-| `unifi-mcp-relay` | `packages/unifi-mcp-relay/` | `relay/v*` | `publish-relay.yml` |
+| `unifi-core` | `packages/unifi-core/` | `core/v*` | `release-core.yml` |
+| `unifi-mcp-shared` | `packages/unifi-mcp-shared/` | `shared/v*` | `release-shared.yml` |
+| `unifi-mcp-network` | `apps/network/` | `network/v*` | `release-network.yml` |
+| `unifi-mcp-protect` | `apps/protect/` | `protect/v*` | `release-protect.yml` |
+| `unifi-mcp-access` | `apps/access/` | `access/v*` | `release-access.yml` |
+| `unifi-api-server` | `apps/api/` | `api/v*` | `release-api.yml` |
+| `unifi-mcp-relay` | `packages/unifi-mcp-relay/` | `relay/v*` | `release-relay.yml` |
 
-When adding a new package, extend this table and complete the new-package checklist
-in Procedure D before pushing any tag.
+When adding a new package, extend this table and the release-notes path configuration
+before pushing any tag.
 
 ## Procedure A: Determine Release Scope
 
@@ -61,7 +62,7 @@ git log --oneline network/v$(git tag -l 'network/v*' | sort -V | tail -1)..HEAD 
 | What changed | Tags required |
 |---|---|
 | `packages/unifi-mcp-shared/` only | `shared/v*` → then `network/v*`, `protect/v*`, `access/v*`, `relay/v*` |
-| `packages/unifi-core/` only | `core/v*` → then `shared/v*` → then all downstream packages |
+| `packages/unifi-core/` only | `core/v*` → then `shared/v*` → then all downstream packages, including `api/v*` |
 | One app only (e.g., `apps/protect/`) | `protect/v*` only |
 | Multiple apps | One tag per changed app, in dependency order |
 | Plugin-only changes (manifest/config updates) | Patch release for cache invalidation (e.g., `network/v0.14.13` → `network/v0.14.14`) |
@@ -152,6 +153,7 @@ influence any package's version — a `network/v0.14.13` tag will contaminate
 | relay | `relay/v*` |
 | unifi-core | `core/v*` |
 | unifi-mcp-shared | `shared/v*` |
+| api | `api/v*` |
 
 ### pyproject.toml configuration
 
@@ -178,6 +180,41 @@ raw-options.fallback_version = "0.0.0"
 
 Each package's `--match` pattern must be scoped to its own tag prefix from the
 Package Map. Never share or widen the `--match` pattern across packages.
+
+## Procedure D: Align Cross-Package Dependency Bounds Before Tagging
+
+Before creating release tags, inspect every downstream `pyproject.toml` dependency
+range for packages being released together. Tag order only solves publication timing;
+the wheel metadata must also allow the newly published upstream version.
+
+**Rule:** If a downstream package requires code that is only present in the new
+`unifi-core` or `unifi-mcp-shared` release, update its dependency range before
+placing tags. Do not assume pip installs the newest upstream release. It installs
+the newest version permitted by the downstream wheel metadata.
+
+Examples:
+
+```toml
+# New Protect/API code needs unifi-core 0.3.x models and managers.
+"unifi-core[protect]>=0.3,<0.4"
+"unifi-core[network,protect,access]>=0.3,<0.4"
+
+# New app code needs unifi-mcp-shared 0.5.x helpers.
+"unifi-mcp-shared>=0.5,<0.6"
+```
+
+### Dependency-bound checklist
+
+1. Identify upstream packages that changed (`unifi-core`, `unifi-mcp-shared`).
+2. Identify downstream packages being tagged because they use that upstream code.
+3. Update downstream dependency ranges in `apps/*/pyproject.toml` and
+   `packages/unifi-mcp-relay/pyproject.toml` as needed.
+4. Run `uv lock --check` after the edits.
+5. Commit dependency-bound changes before creating local tags.
+
+If dependency bounds are stale, the release can publish successfully but install an
+older upstream package that lacks the required API surface. Treat dependency-bound
+alignment as part of the release artifact, not as optional cleanup.
 
 ### Verification before tagging
 
@@ -214,7 +251,7 @@ tags when the package is built (during CI), not when it is installed. The tag mu
 be reachable on the exact commit being built. If CI triggers before the tag propagates
 to GitHub, the version will be wrong even if the tag exists locally.
 
-## Procedure D: Manifest Bumper — args[2] vs args[0] Correction
+## Procedure E: Manifest Bumper — args[2] vs args[0] Correction
 
 The manifest bumper workflow (`bump-plugin-versions.yml`) rewrites version fields in
 `plugin.json` and `server.json` files after a successful publish. A past bug (PR #227)
@@ -242,7 +279,7 @@ index 0 would corrupt the flag or field name.
 manifest commit in GitHub. The `plugin.json` and `server.json` should have updated
 version strings (e.g., `"version": "0.14.14"`), NOT corrupted field names.
 
-## Procedure E: Dependency-Ordered Tag Pushing
+## Procedure F: Dependency-Ordered Tag Pushing
 
 The dependency graph:
 
@@ -251,6 +288,7 @@ unifi-core  →  unifi-mcp-shared  →  unifi-mcp-network
                                   →  unifi-mcp-protect
                                   →  unifi-mcp-access
                                   →  unifi-mcp-relay
+            →  unifi-api-server
 ```
 
 **Rule:** Push upstream tags first. Wait for PyPI to confirm the package is live
@@ -271,11 +309,12 @@ git tag shared/v0.4.0
 git push origin shared/v0.4.0
 # WAIT: confirm https://pypi.org/project/unifi-mcp-shared/ shows 0.4.0
 
-# Step 3 — app servers (siblings; order among them doesn't matter)
+# Step 3 — app servers and API (siblings after core/shared are live)
 git tag network/v0.14.13
 git tag protect/v0.3.5
 git tag access/v0.2.4
-git push origin network/v0.14.13 protect/v0.3.5 access/v0.2.4
+git tag api/v0.2.1
+git push origin network/v0.14.13 protect/v0.3.5 access/v0.2.4 api/v0.2.1
 # Siblings can be pushed together — same dependency level
 
 # Step 4 — relay
@@ -293,7 +332,7 @@ npm release flow using OIDC via GitHub Actions. Apply the same ordering principl
 if the worker depends on a Python package version, confirm PyPI is updated before
 pushing the worker tag.
 
-## Procedure F: generate_release_notes.py Path Configuration
+## Procedure G: generate_release_notes.py Path Configuration
 
 GitHub's built-in `--generate-notes` option includes every PR merged between the
 previous tag and the current tag in the entire repo — regardless of which files
@@ -320,7 +359,7 @@ APP_CONFIGS = {
             PathGroup(
                 "Release Infrastructure",
                 (
-                    ".github/workflows/publish-network.yml",
+                    ".github/workflows/release-network.yml",
                     ".github/workflows/docker-network.yml",
                     ".github/workflows/test-network.yml",
                     ".github/workflows/bump-plugin-versions.yml",
@@ -340,7 +379,7 @@ Each app server entry should include:
 2. Shared dependency directories (`packages/unifi-core/`, `packages/unifi-mcp-shared/`)
 3. Its own publish/test/docker workflows as Release Infrastructure
 
-## Procedure G: Release Validation
+## Procedure H: Release Validation
 
 After pushing a tag, verify it resolved correctly before closing the work.
 
@@ -376,9 +415,9 @@ version. Symptom: `pip install unifi-mcp-network==0.14.13` installs a package th
 prints `0.3.5` from `importlib.metadata`. Fix: tighten the `--match` pattern in
 `raw-options.git_describe_command` in `pyproject.toml` and rebuild.
 
-**PR merge is NOT the release trigger — the tag push is.** `hatch-vcs` reads git tags at build time to generate `_version.py`. Merging a PR does NOT trigger a release. If the tag is never pushed, PyPI stays on the old version with no error — the build succeeds but installs the previous release. The tag push IS the release trigger. (Session 3: `core/v0.1.2` was never tagged; PyPI stayed at 0.1.1 until the tag was pushed manually.) Always run Procedure G after tagging.
+**PR merge is NOT the release trigger — the tag push is.** `hatch-vcs` reads git tags at build time to generate `_version.py`. Merging a PR does NOT trigger a release. If the tag is never pushed, PyPI stays on the old version with no error — the build succeeds but installs the previous release. The tag push IS the release trigger. (Session 3: `core/v0.1.2` was never tagged; PyPI stayed at 0.1.1 until the tag was pushed manually.) Always run Procedure H after tagging.
 
-**Silent version freeze.** If a tag is missing, `hatch-vcs` falls back to `fallback_version = "0.0.0"` or the last matching tag. There is no error at merge time. The failure surfaces only when a user installs and notices the wrong version. Always run Procedure G after tagging.
+**Silent version freeze.** If a tag is missing, `hatch-vcs` falls back to `fallback_version = "0.0.0"` or the last matching tag. There is no error at merge time. The failure surfaces only when a user installs and notices the wrong version. Always run Procedure H after tagging.
 
 **Missing tag causes broken downstream install.** If `unifi-core` code is merged but
 `core/vX.Y.Z` is never pushed, downstream packages requesting `unifi-core>=X.Y.Z`

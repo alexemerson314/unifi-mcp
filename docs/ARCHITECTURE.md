@@ -8,6 +8,7 @@ unifi-mcp/
     network/              # UniFi Network MCP server
     protect/              # UniFi Protect MCP server
     access/               # UniFi Access MCP server
+    api/                  # REST + GraphQL API server
   packages/
     unifi-core/           # Shared UniFi controller connectivity
     unifi-mcp-shared/     # Shared MCP server patterns
@@ -32,7 +33,7 @@ Low-level UniFi controller connectivity. No MCP dependency.
 | `retry.py` | Retry logic with exponential backoff |
 | `exceptions.py` | Shared exception types |
 
-Used by: `apps/network`, `apps/protect`, `apps/access`.
+Used by: `apps/network`, `apps/protect`, `apps/access`, `apps/api`.
 
 ### unifi-mcp-shared
 

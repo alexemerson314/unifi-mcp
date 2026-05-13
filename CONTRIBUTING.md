@@ -182,9 +182,12 @@ Tests use `pytest-asyncio` for async support and `aioresponses` for HTTP mocking
 
 ## Release Process (Maintainers)
 
-1. Run `make pre-commit` from root
-2. Create a GitHub Release with the appropriate tag
-3. CI publishes to PyPI and builds Docker images
+1. Run `make pre-commit` from root.
+2. Determine release scope by package tag namespace (`core/v*`, `shared/v*`, `network/v*`, `protect/v*`, `access/v*`, `api/v*`, `relay/v*`).
+3. If a downstream package needs code from a newly released upstream package, update its `pyproject.toml` dependency range before tagging. For example, Protect/API releases that require new `unifi-core` models must allow the new `unifi-core` line.
+4. Run `uv lock --check` and commit any dependency-bound changes before creating local tags.
+5. Push tags in dependency order: `core` first, then `shared`, then app/API packages, then `relay`. Wait for each upstream package to appear on PyPI before pushing dependents.
+6. CI publishes to PyPI, builds Docker images where applicable, and creates GitHub Releases.
 
 ## Questions?
 

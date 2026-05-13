@@ -224,6 +224,7 @@ make pre-commit   # format + lint + sync-skills + test
 ### Version and Manifest Rules
 
 - Version is derived from git tags via `hatch-vcs`. MUST NOT manually edit version in `pyproject.toml`.
+- Before release tags, update downstream `pyproject.toml` dependency ranges when a downstream package requires newly tagged `unifi-core` or `unifi-mcp-shared` code; pip only installs versions allowed by the published wheel metadata.
 - Each app's `tools_manifest.json` MUST be regenerated (`make manifest`) and committed before release.
 
 ## Patterns
