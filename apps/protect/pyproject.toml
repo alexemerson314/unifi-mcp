@@ -8,7 +8,7 @@ dependencies = [
     "unifi-mcp-shared>=0.4,<0.5",
     # Protect managers in unifi-core import uiprotect; pull it in via the
     # [protect] extra rather than declaring uiprotect here directly.
-    "unifi-core[protect]>=0.2,<0.3",
+    "unifi-core[protect]>=0.3,<0.4",
     "mcp[cli]>=1.26.0,<2",
     "aiohttp>=3.13.4",
     "pyyaml>=6.0",
