@@ -5,7 +5,7 @@
   <img src="../../assets/hero-protect.svg" alt="UniFi Protect MCP Server" width="720">
 </p>
 
-MCP server exposing UniFi Protect tools for LLMs, agents, and automation platforms. Query cameras, events, smart detections, recordings, lights, sensors, chimes, and the Alarm Manager -- with safe-by-default permissions and preview-before-confirm for all mutations.
+MCP server exposing UniFi Protect tools for LLMs, agents, and automation platforms. Query cameras, events, smart detections, recordings, lights, sensors, chimes, Known Faces, and the Alarm Manager -- with safe-by-default permissions and preview-before-confirm for all mutations.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/downloads/)
@@ -129,6 +129,7 @@ Add to `claude_desktop_config.json`:
 - **Events** -- query historical events, smart detections (person/vehicle/animal/package), thumbnails
 - **Real-time streaming** -- websocket event buffer with MCP resource subscriptions and polling
 - **Recordings** -- status, availability, clip export with timelapse support
+- **Known Faces** -- list, rename, merge, and remove face recognition groups
 - **Devices** -- lights (brightness, PIR sensitivity), sensors (temperature, humidity, motion), chimes (volume, trigger)
 - **Liveviews** -- list and inspect multi-camera layouts
 - **System** -- NVR info, health metrics, firmware status, connected viewers
@@ -195,7 +196,7 @@ Compact mode is the recommended default when building summaries or feeding event
 
 - [Configuration](docs/configuration.md) -- Full env var reference, YAML config, Protect-specific options
 - [Permissions](docs/permissions.md) -- Permission system, category defaults, how to enable mutations
-- [Tool Catalog](docs/tools.md) -- All 38 tools organized by category
+- [Tool Catalog](docs/tools.md) -- All 43 tools organized by category
 - [Event Streaming](docs/events.md) -- Real-time event architecture, MCP resources, polling
 - [Troubleshooting](docs/troubleshooting.md) -- Connection issues, SSL, missing tools
 

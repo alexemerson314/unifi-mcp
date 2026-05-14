@@ -42,6 +42,7 @@ Protect defaults all mutations to denied because operations directly affect phys
 | `events` | — | `UNIFI_POLICY_PROTECT_EVENTS_UPDATE` | — | Acknowledge/favorite |
 | `lights` | — | `UNIFI_POLICY_PROTECT_LIGHTS_UPDATE` | — | Brightness, sensitivity, duration |
 | `liveviews` | `UNIFI_POLICY_PROTECT_LIVEVIEWS_CREATE` | — | `UNIFI_POLICY_PROTECT_LIVEVIEWS_DELETE` | Not supported by uiprotect API |
+| `recognition` | — | `UNIFI_POLICY_PROTECT_RECOGNITION_UPDATE` | `UNIFI_POLICY_PROTECT_RECOGNITION_DELETE` | Known Face rename, merge, delete |
 | `recordings` | — | — | `UNIFI_POLICY_PROTECT_RECORDINGS_DELETE` | Not supported by API |
 | `sensors` | — | `UNIFI_POLICY_PROTECT_SENSORS_UPDATE` | — | Hardware devices |
 | `system` | — | `UNIFI_POLICY_PROTECT_SYSTEM_UPDATE` | — | NVR system settings |
@@ -63,6 +64,7 @@ UNIFI_POLICY_PROTECT_DELETE=false
 UNIFI_POLICY_PROTECT_CAMERAS_UPDATE=true
 UNIFI_POLICY_PROTECT_LIGHTS_UPDATE=true
 UNIFI_POLICY_PROTECT_CHIMES_UPDATE=true
+UNIFI_POLICY_PROTECT_RECOGNITION_UPDATE=true
 ```
 
 ### Lock down deletes and creates

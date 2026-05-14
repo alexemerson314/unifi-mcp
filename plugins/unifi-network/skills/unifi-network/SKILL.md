@@ -5,7 +5,7 @@ description: How to manage UniFi network infrastructure — devices, clients, fi
 
 # UniFi Network MCP Server
 
-You have access to a UniFi Network MCP server that lets you query and manage a UniFi Network Controller. It provides 91 tools covering devices, clients, firewall, VPN, routing, WLANs, statistics, and more.
+You have access to a UniFi Network MCP server that lets you query and manage a UniFi Network Controller. It provides 169 tools covering devices, clients, firewall, VPN, routing, WLANs, statistics, and more.
 
 ## Tool Discovery
 
@@ -86,4 +86,4 @@ Cameras and access readers appear as network clients — use `unifi_lookup_by_ip
 
 ## Tool Reference
 
-For the complete list of all 91 tools organized by category with descriptions, tips, and common scenarios, read `references/network-tools.md`.
+For the complete list of all 169 tools organized by category with descriptions, tips, and common scenarios, read `references/network-tools.md`.

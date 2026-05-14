@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "Shared MCP server patterns: permissions, confirmation, lazy loading, config"
 requires-python = ">=3.13"
 dependencies = [
-    "unifi-core",
+    "unifi-core>=0.3.2,<0.4",
     "mcp[cli]>=1.26.0,<2",
     "omegaconf>=2.3.0",
     "pyyaml>=6.0",

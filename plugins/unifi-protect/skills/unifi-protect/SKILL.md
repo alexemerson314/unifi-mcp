@@ -1,11 +1,11 @@
 ---
 name: unifi-protect
-description: How to manage UniFi Protect cameras and NVR — view cameras, smart detections, recordings, snapshots, lights, sensors, and the Alarm Manager. Use this skill when the user mentions UniFi cameras, security cameras, NVR, recordings, motion detection, person detection, snapshots, RTSP streams, floodlights, sensors, chimes, arming/disarming the alarm, or any UniFi Protect task.
+description: How to manage UniFi Protect cameras and NVR — view cameras, smart detections, recordings, snapshots, lights, sensors, Known Faces, and the Alarm Manager. Use this skill when the user mentions UniFi cameras, security cameras, NVR, recordings, motion detection, person detection, face recognition, Known Faces, snapshots, RTSP streams, floodlights, sensors, chimes, arming/disarming the alarm, or any UniFi Protect task.
 ---
 
 # UniFi Protect MCP Server
 
-You have access to a UniFi Protect MCP server that lets you query and manage a UniFi Protect NVR. It provides 38 tools covering cameras, smart detections, recordings, snapshots, lights, sensors, chimes, and the Alarm Manager (arm/disarm).
+You have access to a UniFi Protect MCP server that lets you query and manage a UniFi Protect NVR. It provides 43 tools covering cameras, smart detections, recordings, snapshots, lights, sensors, chimes, Known Faces, and the Alarm Manager (arm/disarm).
 
 ## Tool Discovery
 
@@ -31,6 +31,8 @@ The server uses **lazy loading** by default — only meta-tools are registered i
 - `UNIFI_POLICY_PROTECT_LIGHTS_UPDATE=true` — light brightness, PIR sensitivity
 - `UNIFI_POLICY_PROTECT_CHIMES_UPDATE=true` — chime volume, trigger
 - `UNIFI_POLICY_PROTECT_ALARM_UPDATE=true` — arm/disarm the Alarm Manager (Protect 6.1+)
+- `UNIFI_POLICY_PROTECT_RECOGNITION_UPDATE=true` — Known Face rename/merge
+- `UNIFI_POLICY_PROTECT_RECOGNITION_DELETE=true` — Known Face deletion
 
 **Confirmation flow** — every mutation uses preview-then-confirm:
 1. Default call → returns preview of what would change
@@ -51,6 +53,7 @@ All tools return: `{"success": true, "data": ...}`, `{"success": false, "error":
 - **Real-time events:** `protect_recent_events` reads from websocket buffer instantly (no API call). Buffer holds ~100 events with 5-minute TTL. Use `protect_list_events` for historical queries.
 - **Video export:** `protect_export_clip` returns metadata (not video data — too large for MCP). Max 2 hours, supports timelapse (fps: 4=60x, 8=120x, 20=300x)
 - **PTZ:** Only zoom works via API. For pan/tilt, use `protect_ptz_preset` with saved positions
+- **Known Faces:** Use `protect_list_known_faces` to inspect face groups before rename, merge, or delete mutations
 
 ## Efficiency Tips
 
@@ -81,4 +84,4 @@ Cameras are network clients — if a camera appears offline, the Network server 
 
 ## Tool Reference
 
-For the complete list of all 38 tools organized by category with descriptions, tips, and common scenarios, read `references/protect-tools.md`.
+For the complete list of all 43 tools organized by category with descriptions, tips, and common scenarios, read `references/protect-tools.md`.

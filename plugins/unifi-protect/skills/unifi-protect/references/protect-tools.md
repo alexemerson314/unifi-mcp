@@ -188,7 +188,7 @@ Controls the UniFi Protect Alarm Manager (Protect 6.1+). Requires arm profiles c
 
 ## Known Faces
 
-Lists assigned UniFi Protect Known Faces / named face recognition groups. Read-only; returns metadata and controller image references only.
+Lists and manages UniFi Protect Known Faces / named face recognition groups. Read tools return metadata and controller image references only; mutations use preview-then-confirm.
 
 <!-- AUTO:tools:recognition -->
 4 tools.
@@ -203,6 +203,7 @@ Lists assigned UniFi Protect Known Faces / named face recognition groups. Read-o
 
 **Tips:**
 - Use `protect_list_known_faces` to discover configured face labels and last-seen timestamps.
+- Use `protect_update_known_face` for metadata changes, `protect_merge_known_faces` to consolidate duplicate groups, and `protect_delete_known_face` only after previewing the exact group.
 - Image fields are controller references only; the tool does not fetch or return image bytes.
 
 ---

@@ -18,8 +18,8 @@ Leverage agents and agentic AI workflows to manage your UniFi deployment.
 
 | Server | Status | Tools | Package |
 |--------|--------|-------|---------|
-| [Network](apps/network/) | Stable | 161 | [`unifi-network-mcp`](https://pypi.org/project/unifi-network-mcp/) |
-| [Protect](apps/protect/) | Beta | 34 | [`unifi-protect-mcp`](https://pypi.org/project/unifi-protect-mcp/) |
+| [Network](apps/network/) | Stable | 169 | [`unifi-network-mcp`](https://pypi.org/project/unifi-network-mcp/) |
+| [Protect](apps/protect/) | Beta | 43 | [`unifi-protect-mcp`](https://pypi.org/project/unifi-protect-mcp/) |
 | [Access](apps/access/) | Beta | 29 | [`unifi-access-mcp`](https://pypi.org/project/unifi-access-mcp/) |
 
 ## Cloud Relay
@@ -35,7 +35,7 @@ The relay bridges your local MCP servers to a Cloudflare Worker, letting cloud a
 
 | Component | Status | Package |
 |-----------|--------|---------|
-| [API Server](apps/api/) | Beta (0.1.0) | [`unifi-api-server`](https://pypi.org/project/unifi-api-server/) · [GHCR image](https://github.com/sirkirby/unifi-mcp/pkgs/container/unifi-api-server) |
+| [API Server](apps/api/) | Beta | [`unifi-api-server`](https://pypi.org/project/unifi-api-server/) · [GHCR image](https://github.com/sirkirby/unifi-mcp/pkgs/container/unifi-api-server) |
 
 `unifi-api-server` is a standalone HTTP service exposing the same UniFi capabilities as the MCP servers, but as a REST + GraphQL API for desktop apps, dashboards, and any consumer that doesn't speak MCP. It runs **independently** of the MCP servers — both share the `unifi-core` manager packages, neither depends on the other being running. See [`apps/api/README.md`](apps/api/README.md) for quick-start and deployment patterns.
 
@@ -197,8 +197,8 @@ This is a monorepo with shared packages:
 
 ```
 apps/
-  network/          # UniFi Network MCP server (stable, 166 tools)
-  protect/          # UniFi Protect MCP server (beta, 38 tools)
+  network/          # UniFi Network MCP server (stable, 169 tools)
+  protect/          # UniFi Protect MCP server (beta, 43 tools)
   access/           # UniFi Access MCP server (beta, 29 tools)
 packages/
   unifi-core/       # Shared UniFi connectivity (auth, detection, retry)

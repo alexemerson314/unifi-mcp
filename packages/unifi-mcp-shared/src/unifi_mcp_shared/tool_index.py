@@ -111,7 +111,7 @@ def get_tool_index(
     """Get the tool index, optionally filtered to reduce response size.
 
     By default returns tool names and descriptions without full schemas
-    (~38K chars for 166 tools vs ~127K with schemas).
+    (~38K chars for 169 tools vs ~127K with schemas).
 
     In lazy loading mode, reads tool metadata from a static manifest file
     (tools_manifest.json) generated at build time.

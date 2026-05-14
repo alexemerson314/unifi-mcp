@@ -1,6 +1,6 @@
 # Tool Catalog
 
-The UniFi Protect MCP server exposes 38 tools, all prefixed with `protect_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
+The UniFi Protect MCP server exposes 43 tools, all prefixed with `protect_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
 
 For machine-readable tool metadata, call the `protect_tool_index` meta-tool at runtime, or inspect `src/unifi_protect_mcp/tools_manifest.json`.
 
@@ -79,6 +79,13 @@ Controls the UniFi Protect Alarm Manager (Protect 6.1+). Requires arm profiles t
 - `protect_alarm_get_status` -- Current armed/disarmed state across all profiles
 - `protect_alarm_arm` -- Arm the system for a given profile (confirm required; defaults to default profile)
 - `protect_alarm_disarm` -- Disarm the system for a given profile (confirm required; defaults to default profile)
+
+## Known Faces (4 tools)
+
+- `protect_list_known_faces` -- List assigned and optionally unlabeled face recognition groups
+- `protect_update_known_face` -- Update Known Face metadata such as name, description, and notifications (confirm required)
+- `protect_merge_known_faces` -- Merge one face group into another (confirm required)
+- `protect_delete_known_face` -- Delete or remove a face recognition group (confirm required)
 
 ## System (4 tools)
 
