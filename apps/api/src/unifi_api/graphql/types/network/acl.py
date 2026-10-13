@@ -19,6 +19,7 @@ from dataclasses import asdict
 from typing import Any
 
 import strawberry
+from unifi_core.network.models.acl import read_mask_fields
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -42,6 +43,10 @@ class AclRule:
     destination_type: str | None
     source_macs: list[str]
     destination_macs: list[str]
+    source_netmask: int | None
+    destination_netmask: int | None
+    source_mac_mask: str | None
+    destination_mac_mask: str | None
 
     @classmethod
     def render_hint(cls, kind: str) -> dict:
@@ -66,6 +71,8 @@ class AclRule:
             src_macs = []
         if not isinstance(dst_macs, list):
             dst_macs = []
+        src_mask, src_netmask = read_mask_fields(source)
+        dst_mask, dst_netmask = read_mask_fields(destination)
         return cls(
             id=_get(obj, "_id") or _get(obj, "id"),
             name=_get(obj, "name"),
@@ -77,6 +84,10 @@ class AclRule:
             destination_type=destination.get("type"),
             source_macs=list(src_macs),
             destination_macs=list(dst_macs),
+            source_netmask=src_netmask,
+            destination_netmask=dst_netmask,
+            source_mac_mask=src_mask,
+            destination_mac_mask=dst_mask,
         )
 
     def to_dict(self) -> dict:

@@ -11,21 +11,25 @@ from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
 from unifi_core.confirmation import toggle_preview, update_preview
+from unifi_core.network.managers.client_manager import (
+    FixedApAuthError,
+    FixedApNotFoundError,
+    FixedApOperationError,
+    FixedApValidationError,
+)
 from unifi_core.network.models._actions import (
     AuthorizeGuestInput,
     BlockClientInput,
     ForceReconnectClientInput,
     ForgetClientInput,
     RenameClientInput,
+    SetClientFixedApInput,
     SetClientIpSettingsInput,
     UnauthorizeGuestInput,
     UnblockClientInput,
 )
-from unifi_core.network.models.clients import (
-    blocked_client_from_controller,
-    client_from_controller,
-    client_lookup_from_controller,
-)
+from unifi_core.network.models.clients import blocked_client_from_controller, client_lookup_from_controller
+from unifi_core.network.read_views import shape_client_details, shape_client_list
 
 # Import the global FastMCP server instance, config, and managers
 from unifi_network_mcp.runtime import client_manager, server
@@ -35,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 @server.tool(
     name="unifi_lookup_by_ip",
-    description="Quick IP-to-hostname lookup. Returns only essential fields (hostname, name, MAC) to minimize token usage.",
+    description="Quick IP-to-client lookup. Returns essential fields (hostname, name, mac, is_online, last_seen) to minimize token usage.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def lookup_by_ip(
@@ -61,18 +65,30 @@ async def lookup_by_ip(
             "error": f"No client found with IP: {ip_address}",
         }
     except Exception as e:
-        logger.error("Error looking up client by IP %s: %s", ip_address, e, exc_info=True)
+        logger.error("Error looking up client by IP [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to look up client by IP {ip_address}: {e}"}
 
 
 @server.tool(
     name="unifi_list_clients",
+    auth="either",
     description=(
-        "Returns connected clients with MAC, name, hostname, IP, connection type "
-        "(wired/wireless), and for wireless clients: SSID, signal dBm, channel, radio. "
-        "Filter by filter_type (all/wired/wireless), set include_offline=true for "
-        "historical clients. For a single client's full raw object, use "
-        "unifi_get_client_details. For IP-to-hostname lookup, use unifi_lookup_by_ip."
+        "Returns connected clients with mac, name, hostname, ip, status (online/offline), "
+        "connection type (wired/wireless), and for wireless clients: ssid, signal_dbm, "
+        "channel, radio. Filter by filter_type (all/wired/wireless), set "
+        "include_offline=true for historical clients. Use search to filter by "
+        "name/hostname/IP/MAC (case-insensitive). For a single client's full raw "
+        "object, use unifi_get_client_details. For IP-to-client lookup, use "
+        "unifi_lookup_by_ip. Pass an entry's mac to the client tools as "
+        "mac_address (unifi_get_client_details, unifi_block_client, "
+        "unifi_rename_client, unifi_get_client_sessions, "
+        "unifi_get_client_dpi_traffic, unifi_get_client_wifi_details, "
+        "unifi_recent_events)."
+        " API-key inventory uses legacy reads when supported, otherwise limited public inventory. "
+        "Public results include source_api=integration and integration_id; missing legacy fields are unknown. "
+        "These IDs are scoped to the Integration inventory tool family — do not pass them to other resource tools. "
+        "include_offline=true requires session credentials for historical inventory. "
+        "Full details and mutations can require session credentials."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
@@ -84,56 +100,48 @@ async def list_clients(
         bool,
         Field(description="When true, includes offline/disconnected clients from controller history. Default false"),
     ] = False,
+    search: Annotated[
+        Optional[str],
+        Field(description="Filter by name, hostname, IP, or MAC (case-insensitive substring match)"),
+    ] = None,
     limit: Annotated[int, Field(description="Maximum number of clients to return (default 100)")] = 100,
+    fields: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Comma-separated list of fields to return per client (default: all). "
+                "Available: mac, name, hostname, ip, connection_type, status, last_seen, _id. "
+                "Wireless-only: essid, signal_dbm, channel, radio. "
+                "Example: fields='mac,name,ip' returns only those 3 fields."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Implementation for listing clients."""
     try:
-        clients = await client_manager.get_all_clients() if include_offline else await client_manager.get_clients()
-
-        def _raw(c):
-            return c.raw if hasattr(c, "raw") else c  # c might already be a dict
-
-        clients_raw = [_raw(c) for c in clients]
-
-        if filter_type == "wireless":
-            clients_raw = [c for c in clients_raw if not c.get("is_wired", False)]
-        elif filter_type == "wired":
-            clients_raw = [c for c in clients_raw if c.get("is_wired", False)]
-
-        clients_raw = clients_raw[:limit]
-
-        formatted_clients = []
-        for client in clients_raw:
-            shaped = client_from_controller(client)
-            formatted = shaped.model_dump(exclude_none=True)
-            # Preserve wired/wireless display fields not in the base model
-            formatted["connection_type"] = "Wired" if client.get("is_wired", False) else "Wireless"
-            formatted["_id"] = client.get("_id")
-            if not client.get("is_wired", False):
-                formatted["essid"] = client.get("essid", "Unknown")
-                formatted["signal_dbm"] = client.get("signal")
-                formatted["channel"] = client.get("channel", "Unknown")
-                formatted["radio"] = client.get("radio", "Unknown")
-            formatted_clients.append(formatted)
-
-        return {
-            "success": True,
-            "site": client_manager._connection.site,
-            "count": len(formatted_clients),
-            "clients": formatted_clients,
-        }
+        clients = await client_manager.get_clients(include_offline=include_offline)
+        return shape_client_list(
+            clients,
+            site=client_manager._connection.site,
+            filter_type=filter_type,
+            search=search,
+            limit=limit,
+            fields=fields,
+        )
     except Exception as e:
-        logger.error("Error listing clients: %s", e, exc_info=True)
+        logger.error("Error listing clients: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to list clients: {e}"}
 
 
 @server.tool(
     name="unifi_get_client_details",
     description=(
-        "Returns the full raw client object for one client by MAC address — includes "
-        "all controller-reported fields: IP, hostname, connection stats, DHCP info, "
-        "network/WLAN associations, traffic counters, and fixed-IP settings. "
-        "For a summary of all clients, use unifi_list_clients."
+        "Returns client data for one client by MAC address. By default (summary=false) "
+        "returns the full raw client object — all controller-reported fields, with the "
+        "typed/normalized shape (ISO timestamps, derived status, null-safe name/hostname) "
+        "layered on top of the merged live /stat/sta + /rest/user data. Set summary=true to "
+        "trim to selected sections via include (basic, network, wireless, traffic, "
+        "fingerprint, all). For a summary of all clients, use unifi_list_clients."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
@@ -141,29 +149,47 @@ async def get_client_details(
     mac_address: Annotated[
         str, Field(description="Client MAC address in format AA:BB:CC:DD:EE:FF (from unifi_list_clients)")
     ],
+    include: Annotated[
+        str,
+        Field(
+            description=(
+                "Comma-separated sections to return when summary=true (default 'basic'). "
+                "Sections: basic, network, wireless, traffic, fingerprint, all."
+            )
+        ),
+    ] = "basic",
+    summary: Annotated[
+        bool,
+        Field(
+            description=(
+                "When false (default), returns the full raw client object. "
+                "When true, trims the response to the sections named in include."
+            )
+        ),
+    ] = False,
 ) -> Dict[str, Any]:
     """Implementation for getting client details."""
     try:
         client_obj = await client_manager.get_client_details(mac_address)
-        if client_obj:
-            shaped = client_from_controller(client_obj)
-            return {
-                "success": True,
-                "site": client_manager._connection.site,
-                "client": shaped.model_dump(exclude_none=True),
-            }
-        return {
-            "success": False,
-            "error": f"Client not found with MAC address: {mac_address}",
-        }
+        return shape_client_details(
+            client_obj,
+            site=client_manager._connection.site,
+            mac_address=mac_address,
+            include=include,
+            summary=summary,
+        )
     except Exception as e:
-        logger.error("Error getting client details for %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error getting client details for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get client details for {mac_address}: {e}"}
 
 
 @server.tool(
     name="unifi_list_blocked_clients",
-    description="List clients/devices that are currently blocked from the network",
+    description=(
+        "Lists clients/devices currently blocked from the network. Each entry includes "
+        "mac, hostname, name, last_seen, blocked. Pass an entry's mac to "
+        "unifi_unblock_client as mac_address."
+    ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def list_blocked_clients() -> Dict[str, Any]:
@@ -183,7 +209,7 @@ async def list_blocked_clients() -> Dict[str, Any]:
             "blocked_clients": formatted_clients,
         }
     except Exception as e:
-        logger.error("Error listing blocked clients: %s", e, exc_info=True)
+        logger.error("Error listing blocked clients: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to list blocked clients: {e}"}
 
 
@@ -245,7 +271,7 @@ async def block_client(
             }
         return {"success": False, "error": f"Failed to block client {mac_address}."}
     except Exception as e:
-        logger.error("Error blocking client %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error blocking client [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to block client {mac_address}: {e}"}
 
 
@@ -309,7 +335,7 @@ async def unblock_client(
             }
         return {"success": False, "error": f"Failed to unblock client {mac_address}."}
     except Exception as e:
-        logger.error("Error unblocking client %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error unblocking client [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to unblock client {mac_address}: {e}"}
 
 
@@ -367,7 +393,7 @@ async def rename_client(
             }
         return {"success": False, "error": f"Failed to rename client {mac_address}."}
     except Exception as e:
-        logger.error("Error renaming client %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error renaming client [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to rename client {mac_address}: {e}"}
 
 
@@ -441,7 +467,7 @@ async def force_reconnect_client(
             "error": f"Failed to force reconnect for client {mac_address}.",
         }
     except Exception as e:
-        logger.error("Error forcing reconnect for client %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error forcing reconnect for client [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to force reconnect for client {mac_address}: {e}"}
 
 
@@ -508,7 +534,7 @@ async def forget_client(
             }
         return {"success": False, "error": f"Failed to forget client {mac_address}."}
     except Exception as e:
-        logger.error("Error forgetting client %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error forgetting client [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to forget client {mac_address}: {e}"}
 
 
@@ -546,7 +572,13 @@ async def authorize_guest(
 ) -> Dict[str, Any]:
     """Implementation for authorizing a guest."""
     try:
-        AuthorizeGuestInput(mac_address=mac_address, minutes=minutes)
+        AuthorizeGuestInput(
+            mac_address=mac_address,
+            minutes=minutes,
+            up_kbps=up_kbps,
+            down_kbps=down_kbps,
+            bytes_quota=bytes_quota,
+        )
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
@@ -597,7 +629,7 @@ async def authorize_guest(
             }
         return {"success": False, "error": f"Failed to authorize guest {mac_address}."}
     except Exception as e:
-        logger.error("Error authorizing guest %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error authorizing guest [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to authorize guest {mac_address}: {e}"}
 
 
@@ -668,7 +700,7 @@ async def unauthorize_guest(
             "error": f"Failed to unauthorize guest {mac_address}.",
         }
     except Exception as e:
-        logger.error("Error unauthorizing guest %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error unauthorizing guest [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to unauthorize guest {mac_address}: {e}"}
 
 
@@ -802,5 +834,74 @@ async def set_client_ip_settings(
             "error": f"Failed to update IP settings for client {mac_address}.",
         }
     except Exception as e:
-        logger.error("Error setting IP settings for %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error setting IP settings for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to set IP settings for client {mac_address}: {e}"}
+
+
+@server.tool(
+    name="unifi_set_client_fixed_ap",
+    auth="local_only",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description=(
+        "Enable or disable a wireless client's fixed access-point association. "
+        "Enabling requires the MAC address of an adopted access point. "
+        "Disabling preserves the controller's inactive AP MAC. "
+        "This legacy write requires Network session authentication."
+    ),
+    permission_category="clients",
+    permission_action="update",
+)
+async def set_client_fixed_ap(
+    mac_address: Annotated[str, Field(description="MAC address of the wireless client")],
+    fixed_ap_enabled: Annotated[bool, Field(description="Whether to enable fixed access-point association")],
+    fixed_ap_mac: Annotated[
+        Optional[str],
+        Field(description="MAC address of the adopted access point; required when enabling, ignored when disabling"),
+    ] = None,
+    confirm: Annotated[bool, Field(description="When true, apply the change; otherwise return a preview")] = False,
+) -> Dict[str, Any]:
+    """Set a wireless client's fixed access-point association."""
+    try:
+        validated = SetClientFixedApInput(
+            mac_address=mac_address,
+            fixed_ap_enabled=fixed_ap_enabled,
+            fixed_ap_mac=fixed_ap_mac,
+        )
+    except ValidationError as exc:
+        return {"success": False, "error": f"Invalid fixed AP settings: {exc.errors()[0]['msg']}"}
+
+    mac_address = validated.mac_address
+    fixed_ap_enabled = validated.fixed_ap_enabled
+    fixed_ap_mac = validated.fixed_ap_mac
+    try:
+        client_obj = await client_manager.get_client_details(mac_address)
+        client = client_obj.raw if hasattr(client_obj, "raw") else client_obj
+        if not isinstance(client, dict):
+            return {"success": False, "error": "Failed to retrieve client fixed AP settings"}
+        if not confirm:
+            updates = {"fixed_ap_enabled": fixed_ap_enabled}
+            if fixed_ap_enabled:
+                updates["fixed_ap_mac"] = fixed_ap_mac
+            return update_preview(
+                resource_type="client",
+                resource_id=mac_address,
+                resource_name=client.get("name") or client.get("hostname"),
+                current_state={
+                    "fixed_ap_enabled": client.get("fixed_ap_enabled", False),
+                    "fixed_ap_mac": client.get("fixed_ap_mac"),
+                },
+                updates=updates,
+            )
+        persisted = await client_manager.set_client_fixed_ap(
+            client_mac=mac_address,
+            fixed_ap_enabled=fixed_ap_enabled,
+            fixed_ap_mac=fixed_ap_mac,
+        )
+        if persisted:
+            return {"success": True, "message": "Client fixed AP settings updated.", "settings": persisted}
+        return {"success": False, "error": "Failed to update client fixed AP settings"}
+    except (FixedApAuthError, FixedApNotFoundError, FixedApOperationError, FixedApValidationError) as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        logger.error("Failed to set client fixed AP: %s", type(exc).__name__)
+        return {"success": False, "error": "Failed to set client fixed AP settings"}

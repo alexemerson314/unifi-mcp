@@ -7,8 +7,9 @@ import pathlib
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp.server.mcpserver.exceptions import ToolError
+from unifi_core.redaction import REDACTED
 from unifi_mcp_shared.strict_dispatch import StrictKwargFastMCP, _load_allowed_kwargs
 
 
@@ -96,6 +97,7 @@ async def test_known_kwargs_pass_through(acl_manifest: pathlib.Path) -> None:
     super_mock.assert_awaited_once_with(
         "unifi_create_acl_rule",
         {"name": "rule", "action": "REJECT", "enabled": True},
+        context=None,
     )
 
 
@@ -105,7 +107,7 @@ async def test_empty_kwargs_pass_through(acl_manifest: pathlib.Path) -> None:
     with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
         result = await server.call_tool("unifi_list_devices", {})
     assert result is sentinel
-    super_mock.assert_awaited_once_with("unifi_list_devices", {})
+    super_mock.assert_awaited_once_with("unifi_list_devices", {}, context=None)
 
 
 async def test_no_args_tool_pass_through(acl_manifest: pathlib.Path) -> None:
@@ -115,7 +117,7 @@ async def test_no_args_tool_pass_through(acl_manifest: pathlib.Path) -> None:
     with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
         result = await server.call_tool("unifi_no_args_tool", {})
     assert result is sentinel
-    super_mock.assert_awaited_once_with("unifi_no_args_tool", {})
+    super_mock.assert_awaited_once_with("unifi_no_args_tool", {}, context=None)
 
 
 async def test_no_args_tool_rejects_unknown_kwargs(acl_manifest: pathlib.Path) -> None:
@@ -135,7 +137,7 @@ async def test_dict_param_doesnt_recurse(acl_manifest: pathlib.Path) -> None:
     with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
         result = await server.call_tool("unifi_update_policy", args)
     assert result is sentinel
-    super_mock.assert_awaited_once_with("unifi_update_policy", args)
+    super_mock.assert_awaited_once_with("unifi_update_policy", args, context=None)
 
 
 async def test_unknown_tool_delegates_to_super(acl_manifest: pathlib.Path) -> None:
@@ -145,7 +147,7 @@ async def test_unknown_tool_delegates_to_super(acl_manifest: pathlib.Path) -> No
     with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
         result = await server.call_tool("unifi_not_in_manifest", {"anything": 1})
     assert result is sentinel
-    super_mock.assert_awaited_once_with("unifi_not_in_manifest", {"anything": 1})
+    super_mock.assert_awaited_once_with("unifi_not_in_manifest", {"anything": 1}, context=None)
 
 
 async def test_missing_required_not_double_reported(acl_manifest: pathlib.Path) -> None:
@@ -156,7 +158,58 @@ async def test_missing_required_not_double_reported(acl_manifest: pathlib.Path) 
     with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
         result = await server.call_tool("unifi_create_acl_rule", {"name": "rule"})
     assert result is sentinel
-    super_mock.assert_awaited_once_with("unifi_create_acl_rule", {"name": "rule"})
+    super_mock.assert_awaited_once_with("unifi_create_acl_rule", {"name": "rule"}, context=None)
+
+
+# -----------------------------
+# redaction-marker write-back guard
+# -----------------------------
+
+
+async def test_rejects_top_level_redaction_marker(tmp_path: pathlib.Path) -> None:
+    """A sensitive top-level kwarg echoed back as the marker is rejected."""
+    manifest = _write_manifest(
+        tmp_path,
+        [_make_tool("unifi_update_snmp_settings", {"enabled": {"type": "boolean"}, "community": {"type": "string"}})],
+    )
+    server = StrictKwargFastMCP("test", tools_manifest_path=manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_update_snmp_settings", {"enabled": True, "community": REDACTED})
+    msg = str(excinfo.value)
+    assert "community" in msg
+    assert "redaction marker" in msg
+
+
+async def test_rejects_nested_redaction_marker(acl_manifest: pathlib.Path) -> None:
+    """Unlike the kwarg check, the marker guard recurses into inner dicts."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=acl_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool(
+            "unifi_update_policy",
+            {"policy_id": "p1", "policy_data": {"x_passphrase": REDACTED}},
+        )
+    assert "policy_data.x_passphrase" in str(excinfo.value)
+
+
+async def test_marker_guard_allows_non_sensitive_field_equal_to_marker(acl_manifest: pathlib.Path) -> None:
+    """A non-sensitive field whose value equals the marker passes — the guard
+    only fires on keys the shared vocabulary deems sensitive."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=acl_manifest)
+    sentinel = [{"type": "text", "text": "ok"}]
+    args = {"name": REDACTED, "action": "REJECT"}
+    with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=sentinel)) as super_mock:
+        result = await server.call_tool("unifi_create_acl_rule", args)
+    assert result is sentinel
+    super_mock.assert_awaited_once_with("unifi_create_acl_rule", args, context=None)
+
+
+async def test_marker_guard_runs_for_unknown_tools(tmp_path: pathlib.Path) -> None:
+    """The guard is not gated on manifest presence: a tool absent from the
+    manifest still cannot smuggle a marker write-back through."""
+    manifest = _write_manifest(tmp_path, [_make_tool("unifi_known", {"x": {"type": "string"}})])
+    server = StrictKwargFastMCP("test", tools_manifest_path=manifest)
+    with pytest.raises(ToolError):
+        await server.call_tool("unifi_not_in_manifest", {"token": REDACTED})
 
 
 # -----------------------------
@@ -217,3 +270,115 @@ def test_loader_treats_tools_without_input_schema_as_zero_arg(
     assert allowed["unifi_partial"] == frozenset()
     assert allowed["unifi_normal"] == frozenset({"x"})
     assert any("had no input schema" in record.message for record in caplog.records)
+
+
+# -----------------------------
+# MAC parameter guidance
+# -----------------------------
+
+
+@pytest.fixture
+def mac_manifest(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Network tools use mac_address for the subject MAC."""
+    tools = [
+        _make_tool("unifi_get_client_details", {"mac_address": {"type": "string"}}),
+        _make_tool("unifi_get_client_sessions", {"mac_address": {"type": "string"}, "limit": {"type": "integer"}}),
+        _make_tool("unifi_get_switch_ports", {"mac_address": {"type": "string"}}),
+        _make_tool("unifi_recent_events", {"mac_address": {"type": "string"}}),
+        _make_tool("unifi_list_networks", {"site": {"type": "string"}}),
+        _make_tool("unifi_trigger_rf_scan", {"ap_mac": {"type": "string"}}),
+        _make_tool("unifi_two_macs", {"client_mac": {"type": "string"}, "device_mac": {"type": "string"}}),
+    ]
+    return _write_manifest(tmp_path, tools)
+
+
+@pytest.mark.parametrize(
+    ("tool", "rejected", "canonical"),
+    [
+        ("unifi_get_client_details", "client_mac", "mac_address"),
+        ("unifi_get_client_details", "device_mac", "mac_address"),
+        ("unifi_get_client_details", "mac", "mac_address"),
+        ("unifi_get_client_sessions", "client_mac", "mac_address"),
+        ("unifi_get_switch_ports", "device_mac", "mac_address"),
+        ("unifi_recent_events", "mac", "mac_address"),
+    ],
+)
+async def test_mac_spelling_error_names_the_canonical_parameter(
+    mac_manifest: pathlib.Path, tool: str, rejected: str, canonical: str
+) -> None:
+    """The MAC parameter is spelled differently across tools; the rejection says which one this tool takes."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool(tool, {rejected: "aa:bb:cc:dd:ee:ff"})
+    msg = str(excinfo.value)
+    assert f"unknown arguments {{{rejected}}}" in msg
+    assert f"'{tool}' takes the MAC address as '{canonical}'." in msg
+
+
+async def test_mac_hint_is_absent_for_a_non_mac_argument(mac_manifest: pathlib.Path) -> None:
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_get_client_details", {"hostname": "x"})
+    assert "takes the MAC address as" not in str(excinfo.value)
+
+
+async def test_mac_hint_is_absent_when_the_tool_takes_two_mac_parameters(mac_manifest: pathlib.Path) -> None:
+    """Two candidates and nothing to choose between them; guessing is worse than silence."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_two_macs", {"mac_address": "aa:bb:cc:dd:ee:ff"})
+    assert "takes the MAC address as" not in str(excinfo.value)
+
+
+async def test_ap_mac_is_not_treated_as_a_spelling_of_the_subject_mac(mac_manifest: pathlib.Path) -> None:
+    """ap_mac names the access point to scan FROM, not the subject of the call. Pointing
+    a caller at it would turn a rejected call into a wrong answer."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_trigger_rf_scan", {"client_mac": "aa:bb:cc:dd:ee:ff"})
+    assert "takes the MAC address as" not in str(excinfo.value)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_get_client_sessions", {"ap_mac": "aa:bb:cc:dd:ee:ff"})
+    assert "takes the MAC address as" not in str(excinfo.value)
+
+
+async def test_mac_hint_is_absent_when_the_canonical_name_was_already_sent(mac_manifest: pathlib.Path) -> None:
+    """Repeating back a parameter the caller supplied invites a retry that changes nothing."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool(
+            "unifi_get_client_details", {"mac_address": "aa:bb:cc:dd:ee:ff", "client_mac": "11:22:33:44:55:66"}
+        )
+    msg = str(excinfo.value)
+    assert "unknown arguments {client_mac}" in msg
+    assert "takes the MAC address as" not in msg
+
+
+async def test_mac_hint_is_absent_when_the_tool_has_no_mac_parameter(mac_manifest: pathlib.Path) -> None:
+    """A MAC spelling sent to a tool that takes no MAC is still just an unknown argument."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_list_networks", {"mac_address": "aa:bb:cc:dd:ee:ff"})
+    assert "takes the MAC address as" not in str(excinfo.value)
+
+
+async def test_mac_hint_does_not_disturb_the_rest_of_the_message(mac_manifest: pathlib.Path) -> None:
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with pytest.raises(ToolError) as excinfo:
+        await server.call_tool("unifi_get_client_sessions", {"client_mac": "aa:bb:cc:dd:ee:ff", "bogus": 1})
+    assert str(excinfo.value) == (
+        "Invalid params for 'unifi_get_client_sessions': "
+        "unknown arguments {bogus, client_mac}. "
+        "Valid arguments: [limit, mac_address]. "
+        "'unifi_get_client_sessions' takes the MAC address as 'mac_address'."
+    )
+
+
+async def test_mac_spelling_is_not_accepted_as_an_alias(mac_manifest: pathlib.Path) -> None:
+    """Guidance only: the canonical contract is unchanged, so the call still fails."""
+    server = StrictKwargFastMCP("test", tools_manifest_path=mac_manifest)
+    with patch.object(FastMCP, "call_tool", new=AsyncMock(return_value=[])) as super_mock:
+        with pytest.raises(ToolError):
+            await server.call_tool("unifi_get_client_details", {"client_mac": "aa:bb:cc:dd:ee:ff"})
+    super_mock.assert_not_awaited()

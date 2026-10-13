@@ -1,8 +1,8 @@
 # Tool Catalog
 
-The UniFi Network MCP server exposes 169 tools, all prefixed with `unifi_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
+The UniFi Network MCP server exposes 210 tools, all prefixed with `unifi_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
 
-Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy/meta-only workflows, call the `unifi_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_network_mcp/tools_manifest.json`.
+Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy workflows, call the `unifi_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_network_mcp/tools_manifest.json`. In `meta_only` mode, the index initially contains only meta-tools; executing a known domain tool lazily registers its module, so later index results can include those loaded tools.
 
 ## Meta-Tools
 
@@ -13,7 +13,7 @@ These are always registered regardless of mode:
 - `unifi_batch` — Execute multiple tools in parallel
 - `unifi_batch_status` — Check batch job status
 
-## Firewall (11 tools)
+## Firewall (15 tools)
 
 - `unifi_list_firewall_policies` — List all firewall policies
 - `unifi_get_firewall_policy_details` — Get policy details by ID
@@ -21,21 +21,66 @@ These are always registered regardless of mode:
 - `unifi_create_firewall_policy` — Create a V2 zone-based policy with schema validation
 - `unifi_update_firewall_policy` — Update policy fields
 - `unifi_list_firewall_zones` — List firewall zones (V2 API)
+- `unifi_create_firewall_zone` — Create a custom firewall zone
+- `unifi_update_firewall_zone` — Rename a custom firewall zone
+- `unifi_delete_firewall_zone` — Delete a custom firewall zone
+- `unifi_list_legacy_firewall_rules` — List legacy pre-zone-based firewall rules (V1 API)
 - `unifi_list_firewall_groups` — List firewall groups (address and port groups)
 - `unifi_get_firewall_group_details` — Get firewall group details by ID
 - `unifi_create_firewall_group` — Create a new address or port group
 - `unifi_update_firewall_group` — Update an existing group
 - `unifi_delete_firewall_group` — Delete a group
 
-## Content Filtering (4 tools)
+## Gateway Settings (2 tools)
+
+Gateway-wide security / NAT / connection-tracking settings (the controller's `usg` singleton).
+
+- `unifi_get_gateway_settings` — Read gateway settings: GeoIP filtering, SYN cookies, ICMP redirects, DNS verification, UPnP/NAT-PMP, MSS clamp, ALG modules, hardware offloading, conntrack timeouts
+- `unifi_update_gateway_settings` — Update gateway settings (confirm-gated; deep-merges a partial update, preserving nested sub-objects and untouched keys)
+
+## Content Filtering (5 tools)
 
 - `unifi_list_content_filters` — List content filtering profiles with category/targeting summary
 - `unifi_get_content_filter_details` — Get full profile config (categories, MACs, networks, safe search)
-- `unifi_update_content_filter` — Update an existing profile (full object replacement)
+- `unifi_create_content_filter` — Create a scoped profile, disabled by default
+- `unifi_update_content_filter` — Update profile fields and schedules while preserving other settings
 - `unifi_delete_content_filter` — Delete a profile (requires delete permission)
 
-> **Note:** The UniFi API does not support creating content filtering profiles (POST returns 405).
-> Profiles must be created in the UniFi UI first, then managed via these tools.
+Profiles can be created through these tools. New profiles are disabled by default and require a client or network scope.
+
+## NAT Rules (6 tools)
+
+- `unifi_list_nat_rules` — List V2 NAT rules with explicit nulls for unknown fields
+- `unifi_get_nat_rule` — Get one V2 NAT rule by its scoped ID
+- `unifi_create_nat_rule` — Create an IPv4 rule, disabled by default, and verify persistence
+- `unifi_update_nat_rule` — Merge partial changes into a manual rule and verify persistence
+- `unifi_toggle_nat_rule` — Set a manual rule's enabled state explicitly
+- `unifi_delete_nat_rule` — Delete a manual rule and verify its absence
+
+These tools require Network session credentials. NAT rule IDs cannot be used with port-forward or Integration API tools. Mutations require confirmation and support verified IPv4 DNAT, SNAT, and MASQUERADE fields; see the [NAT write guidance](../README.md#v2-nat-rules). A successful readback confirms stored configuration, not traffic enforcement. Use the [scoped DNS redirect recipe](../../../plugins/unifi-network/skills/firewall-auditor/references/dns-redirect.md) for packet verification.
+
+## mDNS Settings (2 tools)
+
+- `unifi_get_mdns_settings` — Read site-wide mDNS service settings and network scope
+- `unifi_update_mdns_settings` — Update service mode and service lists, then verify persistence
+
+The update preserves network scope. Each supplied service list replaces the entire list; changes require confirmation and may affect service discovery. An uncertain write returns `mutation_applied: null`; read settings before retrying.
+
+Mode `all` requires both service lists to be empty. Mode `custom` requires at least one predefined or custom service; provide the mode and lists together when switching between these modes.
+
+## Threat Management Settings (1 tool)
+
+- `unifi_get_threat_management_settings` — Read site-wide threat management (IDS/IPS) and traffic identification (DPI) settings
+
+Returns current intrusion detection/prevention configuration and traffic identification flags:
+- `ips_mode`: raw controller mode code (`disabled`, `ids`, `ips`, `ipsInline`, or unknown raw string)
+- `enabled`: normalized boolean (`true` for active modes `ids`/`ips`/`ipsInline`, `false` for `disabled`, `null` if mode is unknown or missing)
+- `enabled_categories`: list of raw threat category codes (`null` when absent from controller)
+- `enabled_networks`: list of protected network IDs (`null` when absent from controller)
+- `traffic_identification_enabled`: DPI traffic identification flag (strict boolean, `null` if missing or malformed)
+- `device_fingerprinting_enabled`: device fingerprinting flag (strict boolean, `null` if missing or malformed)
+
+This tool is read-only. Controller secrets (such as `utm_token`) and unverified fields are excluded.
 
 ## OON Policies (6 tools)
 
@@ -71,23 +116,27 @@ These are always registered regardless of mode:
 - `unifi_update_acl_rule` — Update an existing rule
 - `unifi_delete_acl_rule` — Delete a rule (requires delete permission)
 
-## Traffic Routes (6 tools)
+## Traffic Routes (5 tools)
 
 - `unifi_list_traffic_routes` — List policy-based routing rules
 - `unifi_get_traffic_route_details` — Get route details by ID
 - `unifi_toggle_traffic_route` — Enable/disable a route
 - `unifi_create_traffic_route` — Create with full schema
-- `unifi_create_simple_traffic_route` — Create with simplified schema
-- `unifi_update_traffic_route` — Update route settings
+- `unifi_update_traffic_route` — Update route settings, including the target network or VPN
 
-## Port Forwarding (6 tools)
+## Traffic Flows (1 tool)
+
+- `unifi_get_traffic_flows` — Query historical UniFi Traffic Flows from Insights > Flows, with pagination and filters for time range, client, host, port, protocol, application, and direction
+
+## Port Forwarding (7 tools)
 
 - `unifi_list_port_forwards` — List all port forwarding rules
 - `unifi_get_port_forward` — Get rule details by ID
 - `unifi_toggle_port_forward` — Enable/disable a rule
-- `unifi_create_port_forward` — Create with full schema validation
-- `unifi_create_simple_port_forward` — Create with simplified schema
+- `unifi_create_port_forward` — Preview or create with full schema validation (requires confirmation)
+- `unifi_create_simple_port_forward` — Preview or create with simplified schema (requires confirmation)
 - `unifi_update_port_forward` — Update rule fields
+- `unifi_delete_port_forward` — Delete a rule by ID (requires delete permission)
 
 ## QoS / Traffic Shaping (6 tools)
 
@@ -98,16 +147,37 @@ These are always registered regardless of mode:
 - `unifi_create_simple_qos_rule` — Create with simplified schema
 - `unifi_update_qos_rule` — Update rule fields
 
-## Networks & WLANs (8 tools)
+## Networks, WLANs & AP Groups (16 tools)
 
 - `unifi_list_networks` — List all networks (LAN, WAN, VLAN)
 - `unifi_get_network_details` — Get network details by ID
-- `unifi_create_network` — Create a network (LAN/VLAN)
-- `unifi_update_network` — Update network fields
+- `unifi_create_network` — Create a network (LAN/VLAN); guest creation requires a verified built-in Hotspot zone
+- `unifi_update_network` — Update network fields with exact post-write verification
+- `unifi_delete_network` — Delete a network after a live-state preview
 - `unifi_list_wlans` — List all wireless LANs
 - `unifi_get_wlan_details` — Get WLAN details by ID
-- `unifi_create_wlan` — Create a WLAN/SSID
-- `unifi_update_wlan` — Update WLAN fields
+- `unifi_create_wlan` — Create a WLAN/SSID with exact post-write verification
+- `unifi_update_wlan` — Update WLAN fields and report persisted/dropped/coerced fields
+- `unifi_delete_wlan` — Delete a WLAN/SSID
+- `unifi_toggle_wlan` — Toggle a WLAN's enabled state
+- `unifi_list_ap_groups` — List AP groups
+- `unifi_get_ap_group_details` — Get AP-group details by ID
+- `unifi_create_ap_group` — Create an AP group
+- `unifi_update_ap_group` — Update AP-group fields
+- `unifi_delete_ap_group` — Delete an AP group
+
+### Guest networks
+
+Use `purpose="guest"` with the built-in Hotspot zone's `firewall_zone_id` from
+`unifi_list_firewall_zones`. Use legacy V2 zone IDs, not Integration API UUIDs.
+Guest previews verify the live zone; confirmed creates verify that both guest
+purpose and the requested zone persisted. Missing, unrecognized, or non-Hotspot
+zones fail before creation. Keep `network_isolation_enabled` false or omit it.
+
+This path supports gateway-routed networks. Converting an existing network's
+purpose to guest, switch-routed guest networks, and SD-WAN guest networks remain
+unsupported. A failed post-write result can still identify a created resource;
+inspect its `mutation_applied` state and resource ID before retrying or cleaning up.
 
 ## Switch Management (15 tools)
 
@@ -132,20 +202,22 @@ These are always registered regardless of mode:
 - `unifi_update_switch_stp` — Update STP priority and version
 - `unifi_set_jumbo_frames` — Enable/disable jumbo frames
 
-## VPN (6 tools)
+## VPN (8 tools)
 
 - `unifi_list_vpn_clients` — List VPN clients (WireGuard, OpenVPN)
 - `unifi_get_vpn_client_details` — Get client details by ID
-- `unifi_update_vpn_client_state` — Enable/disable a VPN client
+- `unifi_update_vpn_client_state` — Preview, then enable/disable a VPN client with read-back verification
+- `unifi_delete_vpn_client` — Preview, then delete a VPN client
 - `unifi_list_vpn_servers` — List VPN servers
 - `unifi_get_vpn_server_details` — Get server details by ID
-- `unifi_update_vpn_server_state` — Enable/disable a VPN server
+- `unifi_update_vpn_server_alternate_address` — Preview, then update a WireGuard server’s advertised address with read-back verification
+- `unifi_update_vpn_server_state` — Preview, then enable/disable a VPN server with read-back verification
 
 ## Devices (10 tools)
 
 - `unifi_list_devices` — List all adopted devices
 - `unifi_get_device_details` — Get full device object by MAC
-- `unifi_get_device_radio` — Get AP radio config and stats
+- `unifi_get_device_radio` — Get radio config and stats for a device with radios
 - `unifi_update_device_radio` — Update radio settings (TX power, channel, width)
 - `unifi_reboot_device` — Reboot a device by MAC
 - `unifi_rename_device` — Rename a device by MAC
@@ -154,7 +226,7 @@ These are always registered regardless of mode:
 - `unifi_locate_device` — Toggle LED blinking to locate any device
 - `unifi_force_provision_device` — Force re-provision device configuration
 
-## Clients (11 tools)
+## Clients (12 tools)
 
 - `unifi_list_clients` — List connected clients
 - `unifi_get_client_details` — Get full client object by MAC
@@ -167,14 +239,21 @@ These are always registered regardless of mode:
 - `unifi_authorize_guest` — Authorize a guest client
 - `unifi_unauthorize_guest` — Revoke guest authorization
 - `unifi_set_client_ip_settings` — Set fixed IP / local DNS record
+- `unifi_set_client_fixed_ap` — Pin a wireless client to an adopted AP or disable the pin with persisted-state verification
 
-## Events & Alarms (5 tools)
+## Events & Alarms (7 tools)
 
 - `unifi_list_events` — List timestamped event log entries
 - `unifi_list_alarms` — List active alarms
 - `unifi_archive_alarm` — Archive a specific alarm
 - `unifi_archive_all_alarms` — Archive all active alarms
-- `unifi_get_event_types` — Get known event type prefixes
+- `unifi_get_event_types` — Get exact event keys observed in the 1,000 most recent events within the last 7 days
+- `unifi_recent_events` — Events from the in-memory websocket buffer, with listener state (`listening`, `attached`, `buffer_capacity`)
+- `unifi_subscribe_events` — Handle for the live event resource plus listener state
+
+## Incident Evidence (1 tool)
+
+- `unifi_get_incident_evidence` — Bounded, read-only event evidence for one incident window with per-source coverage and budget usage: a bounded `unifi-incident-evidence-view` by default, or the whole `unifi-incident-evidence` document with `detail="full"` (see [incident evidence](../../../docs/incident-evidence.md)). Listed directly in lazy mode so read-only clients can call it.
 
 ## Routing (5 tools)
 
@@ -186,7 +265,7 @@ These are always registered regardless of mode:
 
 ## Hotspot / Vouchers (4 tools)
 
-- `unifi_list_vouchers` — List all hotspot vouchers
+- `unifi_list_vouchers` — List vouchers with optional pagination, code/note search, and field projection
 - `unifi_get_voucher_details` — Get voucher details by ID
 - `unifi_create_voucher` — Create guest network voucher(s)
 - `unifi_revoke_voucher` — Revoke a voucher (requires delete permission)
@@ -215,13 +294,14 @@ These are always registered regardless of mode:
 - `unifi_update_dns_record` — Update a record (partial updates preserved)
 - `unifi_delete_dns_record` — Delete a record
 
-## System (10 tools)
+## System (12 tools)
 
 - `unifi_get_system_info` — Controller version, uptime, resource usage
 - `unifi_get_network_health` — Per-subsystem health (WAN, LAN, WLAN, VPN)
-- `unifi_get_site_settings` — Current site settings
-- `unifi_get_snmp_settings` — SNMP configuration
-- `unifi_update_snmp_settings` — Update SNMP settings
+- `unifi_get_site_settings` — Site identity, country, timezone, connectivity monitor and NTP servers
+- `unifi_get_mgmt_settings` — Device management settings (device SSH, debug tools, auto-upgrade); stored credentials reported as present/absent
+- `unifi_get_snmp_settings` — SNMP v1/v2c and SNMPv3 state (secrets redacted)
+- `unifi_update_snmp_settings` — Update SNMP v1/v2c (enabled, community) and SNMPv3 (enabled_v3, username, x_password)
 - `unifi_list_backups` — List available backups on the controller
 - `unifi_create_backup` — Create a new backup of the controller configuration
 - `unifi_delete_backup` — Delete a backup file from the controller
@@ -232,8 +312,37 @@ These are always registered regardless of mode:
 
 | Mode | Initial Tokens | Behavior |
 |------|---------------|----------|
-| `lazy` (default) | ~200 | Meta-tools registered; others load on first use |
+| `lazy` (default) | ~200 | Meta-tools and `unifi_get_incident_evidence` registered; others load on first use |
 | `eager` | ~5,000 | All tools registered immediately |
 | `meta_only` | ~200 | Only meta-tools; use `unifi_execute` for everything |
 
 Set via `UNIFI_TOOL_REGISTRATION_MODE`. Lazy mode is recommended for LLM clients.
+
+### Threat Management updates
+
+`unifi_get_threat_posture` returns the controller's CyberSecure summary for `HOUR`,
+`DAY` (default), `WEEK`, or `MONTH`, plus gateway signature status. Missing values
+remain null. Signature and summary timestamps use Unix milliseconds. The typed
+settings read also exposes the controller's category selection preference.
+
+`unifi_update_threat_management_settings` accepts partial `update_data`:
+
+- IPS: `ips_mode` (`ids` detection, `ips` prevention, or `disabled`) and
+  `enabled_categories` (the complete replacement list of controller category codes).
+  `ipsInline` can only be preserved when the controller already uses it.
+- Traffic Identification: `traffic_identification_enabled` and
+  `device_fingerprinting_enabled` (strict booleans, only when supported).
+
+Use separate calls for IPS and Traffic Identification. Category updates select
+manual filtering and are validated against the gateway's current supported catalog.
+Disabling IPS also disables filtering and clears its category selection. Re-enabling
+manual inspection requires a nonempty category list and networks already configured
+for protection in UniFi. This tool does not change protected network membership.
+
+Always inspect the preview before confirming: changes can reduce inspection coverage
+or pause identification while the gateway provisions them. MCP previews show live
+before/after state; REST action previews show submitted arguments only. Confirmed
+writes report persistence separately from acceptance. `collateral_changed_fields`
+means the controller also changed a field that was meant to be preserved; inspect
+actual settings before another update. A failed verification does not roll back a
+write. This verifies configuration persistence, not detection of malicious traffic.

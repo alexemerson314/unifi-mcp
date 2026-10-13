@@ -4,8 +4,19 @@ dynamic = ["version"]
 description = "Shared MCP server patterns: permissions, confirmation, lazy loading, config"
 requires-python = ">=3.13"
 dependencies = [
-    "unifi-core>=0.3.2,<0.4",
-    "mcp[cli]>=1.26.0,<2",
+    # Controller credential redaction requires Core 0.4.51.
+    "unifi-core>=0.4.51,<0.5",
+    "mcp[cli]>=2.2.0,<3",
+    # Published wheels do not consume uv.lock; keep MCP transitive security
+    # floors explicit so upgrades cannot retain vulnerable installed versions.
+    "cryptography>=50.0.1",
+    "pydantic-settings>=2.14.2",
+    "PyJWT>=2.15.0",
+    "python-multipart>=0.0.31",
+    "anyio>=4.14.2",
+    "starlette>=1.7.0",
+    "click>=8.3.3",
+    "multidict>=6.9.1",
     "omegaconf>=2.3.0",
     "pyyaml>=6.0",
     "jsonschema>=4.0.0",

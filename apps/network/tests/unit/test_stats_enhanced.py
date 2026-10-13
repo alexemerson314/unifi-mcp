@@ -265,9 +265,74 @@ class TestStatsManagerEnhanced:
 
         await stats_manager.get_ips_events(limit=10)
 
-        call_args = mock_connection.request.call_args
-        api_request = call_args[0][0]
+        # An empty legacy answer now triggers the v2 fallback, so the legacy
+        # request is the first call rather than the last one.
+        api_request = mock_connection.request.call_args_list[0][0][0]
+        assert api_request.path == "/stat/ips/event"
         assert api_request.data["_limit"] == 10
+
+    @pytest.mark.asyncio
+    async def test_get_ips_events_empty_legacy_falls_back_to_v2(self, stats_manager, mock_connection):
+        """An empty legacy response must still reach the v2 security log.
+
+        Controllers that moved IPS events to the v2 system log answer
+        /stat/ips/event with 200 and an empty list rather than failing, so a
+        fallback guarded only by an exception never runs for them.
+        """
+        v2_events = [{"key": "EVT_IPS_IpsAlert"}]
+        mock_connection.request.side_effect = [[], v2_events]
+
+        result = await stats_manager.get_ips_events()
+
+        assert result == v2_events
+        assert mock_connection.request.call_count == 2
+        assert mock_connection.request.call_args_list[0][0][0].path == "/stat/ips/event"
+        assert mock_connection.request.call_args_list[1][0][0].path == "/system-log/critical"
+
+    @pytest.mark.asyncio
+    async def test_get_ips_events_non_empty_legacy_skips_v2(self, stats_manager, mock_connection):
+        """A controller still populating the legacy endpoint must not be double-queried."""
+        legacy_events = [{"event_type": "alert"}]
+        mock_connection.request.return_value = legacy_events
+
+        result = await stats_manager.get_ips_events()
+
+        assert result == legacy_events
+        assert mock_connection.request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_ips_events_v2_failure_after_empty_legacy_returns_empty(self, stats_manager, mock_connection):
+        """A failing v2 fallback must not turn an empty result into an exception.
+
+        A controller old enough to have no v2 endpoint answers exactly this way,
+        so raising here would break setups the legacy endpoint still serves.
+        """
+        mock_connection.request.side_effect = [[], Exception("v2 unavailable")]
+
+        result = await stats_manager.get_ips_events()
+
+        assert result == []
+        assert mock_connection.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_ips_events_v2_failure_is_not_cached(self, stats_manager, mock_connection):
+        """A degraded empty result must not be cached as a confirmed quiet period."""
+        mock_connection.request.side_effect = [[], Exception("v2 unavailable")]
+
+        await stats_manager.get_ips_events()
+
+        mock_connection._update_cache.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_ips_events_non_list_legacy_falls_back_to_v2(self, stats_manager, mock_connection):
+        """A malformed legacy answer must reach v2 rather than be coerced to []."""
+        v2_events = [{"key": "EVT_IPS_IpsAlert"}]
+        mock_connection.request.side_effect = [{"unexpected": "envelope"}, v2_events]
+
+        result = await stats_manager.get_ips_events()
+
+        assert result == v2_events
+        assert mock_connection.request.call_count == 2
 
     @pytest.mark.asyncio
     async def test_get_client_sessions(self, stats_manager, mock_connection):
@@ -369,7 +434,7 @@ class TestStatsManagerEnhanced:
 
     @pytest.mark.asyncio
     async def test_get_client_wifi_details_uses_get_stat_sta(self, stats_manager, mock_connection):
-        """Regression for #148: /stat/sta ignores MAC in POST body — must use GET."""
+        """/stat/sta ignores MAC in POST body — must use GET."""
         mock_connection.request.return_value = []
 
         await stats_manager.get_client_wifi_details("aa:bb:cc:dd:ee:ff")
@@ -380,7 +445,7 @@ class TestStatsManagerEnhanced:
 
     @pytest.mark.asyncio
     async def test_get_client_wifi_details_filters_by_mac(self, stats_manager, mock_connection):
-        """Regression for #148: must filter list by MAC, not return clients[0]."""
+        """Must filter list by MAC, not return clients[0]."""
         mock_connection.request.return_value = [
             {"mac": "11:11:11:11:11:11", "signal": -57, "channel": 132, "radio": "na"},
             {"mac": "aa:bb:cc:dd:ee:ff", "signal": -34, "channel": 1, "radio": "ng"},
@@ -396,7 +461,7 @@ class TestStatsManagerEnhanced:
 
     @pytest.mark.asyncio
     async def test_get_client_wifi_details_no_match_returns_none(self, stats_manager, mock_connection):
-        """Regression for #148: unknown MAC must return None, not clients[0]."""
+        """Unknown MAC must return None, not clients[0]."""
         mock_connection.request.return_value = [
             {"mac": "11:11:11:11:11:11", "signal": -57, "channel": 132},
             {"mac": "22:22:22:22:22:22", "signal": -60, "channel": 36},
@@ -545,3 +610,49 @@ class TestDeviceManagerSpeedtest:
 
         with pytest.raises(Exception):
             await device_manager.get_speedtest_status("aa:bb:cc:dd:ee:ff")
+
+
+class TestGetAlertsFallbackDiagnostics:
+    """Both alert paths failing must explain both, not just the legacy 404."""
+
+    @pytest.fixture
+    def mock_connection(self):
+        conn = MagicMock()
+        conn.site = "default"
+        conn.request = AsyncMock()
+        conn.get_cached = MagicMock(return_value=None)
+        conn._update_cache = MagicMock()
+        conn.ensure_connected = AsyncMock(return_value=True)
+        conn.controller = MagicMock()
+        return conn
+
+    @pytest.fixture
+    def stats_manager(self, mock_connection):
+        from unifi_core.network.managers.stats_manager import StatsManager
+
+        return StatsManager(mock_connection, MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_both_paths_failing_surfaces_the_v2_error_too(self, stats_manager, mock_connection):
+        mock_connection.request.side_effect = [
+            Exception("Bad Request: unknown severity LOW"),  # v2 /system-log/critical
+            Exception("received 404 Not Found"),  # legacy /stat/alarm
+        ]
+
+        with pytest.raises(Exception) as exc:
+            await stats_manager.get_alerts()
+
+        message = str(exc.value)
+        assert "404" in message
+        assert "unknown severity LOW" in message, "the v2 failure must not be swallowed"
+
+    @pytest.mark.asyncio
+    async def test_legacy_success_after_v2_failure_still_returns(self, stats_manager, mock_connection):
+        """The fallback still works — this only changes the both-failed case."""
+        mock_connection.request.side_effect = [
+            Exception("v2 unavailable"),
+            [{"_id": "a1", "archived": False}],
+        ]
+
+        result = await stats_manager.get_alerts()
+        assert result == [{"_id": "a1", "archived": False}]

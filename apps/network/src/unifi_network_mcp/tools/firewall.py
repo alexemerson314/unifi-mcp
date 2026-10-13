@@ -4,71 +4,75 @@ Firewall policy tools for Unifi Network MCP server.
 
 import json
 import logging
-from typing import Annotated, Any, Dict
+from collections import Counter
+from typing import Annotated, Any, Dict, Optional
 
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from unifi_core.confirmation import create_preview, toggle_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, toggle_preview, update_preview
 from unifi_core.network.models.firewall import (
+    FirewallGroup,
     firewall_group_from_controller,
     firewall_zone_from_controller,
+    legacy_firewall_rule_from_controller,
+    legacy_policy_error,
+    normalize_policy_enums,
+    normalize_policy_update,
+    prepare_policy_update,
+    validate_group_create,
+    validate_group_update,
+    validate_policy_port_targeting,
+    validate_policy_selectors,
+    validate_zone_targeting,
 )
-from unifi_core.network.models.firewall import (
-    from_controller as fw_from_controller,
-)
-from unifi_core.network.models.firewall import (
-    to_controller_update as fw_to_update,
-)
-from unifi_network_mcp.runtime import firewall_manager, server
+from unifi_core.network.read_views import LEGACY_ENGINE_HINT, shape_firewall_policy_list
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_network_mcp.runtime import firewall_manager, server, should_redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
-
-
-# Legacy V1 firewall fields removed in #210. The V1 endpoint is dead on
-# modern firmware (UDM-SE 8.4.x); the V1 schema branch always shipped V1-shaped
-# payloads to the V2 endpoint, which rejected them. Detect these fields and
-# return an actionable migration error instead of a silent failure.
-_LEGACY_V1_FIREWALL_FIELDS = frozenset(
-    {
-        "ruleset",
-        "rule_index",
-        "src_address",
-        "dst_address",
-        "src_port",
-        "dst_port",
-    }
-)
-_LEGACY_V1_ACTIONS = frozenset({"accept", "drop", "reject"})
-
-_LEGACY_MIGRATION_ERROR = (
-    "Legacy V1 firewall fields are no longer supported (#210). "
-    "Use V2 zone-based fields: action (ALLOW/BLOCK/REJECT), source "
-    "(zone_id + matching_target), destination (zone_id + matching_target). "
-    "See unifi_list_firewall_policies for examples of valid V2 shape."
-)
-
-
-def _detect_legacy_fields(data: Dict[str, Any]) -> str | None:
-    """Return the migration error string if legacy V1 fields are detected."""
-    if _LEGACY_V1_FIREWALL_FIELDS & set(data.keys()):
-        return _LEGACY_MIGRATION_ERROR
-    action = data.get("action")
-    if isinstance(action, str) and action in _LEGACY_V1_ACTIONS:
-        return _LEGACY_MIGRATION_ERROR
-    return None
 
 
 @server.tool(
     name="unifi_list_firewall_policies",
     description=(
         "List firewall policies configured on the Unifi Network controller. "
-        "Includes zone-based targeting details (zone_id, matching_target, matching_target_type, "
-        "IPs, network IDs) when present on newer firmware."
+        "Returns V2 zone-based targeting (zone_id, matching_target, matching_target_type, "
+        "IPs, network IDs, client MACs, IP/port groups, port matching).\n\n"
+        "Filters: search (name substring), action (ALLOW/BLOCK/REJECT), enabled_only, "
+        "limit (default 50), include_predefined. By default (summary=true) returns a curated "
+        "entry per policy (id, name, enabled, action, rule_index, description, protocol + "
+        "source/destination targeting incl. port_matching_type/port/port_group_id when set). "
+        "Set summary=false for the full fw_from_controller().model_dump() shape including "
+        "schedule, logging, ip_version, connection_state_type, index, etc."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def list_firewall_policies(
+    search: Annotated[
+        Optional[str],
+        Field(description="Filter by policy name (case-insensitive substring match)"),
+    ] = None,
+    action: Annotated[
+        Optional[str],
+        Field(description="Filter by action: ALLOW, BLOCK, or REJECT (V2 firmware). Case-insensitive."),
+    ] = None,
+    enabled_only: Annotated[
+        bool,
+        Field(description="If true, only return enabled policies. Default false."),
+    ] = False,
+    limit: Annotated[int, Field(description="Maximum number of policies to return (default 50)")] = 50,
+    summary: Annotated[
+        bool,
+        Field(
+            description=(
+                "Controls per-policy shape. When true (default), returns a curated 6-key entry "
+                "plus narrowed source/destination targeting. When false, returns the full "
+                "fw_from_controller().model_dump() shape (protocol, schedule, logging, ip_version, "
+                "index, full source/destination dicts)."
+            )
+        ),
+    ] = True,
     include_predefined: Annotated[
         bool,
         Field(
@@ -78,20 +82,20 @@ async def list_firewall_policies(
 ) -> Dict[str, Any]:
     """Lists firewall policies for the current UniFi site.
 
-    Returns both legacy (ruleset-based) and zone-based policy fields.
-    Zone-based fields (zone_id, matching_target, matching_target_type) are
-    included in source/destination when present in the API response.
+    Returns V2 zone-based policy fields (zone_id, matching_target, matching_target_type)
+    in source/destination. Legacy V1 ruleset support has been removed.
     """
     try:
         policies = await firewall_manager.get_firewall_policies(include_predefined=include_predefined)
-        formatted_policies = [fw_from_controller(p).model_dump(exclude_none=True) for p in policies]
-
-        return {
-            "success": True,
-            "site": firewall_manager._connection.site,
-            "count": len(formatted_policies),
-            "policies": formatted_policies,
-        }
+        return shape_firewall_policy_list(
+            policies,
+            site=firewall_manager._connection.site,
+            search=search,
+            action=action,
+            enabled_only=enabled_only,
+            limit=limit,
+            summary=summary,
+        )
     except Exception as e:
         logger.error("Error listing firewall policies: %s", e, exc_info=True)
         return {"success": False, "error": "Failed to list firewall policies: %s" % e}
@@ -145,6 +149,7 @@ async def get_firewall_policy_details(
         }
     }
     """
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         if not policy_id:
             return {"success": False, "error": "policy_id is required"}
@@ -156,11 +161,14 @@ async def get_firewall_policy_details(
                 "success": False,
                 "error": f"Firewall policy with ID '{policy_id}' not found.",
             }
-        return {
-            "success": True,
-            "policy_id": policy_id,
-            "details": json.loads(json.dumps(policy, default=str)),
-        }
+        return redact_sensitive_fields(
+            {
+                "success": True,
+                "policy_id": policy_id,
+                "details": json.loads(json.dumps(policy, default=str)),
+            },
+            redact_sensitive=redact_sensitive,
+        )
     except Exception as e:
         logger.error("Error getting firewall policy details for %s: %s", policy_id, e, exc_info=True)
         return {"success": False, "error": f"Failed to get firewall policy details for {policy_id}: {e}"}
@@ -271,34 +279,32 @@ async def toggle_firewall_policy(
 
 
 def _validate_zone_targeting(validated_data: Dict[str, Any]) -> str | None:
-    """Validate matching_target_type requirements for zone-based policies.
+    """Every targeting rule, as one message or None, for the create preview.
 
-    Returns an error message string if validation fails, or None if valid.
+    A delegate: the rules themselves live in ``unifi_core`` so the API dispatcher and
+    the update path apply the same ones. Kept under this name because the create tool
+    reads better for it.
     """
-    for direction in ("source", "destination"):
-        ep = validated_data.get(direction, {})
-        if not isinstance(ep, dict):
-            continue
-        target = ep.get("matching_target")
-        if target in ("IP", "NETWORK") and not ep.get("matching_target_type"):
-            expected = "'SPECIFIC' or 'OBJECT'" if target == "IP" else "'OBJECT'"
-            return "%s.matching_target_type is required when matching_target is '%s'. Use %s." % (
-                direction,
-                target,
-                expected,
-            )
-        if target == "IP":
-            target_type = ep.get("matching_target_type")
-            if target_type == "OBJECT" and not ep.get("ip_group_id"):
-                return (
-                    "%s.ip_group_id is required when matching_target is 'IP' with matching_target_type 'OBJECT'."
-                    % direction
-                )
-            if target_type != "OBJECT" and not ep.get("ips"):
-                return "%s.ips array is required when matching_target is 'IP'." % direction
-        if target == "NETWORK" and not ep.get("network_ids"):
-            return "%s.network_ids array is required when matching_target is 'NETWORK'." % direction
+    if error := validate_zone_targeting(validated_data):
+        return error
+    try:
+        validate_policy_port_targeting(validated_data)
+        validate_policy_selectors(validated_data)
+    except ValueError as exc:
+        return str(exc)
     return None
+
+
+def _selector_applied(key: str, expected: Any, actual: Dict[str, Any]) -> bool:
+    """Whether the controller's re-read shows an updated endpoint key as applied.
+
+    ``prepare_policy_update`` marks a retired selector with ``None`` and the manager
+    removes the key from the PUT body, so the controller may answer with the key gone
+    or with its own empty default. Both mean retired; only a surviving value does not.
+    """
+    if expected is None:
+        return not actual.get(key)
+    return actual.get(key) == expected
 
 
 @server.tool(
@@ -310,8 +316,13 @@ def _validate_zone_targeting(validated_data: Dict[str, Any]) -> str | None:
         "targeting: matching_target='IP', matching_target_type='SPECIFIC', "
         "ips=[...]. For network targeting: matching_target='NETWORK', "
         "matching_target_type='OBJECT', network_ids=[...]. For any in zone: "
-        "matching_target='ANY'. Use unifi_list_firewall_zones to discover "
-        "zone_ids; unifi_list_networks for network_ids."
+        "matching_target='ANY'. For client targeting: matching_target='CLIENT', "
+        "client_macs=[...]. For port targeting (same source/destination dict): "
+        "port_matching_type='SPECIFIC', port='53,853' (a single string, not a 'ports' "
+        "array) or port_matching_type='OBJECT', port_group_id=<port group>; set protocol "
+        "to tcp, udp or tcp_udp. Use unifi_list_firewall_zones to discover zone_ids; "
+        "unifi_list_networks for network_ids; unifi_list_firewall_groups for "
+        "ip_group_id/port_group_id."
     ),
     permission_category="firewall_policies",
     permission_action="create",
@@ -327,9 +338,12 @@ async def create_firewall_policy(
                 "destination (same structure). For IP targeting: matching_target='IP', "
                 "matching_target_type='SPECIFIC', ips=[...]. For network targeting: "
                 "matching_target='NETWORK', matching_target_type='OBJECT', "
-                "network_ids=[...]. For any in zone: matching_target='ANY'. Optional: "
-                "enabled, description, protocol, connection_state_type, connection_states, "
-                "ip_version, schedule, logging."
+                "network_ids=[...]. For any in zone: matching_target='ANY'. For clients: "
+                "matching_target='CLIENT', client_macs=[...]. Ports on either side: "
+                "port_matching_type='SPECIFIC' + port='53,853' (a single string, not a "
+                "'ports' array) or 'OBJECT' + port_group_id. Optional: enabled, description, "
+                "protocol, connection_state_type, connection_states, ip_version, "
+                "schedule, logging."
             )
         ),
     ],
@@ -339,21 +353,25 @@ async def create_firewall_policy(
     ] = False,
 ) -> Dict[str, Any]:
     """Create a V2 zone-based firewall policy."""
+    redact_sensitive = should_redact_sensitive_fields()
     if not isinstance(policy_data, dict) or not policy_data:
         return {
             "success": False,
             "error": "policy_data must be a non-empty dictionary.",
         }
 
-    # Reject legacy V1 fields up front with an actionable migration error (#210).
-    legacy_error = _detect_legacy_fields(policy_data)
+    # Reject legacy V1 fields up front with an actionable migration error.
+    legacy_error = legacy_policy_error(policy_data)
     if legacy_error:
         return {"success": False, "error": legacy_error}
 
     # Controller's V2 enums are strictly upper-case. Normalize common
     # mixed-case input before validation so users can pass natural forms
     # like "IPv4" or lowercase state names.
-    policy_data = _normalize_v2_policy_casing(policy_data)
+    try:
+        policy_data = normalize_policy_enums(policy_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     # Validate required fields and apply schema defaults directly.
     _required = ("name", "action", "source", "destination")
@@ -392,15 +410,19 @@ async def create_firewall_policy(
         logger.warning("Invalid firewall policy data: %s", err)
         return {"success": False, "error": "Validation Error: %s" % err}
 
-    # Apply the same defaults the legacy schema validator provided.
+    # Apply controller-required V2 defaults for create only. Do not move these
+    # into shared update validation; omitted update fields must remain untouched.
     validated_data: Dict[str, Any] = {
         "enabled": True,
         "protocol": "all",
         "ip_version": "BOTH",
         "logging": False,
         "connection_state_type": "ALL",
+        "schedule": {"mode": "ALWAYS"},
         **policy_data,
     }
+    if validated_data.get("schedule") is None:
+        validated_data["schedule"] = {"mode": "ALWAYS"}
 
     # Validate zone targeting requirements (matching_target_type, ips, network_ids)
     targeting_error = _validate_zone_targeting(validated_data)
@@ -411,14 +433,24 @@ async def create_firewall_policy(
     if not isinstance(action, str) or action.upper() not in ("ALLOW", "BLOCK", "REJECT"):
         return {"success": False, "error": "Invalid action '%s'. Must be ALLOW, BLOCK, or REJECT." % action}
     validated_data["action"] = action.upper()
+    if validated_data["action"] in ("BLOCK", "REJECT"):
+        if validated_data.get("create_allow_respond") is True:
+            return {
+                "success": False,
+                "error": "create_allow_respond must be false for BLOCK/REJECT firewall policies.",
+            }
+        validated_data.setdefault("create_allow_respond", False)
 
     policy_name = validated_data.get("name", "Unnamed Policy")
 
     if not confirm:
-        return create_preview(
-            resource_type="firewall_policy",
-            resource_data=validated_data,
-            resource_name=policy_name,
+        return redact_sensitive_fields(
+            create_preview(
+                resource_type="firewall_policy",
+                resource_data=validated_data,
+                resource_name=policy_name,
+            ),
+            redact_sensitive=redact_sensitive,
         )
 
     logger.info("Creating firewall policy '%s'", policy_name)
@@ -430,12 +462,15 @@ async def create_firewall_policy(
             created_policy_details = created_policy_obj.raw
             new_policy_id = created_policy_details.get("_id", "unknown")
             logger.info("Created firewall policy '%s' with ID %s", policy_name, new_policy_id)
-            return {
-                "success": True,
-                "message": "Firewall policy '%s' created successfully." % policy_name,
-                "policy_id": new_policy_id,
-                "details": json.loads(json.dumps(created_policy_details, default=str)),
-            }
+            return redact_sensitive_fields(
+                {
+                    "success": True,
+                    "message": "Firewall policy '%s' created successfully." % policy_name,
+                    "policy_id": new_policy_id,
+                    "details": json.loads(json.dumps(created_policy_details, default=str)),
+                },
+                redact_sensitive=redact_sensitive,
+            )
         else:
             logger.error("Failed to create firewall policy '%s'. Manager returned None.", policy_name)
             return {
@@ -448,36 +483,18 @@ async def create_firewall_policy(
         return {"success": False, "error": "Failed to create firewall policy '%s': %s" % (policy_name, e)}
 
 
-# Controller-side V2 firewall enums are Java-style and strictly upper-case.
-# Live-controller probe (issue #203 follow-up) confirmed the accepted values:
-#   ip_version            → BOTH | IPV4 | IPV6
-#   connection_state_type → ALL | RESPOND_ONLY | CUSTOM
-#   connection_states[]   → NEW | RELATED | INVALID | ESTABLISHED
-# Normalize to upper-case so users can pass natural forms ("IPv4", "new").
-def _normalize_v2_policy_casing(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a shallow copy of ``data`` with V2 firewall enum fields upper-cased.
-
-    Only normalizes string values; non-string input is left for schema validation
-    to flag with its own error.
-    """
-    out = dict(data)
-    if isinstance(out.get("ip_version"), str):
-        out["ip_version"] = out["ip_version"].upper()
-    if isinstance(out.get("connection_state_type"), str):
-        out["connection_state_type"] = out["connection_state_type"].upper()
-    states = out.get("connection_states")
-    if isinstance(states, list):
-        out["connection_states"] = [s.upper() if isinstance(s, str) else s for s in states]
-    return out
-
-
 @server.tool(
     name="unifi_update_firewall_policy",
     description=(
         "Update specific fields of an existing V2 zone-based firewall policy by ID. "
         "Accepts: name, action (ALLOW/BLOCK/REJECT), enabled, source, destination, "
-        "protocol, ip_version, index, logging, connection_state_type, connection_states, "
-        "schedule."
+        "protocol, ip_version, logging, connection_state_type, connection_states, "
+        "schedule. source/destination are deep-merged with the current policy and accept "
+        "the same targeting and port fields as create (matching_target, port_matching_type, "
+        "port, port_group_id, client_macs); the merged result is checked for port shape and "
+        "selector activation, while the zone/IP/NETWORK completeness rules are checked on "
+        "create only. To change policy order use unifi_reorder_firewall_policies; index is "
+        "rejected here."
     ),
     permission_category="firewall_policies",
     permission_action="update",
@@ -496,7 +513,12 @@ async def update_firewall_policy(
             description=(
                 "Dictionary of V2 zone-based fields to update: name, action "
                 "(ALLOW/BLOCK/REJECT), enabled, source, destination, protocol, ip_version, "
-                "index, logging, connection_state_type, connection_states, schedule."
+                "logging, connection_state_type, connection_states, schedule. "
+                "Partial source/destination dicts are merged with the current policy; "
+                "port_matching_type='SPECIFIC' needs port, 'OBJECT' needs port_group_id, and "
+                "switching to another port_matching_type (or a side off CLIENT) retires the "
+                "stored port/port_group_id/client_macs automatically. "
+                "index is not accepted here; use unifi_reorder_firewall_policies to change order."
             )
         ),
     ],
@@ -506,32 +528,17 @@ async def update_firewall_policy(
     ] = False,
 ) -> Dict[str, Any]:
     """Update specific fields of an existing V2 zone-based firewall policy. Requires confirmation."""
+    redact_sensitive = should_redact_sensitive_fields()
     if not policy_id:
         return {"success": False, "error": "policy_id is required"}
     if not update_data:
         return {"success": False, "error": "update_data cannot be empty"}
-
-    # Reject legacy V1 fields up front with an actionable migration error (#210).
-    legacy_error = _detect_legacy_fields(update_data)
-    if legacy_error:
-        return {"success": False, "error": legacy_error}
-
-    # Normalize V2 action casing if provided.
-    if "action" in update_data:
-        action = update_data["action"]
-        if isinstance(action, str):
-            upper = action.upper()
-            if upper in ("ALLOW", "BLOCK", "REJECT"):
-                update_data["action"] = upper
-            else:
-                return {"success": False, "error": "Invalid action '%s'." % action}
-
-    # Normalize V2 enum casing before filtering so common mixed-case input
-    # ("IPv4", "custom", ["new"]) is preserved.
-    update_data = _normalize_v2_policy_casing(update_data)
-    validated_data = fw_to_update(update_data)
-    if not validated_data:
-        return {"success": False, "error": "Update data is effectively empty or invalid."}
+    try:
+        # normalize_policy_update is the shared MCP/API boundary; it rejects index
+        # (the V2 endpoint silently ignores it) before any controller read or write.
+        validated_data = normalize_policy_update(update_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     updated_fields_list = list(validated_data.keys())
 
@@ -545,13 +552,24 @@ async def update_firewall_policy(
             }
         current = current_policy_obj.raw
 
+        # Retire deactivated selectors and validate each updated side as merged. The
+        # manager runs the same step before its PUT; it is repeated here so the preview
+        # shows the retired selectors and fails the same way.
+        try:
+            validated_data = prepare_policy_update(current, validated_data)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
         if not confirm:
-            return update_preview(
-                resource_type="firewall_policy",
-                resource_id=policy_id,
-                resource_name=current.get("name"),
-                current_state=current,
-                updates=validated_data,
+            return redact_sensitive_fields(
+                update_preview(
+                    resource_type="firewall_policy",
+                    resource_id=policy_id,
+                    resource_name=current.get("name"),
+                    current_state=current,
+                    updates=validated_data,
+                ),
+                redact_sensitive=redact_sensitive,
             )
 
         logger.info("Updating firewall policy '%s' fields: %s", policy_id, ", ".join(updated_fields_list))
@@ -569,46 +587,42 @@ async def update_firewall_policy(
             # For nested dicts (source, destination, schedule), check that each
             # requested key-value is present in the response (subset check),
             # since deep_merge preserves unmentioned sibling keys.
+            # The log names the field, never the value: an update payload can carry a
+            # MAC address, and a MAC never goes to a log.
             mismatched = []
             for field, expected in validated_data.items():
                 actual = updated_details.get(field)
                 if isinstance(expected, dict) and isinstance(actual, dict):
                     for k, v in expected.items():
-                        if actual.get(k) != v:
+                        if not _selector_applied(k, v, actual):
                             mismatched.append(field)
-                            logger.warning(
-                                "Firewall policy %s field '%s.%s' not applied: expected %s, got %s",
-                                policy_id,
-                                field,
-                                k,
-                                v,
-                                actual.get(k),
-                            )
+                            logger.warning("Firewall policy %s field '%s.%s' not applied", policy_id, field, k)
                             break
                 elif actual != expected:
                     mismatched.append(field)
-                    logger.warning(
-                        "Firewall policy %s field '%s' not applied: expected %s, got %s",
-                        policy_id,
-                        field,
-                        expected,
-                        actual,
-                    )
+                    logger.warning("Firewall policy %s field '%s' not applied", policy_id, field)
             if mismatched:
-                return {
-                    "success": False,
-                    "policy_id": policy_id,
-                    "error": "Controller accepted the request but did not apply changes to: %s" % ", ".join(mismatched),
-                    "details": json.loads(json.dumps(updated_details, default=str)),
-                }
+                return redact_sensitive_fields(
+                    {
+                        "success": False,
+                        "policy_id": policy_id,
+                        "error": "Controller accepted the request but did not apply changes to: %s"
+                        % ", ".join(mismatched),
+                        "details": json.loads(json.dumps(updated_details, default=str)),
+                    },
+                    redact_sensitive=redact_sensitive,
+                )
 
             logger.info("Updated firewall policy (%s)", policy_id)
-            return {
-                "success": True,
-                "policy_id": policy_id,
-                "updated_fields": updated_fields_list,
-                "details": json.loads(json.dumps(updated_details, default=str)),
-            }
+            return redact_sensitive_fields(
+                {
+                    "success": True,
+                    "policy_id": policy_id,
+                    "updated_fields": updated_fields_list,
+                    "details": json.loads(json.dumps(updated_details, default=str)),
+                },
+                redact_sensitive=redact_sensitive,
+            )
         else:
             logger.error("Failed to update firewall policy (%s). Manager returned false.", policy_id)
             return {
@@ -623,23 +637,392 @@ async def update_firewall_policy(
 
 
 @server.tool(
+    name="unifi_get_firewall_policy_ordering",
+    auth="both",
+    description=(
+        "Get user-defined firewall policy ordering for a source/destination firewall zone pair. "
+        "Returns policy IDs from the UniFi public integration API (UUIDs); these IDs are scoped "
+        "to the ordering tool family — pass them ONLY to unifi_reorder_firewall_policies. They "
+        "do NOT correspond to the policy IDs returned by unifi_list_firewall_policies or any "
+        "other controller-API firewall tool. Requires a UniFi API key (UNIFI_API_KEY) and session credentials. "
+        "The current ordering path requires a legacy connection even when Integration zone UUIDs are supplied."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def get_firewall_policy_ordering(
+    source_firewall_zone_id: Annotated[
+        str,
+        Field(description="Source firewall zone ID from unifi_list_firewall_zones"),
+    ],
+    destination_firewall_zone_id: Annotated[
+        str,
+        Field(description="Destination firewall zone ID from unifi_list_firewall_zones"),
+    ],
+) -> Dict[str, Any]:
+    """Get user-defined firewall policy ordering for a zone pair."""
+    try:
+        if not source_firewall_zone_id or not destination_firewall_zone_id:
+            return {"success": False, "error": "source_firewall_zone_id and destination_firewall_zone_id are required"}
+
+        ordering = await firewall_manager.get_firewall_policy_ordering(
+            source_firewall_zone_id,
+            destination_firewall_zone_id,
+        )
+        return {
+            "success": True,
+            "source_firewall_zone_id": source_firewall_zone_id,
+            "destination_firewall_zone_id": destination_firewall_zone_id,
+            "ordering": ordering.get("orderedFirewallPolicyIds", ordering),
+        }
+    except Exception as e:
+        logger.error("Error getting firewall policy ordering: %s", e, exc_info=True)
+        return {"success": False, "error": f"Failed to get firewall policy ordering: {e}"}
+
+
+@server.tool(
+    name="unifi_reorder_firewall_policies",
+    auth="both",
+    description=(
+        "Reorder user-defined firewall policies for a source/destination firewall zone pair. "
+        "Pass the complete orderedFirewallPolicyIds object obtained from "
+        "unifi_get_firewall_policy_ordering (beforeSystemDefined + afterSystemDefined arrays). "
+        "These IDs are integration-API UUIDs scoped to the ordering tool family — they are NOT "
+        "the policy IDs returned by unifi_list_firewall_policies. Requires confirmation and a "
+        "UniFi API key (UNIFI_API_KEY) and session credentials. "
+        "The current ordering path requires a legacy connection even when Integration zone UUIDs are supplied."
+    ),
+    permission_category="firewall_policies",
+    permission_action="update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def reorder_firewall_policies(
+    source_firewall_zone_id: Annotated[
+        str,
+        Field(description="Source firewall zone ID from unifi_list_firewall_zones"),
+    ],
+    destination_firewall_zone_id: Annotated[
+        str,
+        Field(description="Destination firewall zone ID from unifi_list_firewall_zones"),
+    ],
+    ordered_firewall_policy_ids: Annotated[
+        Dict[str, list[str]],
+        Field(
+            description=(
+                "Complete ordering object: {'beforeSystemDefined': [...], 'afterSystemDefined': [...]}. "
+                "Preserve all existing policy IDs unless intentionally moving them."
+            )
+        ),
+    ],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, applies the reorder. When false (default), returns a preview"),
+    ] = False,
+) -> Dict[str, Any]:
+    """Reorder user-defined firewall policies for a zone pair."""
+    try:
+        if not source_firewall_zone_id or not destination_firewall_zone_id:
+            return {"success": False, "error": "source_firewall_zone_id and destination_firewall_zone_id are required"}
+
+        if not isinstance(ordered_firewall_policy_ids, dict):
+            return {"success": False, "error": "ordered_firewall_policy_ids must be an object"}
+
+        before = ordered_firewall_policy_ids.get("beforeSystemDefined")
+        after = ordered_firewall_policy_ids.get("afterSystemDefined")
+        if not isinstance(before, list) or not isinstance(after, list):
+            return {
+                "success": False,
+                "error": "ordered_firewall_policy_ids must include beforeSystemDefined and afterSystemDefined arrays",
+            }
+        requested_order = before + after
+        if not all(isinstance(policy_id, str) and policy_id for policy_id in requested_order):
+            return {
+                "success": False,
+                "error": "ordered_firewall_policy_ids arrays must contain only non-empty policy ID strings",
+            }
+        duplicate_ids = sorted(policy_id for policy_id, count in Counter(requested_order).items() if count > 1)
+        if duplicate_ids:
+            return {
+                "success": False,
+                "error": "Reorder payload contains duplicate policy IDs: %s" % ", ".join(duplicate_ids),
+            }
+
+        current = await firewall_manager.get_firewall_policy_ordering(
+            source_firewall_zone_id,
+            destination_firewall_zone_id,
+        )
+        current_ordering = current.get("orderedFirewallPolicyIds", current)
+        if not isinstance(current_ordering, dict):
+            return {
+                "success": False,
+                "error": "Current firewall policy ordering response did not include an ordering object",
+            }
+        current_order = current_ordering.get("beforeSystemDefined", []) + current_ordering.get("afterSystemDefined", [])
+        requested_counts = Counter(requested_order)
+        current_counts = Counter(current_order)
+        if requested_counts != current_counts:
+            missing_ids = sorted((current_counts - requested_counts).elements())
+            unexpected_ids = sorted((requested_counts - current_counts).elements())
+            return {
+                "success": False,
+                "error": (
+                    "Reorder payload must preserve the exact current policy ID set. "
+                    "Missing: %s; unexpected: %s"
+                    % (
+                        ", ".join(missing_ids) or "none",
+                        ", ".join(unexpected_ids) or "none",
+                    )
+                ),
+                "current_ordering": current_ordering,
+            }
+
+        if not confirm:
+            return update_preview(
+                resource_type="firewall_policy_ordering",
+                resource_id=f"{source_firewall_zone_id}->{destination_firewall_zone_id}",
+                resource_name="Firewall policy ordering",
+                current_state={"orderedFirewallPolicyIds": current_ordering},
+                updates={"orderedFirewallPolicyIds": ordered_firewall_policy_ids},
+            )
+
+        result = await firewall_manager.reorder_firewall_policies(
+            source_firewall_zone_id,
+            destination_firewall_zone_id,
+            ordered_firewall_policy_ids,
+        )
+        return {
+            "success": True,
+            "source_firewall_zone_id": source_firewall_zone_id,
+            "destination_firewall_zone_id": destination_firewall_zone_id,
+            "ordering": result.get("orderedFirewallPolicyIds", result),
+        }
+    except Exception as e:
+        logger.error("Error reordering firewall policies: %s", e, exc_info=True)
+        return {"success": False, "error": f"Failed to reorder firewall policies: {e}"}
+
+
+@server.tool(
     name="unifi_list_firewall_zones",
-    description="List controller firewall zones (V2 API).",
+    description="List controller firewall zones (V2 API). Returned IDs are V2 controller "
+    "ObjectIDs, not Integration API UUIDs; use them with the firewall-zone CRUD tools and "
+    "network firewall_zone_id.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def list_firewall_zones() -> Dict[str, Any]:
     try:
         zones = await firewall_manager.get_firewall_zones()
         formatted = [firewall_zone_from_controller(z).model_dump(exclude_none=True) for z in zones]
-        return {
+        result = {
             "success": True,
             "site": firewall_manager._connection.site,
             "count": len(formatted),
             "zones": formatted,
         }
+        if not formatted:
+            result["note"] = LEGACY_ENGINE_HINT
+        return result
     except Exception as exc:
         logger.error("Error listing firewall zones: %s", exc, exc_info=True)
         return {"success": False, "error": f"Failed to list firewall zones: {exc}"}
+
+
+@server.tool(
+    name="unifi_create_firewall_zone",
+    description="Create a new firewall zone. Zones group networks for zone-based "
+    "firewall policy targeting. Network assignment happens separately via "
+    "firewall_zone_id on unifi_update_network. Requires a UniFi API key "
+    "(UNIFI_API_KEY) and session authentication. Returns a V2 controller ObjectID, not an Integration API UUID. "
+    "Requires confirmation.",
+    permission_category="firewall",
+    permission_action="create",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+    auth="both",
+)
+async def create_firewall_zone(
+    name: Annotated[str, Field(description="Name of the firewall zone (must be unique)")],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, creates the zone. When false (default), returns a preview"),
+    ] = False,
+) -> Dict[str, Any]:
+    """Creates a new firewall zone."""
+    name = name.strip()
+    if not name:
+        return {"success": False, "error": "name is required"}
+
+    if not confirm:
+        return create_preview(
+            resource_type="firewall_zone",
+            resource_data={"name": name, "networkIds": []},
+            resource_name=name,
+        )
+
+    try:
+        zone = await firewall_manager.create_firewall_zone(name)
+        return {
+            "success": True,
+            "message": f"Firewall zone '{name}' created successfully.",
+            "zone": firewall_zone_from_controller(zone).model_dump(exclude_none=True),
+        }
+    except Exception as e:
+        logger.error("Error creating firewall zone: %s", e, exc_info=True)
+        return {"success": False, "error": f"Failed to create firewall zone: {e}"}
+
+
+@server.tool(
+    name="unifi_update_firewall_zone",
+    description="Rename an existing firewall zone by ID. Only the name is mutable; "
+    "network membership is managed via firewall_zone_id on the network. Requires a "
+    "UniFi API key (UNIFI_API_KEY) and session authentication. The ID must come from unifi_list_firewall_zones; "
+    "it is a V2 controller ObjectID, not an Integration API UUID. Requires confirmation.",
+    permission_category="firewall",
+    permission_action="update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    auth="both",
+)
+async def update_firewall_zone(
+    zone_id: Annotated[
+        str,
+        Field(description="V2 controller ObjectID from unifi_list_firewall_zones; not an Integration API UUID"),
+    ],
+    name: Annotated[str, Field(description="New name for the zone")],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, updates the zone. When false (default), returns a preview"),
+    ] = False,
+) -> Dict[str, Any]:
+    """Renames an existing firewall zone."""
+    if not zone_id:
+        return {"success": False, "error": "zone_id is required"}
+    name = name.strip()
+    if not name:
+        return {"success": False, "error": "name is required"}
+
+    if not confirm:
+        try:
+            current = await firewall_manager.get_firewall_zone_by_id(zone_id)
+            if current.get("default_zone"):
+                return {
+                    "success": False,
+                    "error": f"Cannot rename system-defined firewall zone '{current.get('name')}'.",
+                }
+            current_state = firewall_zone_from_controller(current).model_dump(exclude_none=True)
+            return update_preview(
+                resource_type="firewall_zone",
+                resource_id=zone_id,
+                resource_name=current_state.get("name") or zone_id,
+                current_state=current_state,
+                updates={"name": name},
+            )
+        except Exception as e:
+            logger.error("Error previewing firewall zone update %s: %s", zone_id, e, exc_info=True)
+            return {"success": False, "error": f"Failed to preview firewall zone update '{zone_id}': {e}"}
+
+    try:
+        success = await firewall_manager.update_firewall_zone(zone_id, name)
+        if success:
+            return {"success": True, "message": f"Firewall zone '{zone_id}' renamed to '{name}'."}
+        return {"success": False, "error": f"Failed to update firewall zone '{zone_id}'."}
+    except Exception as e:
+        logger.error("Error updating firewall zone %s: %s", zone_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to update firewall zone '{zone_id}': {e}"}
+
+
+@server.tool(
+    name="unifi_delete_firewall_zone",
+    description="Delete a firewall zone by ID. System-defined zones cannot be deleted. "
+    "Requires a UniFi API key (UNIFI_API_KEY) and session authentication. The ID must come from "
+    "unifi_list_firewall_zones; it is a V2 controller ObjectID, not an Integration API UUID. "
+    "Requires confirmation.",
+    permission_category="firewall",
+    permission_action="delete",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+    auth="both",
+)
+async def delete_firewall_zone(
+    zone_id: Annotated[
+        str,
+        Field(description="V2 controller ObjectID from unifi_list_firewall_zones; not an Integration API UUID"),
+    ],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, deletes the zone. When false (default), returns a preview"),
+    ] = False,
+) -> Dict[str, Any]:
+    """Deletes a firewall zone."""
+    if not zone_id:
+        return {"success": False, "error": "zone_id is required"}
+
+    if not confirm:
+        try:
+            current = await firewall_manager.get_firewall_zone_by_id(zone_id)
+            if current.get("default_zone"):
+                return {
+                    "success": False,
+                    "error": f"Cannot delete system-defined firewall zone '{current.get('name')}'.",
+                }
+            current_state = firewall_zone_from_controller(current).model_dump(exclude_none=True)
+            return delete_preview(
+                resource_type="firewall_zone",
+                resource_id=zone_id,
+                resource_data=current_state,
+                resource_name=current_state.get("name") or zone_id,
+                warnings=[
+                    "System-defined zones cannot be deleted.",
+                    "Reassign member networks and review policies before deleting this zone.",
+                ],
+            )
+        except Exception as e:
+            logger.error("Error previewing firewall zone deletion %s: %s", zone_id, e, exc_info=True)
+            return {"success": False, "error": f"Failed to preview firewall zone deletion '{zone_id}': {e}"}
+
+    try:
+        success = await firewall_manager.delete_firewall_zone(zone_id)
+        if success:
+            return {"success": True, "message": f"Firewall zone '{zone_id}' deleted successfully."}
+        return {"success": False, "error": f"Failed to delete firewall zone '{zone_id}'."}
+    except Exception as e:
+        logger.error("Error deleting firewall zone %s: %s", zone_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to delete firewall zone '{zone_id}': {e}"}
+
+
+# ---- Legacy Firewall Rules (v1 REST) ----
+
+
+@server.tool(
+    name="unifi_list_legacy_firewall_rules",
+    description=(
+        "List legacy pre-zone-based firewall rules from the UniFi controller. "
+        "Use this on sites that still use the legacy firewall engine and return no "
+        "V2 zone-based firewall policies. Returns ruleset, rule_index, action "
+        "(lowercase accept/drop/reject), source and destination addresses, ports, "
+        "networks and firewall groups, protocol, connection-state matching, "
+        "logging, and enabled state."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def list_legacy_firewall_rules() -> Dict[str, Any]:
+    """Lists legacy firewall rules for the current UniFi site."""
+    redact_sensitive = should_redact_sensitive_fields()
+    try:
+        rules = await firewall_manager.get_legacy_firewall_rules()
+        formatted = [legacy_firewall_rule_from_controller(r).model_dump(exclude_none=True) for r in rules]
+        return redact_sensitive_fields(
+            {
+                "success": True,
+                "engine": "legacy",
+                "site": firewall_manager._connection.site,
+                "count": len(formatted),
+                "rules": formatted,
+            },
+            redact_sensitive=redact_sensitive,
+        )
+    except Exception as e:
+        logger.error("Error listing legacy firewall rules: %s", e, exc_info=True)
+        return {
+            "success": False,
+            "engine": "legacy",
+            "error": f"Failed to list legacy firewall rules: {e}",
+        }
 
 
 # ---- Firewall Groups (address-group, port-group) ----
@@ -677,6 +1060,7 @@ async def get_firewall_group_details(
     group_id: Annotated[str, Field(description="The unique identifier (_id) of the firewall group")],
 ) -> Dict[str, Any]:
     """Gets a specific firewall group."""
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         if not group_id:
             return {"success": False, "error": "group_id is required"}
@@ -685,11 +1069,14 @@ async def get_firewall_group_details(
         if not group:
             return {"success": False, "error": f"Firewall group '{group_id}' not found."}
 
-        return {
-            "success": True,
-            "group_id": group_id,
-            "details": json.loads(json.dumps(group, default=str)),
-        }
+        return redact_sensitive_fields(
+            {
+                "success": True,
+                "group_id": group_id,
+                "details": firewall_group_from_controller(group).model_dump(exclude_none=True),
+            },
+            redact_sensitive=redact_sensitive,
+        )
     except Exception as e:
         logger.error("Error getting firewall group %s: %s", group_id, e, exc_info=True)
         return {"success": False, "error": f"Failed to get firewall group {group_id}: {e}"}
@@ -700,21 +1087,16 @@ async def get_firewall_group_details(
     description="Create a new firewall group (address or port group). "
     "group_type must be 'address-group' (for IPs/CIDRs), 'ipv6-address-group', or 'port-group' (for port numbers/ranges). "
     "IMPORTANT: group_type cannot be changed after creation. "
-    "group_members format: addresses use ['10.0.0.1', '10.0.0.0/24'], ports use ['80', '443', '8080-8090']. "
+    "members format: addresses use ['10.0.0.1', '10.0.0.0/24'], ports use ['80', '443', '8080-8090']. "
     "Requires confirmation.",
     permission_category="firewall",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
 )
 async def create_firewall_group(
-    name: Annotated[str, Field(description="Name of the firewall group")],
-    group_type: Annotated[
-        str,
-        Field(description="Type: 'address-group' (IPv4), 'ipv6-address-group' (IPv6), or 'port-group'"),
-    ],
-    group_members: Annotated[
-        list[str],
-        Field(description="List of IPs/CIDRs (for address groups) or port numbers/ranges (for port groups)"),
+    group_data: Annotated[
+        dict,
+        Field(description="Firewall group fields: name, group_type, and members"),
     ],
     confirm: Annotated[
         bool,
@@ -722,27 +1104,32 @@ async def create_firewall_group(
     ] = False,
 ) -> Dict[str, Any]:
     """Creates a new firewall group."""
-    group_data = {
-        "name": name,
-        "group_type": group_type,
-        "group_members": group_members,
-    }
-
-    if not confirm:
-        return create_preview(
-            resource_type="firewall_group",
-            resource_data=group_data,
-            resource_name=name,
-        )
-
+    redact_sensitive = should_redact_sensitive_fields()
     try:
-        result = await firewall_manager.create_firewall_group(group_data)
+        controller_data = validate_group_create(group_data)
+        public_data = FirewallGroup(**group_data).model_dump(exclude_none=True)
+        name = public_data["name"]
+
+        if not confirm:
+            return redact_sensitive_fields(
+                create_preview(
+                    resource_type="firewall_group",
+                    resource_data=public_data,
+                    resource_name=name,
+                ),
+                redact_sensitive=redact_sensitive,
+            )
+
+        result = await firewall_manager.create_firewall_group(controller_data)
         if result:
-            return {
-                "success": True,
-                "message": f"Firewall group '{name}' created successfully.",
-                "group": json.loads(json.dumps(result, default=str)),
-            }
+            return redact_sensitive_fields(
+                {
+                    "success": True,
+                    "message": f"Firewall group '{name}' created successfully.",
+                    "group": firewall_group_from_controller(result).model_dump(exclude_none=True),
+                },
+                redact_sensitive=redact_sensitive,
+            )
         return {"success": False, "error": f"Failed to create firewall group '{name}'."}
     except Exception as e:
         logger.error("Error creating firewall group: %s", e, exc_info=True)
@@ -751,17 +1138,17 @@ async def create_firewall_group(
 
 @server.tool(
     name="unifi_update_firewall_group",
-    description="Update an existing firewall group. Requires the full group object "
-    "(PUT replaces entire resource). group_type cannot be changed. Requires confirmation.",
+    description="Update an existing firewall group. Pass only the fields you want to change — current values are "
+    "automatically preserved. Accepted fields are name and members; group_type cannot be changed. Requires confirmation.",
     permission_category="firewall",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def update_firewall_group(
     group_id: Annotated[str, Field(description="The ID of the group to update")],
-    group_data: Annotated[
+    update_data: Annotated[
         dict,
-        Field(description="The complete updated group object with all fields"),
+        Field(description="Fields to update: name and/or members"),
     ],
     confirm: Annotated[
         bool,
@@ -769,15 +1156,30 @@ async def update_firewall_group(
     ] = False,
 ) -> Dict[str, Any]:
     """Updates an existing firewall group."""
-    if not confirm:
-        return create_preview(
-            resource_type="firewall_group",
-            resource_data=group_data,
-            resource_name=group_id,
-        )
-
+    redact_sensitive = should_redact_sensitive_fields()
+    if not isinstance(group_id, str) or not group_id.strip():
+        return {"success": False, "error": "group_id is required"}
     try:
-        success = await firewall_manager.update_firewall_group(group_id, group_data)
+        controller_updates = validate_group_update(update_data)
+        public_updates = FirewallGroup(**update_data).model_dump(include=set(update_data), exclude_none=True)
+
+        if not confirm:
+            current = await firewall_manager.get_firewall_group_by_id(group_id)
+            if current is None:
+                return {"success": False, "error": f"Firewall group '{group_id}' not found."}
+            public_current = firewall_group_from_controller(current).model_dump(exclude_none=True)
+            return redact_sensitive_fields(
+                update_preview(
+                    resource_type="firewall_group",
+                    resource_id=group_id,
+                    resource_name=public_current.get("name"),
+                    current_state=public_current,
+                    updates=public_updates,
+                ),
+                redact_sensitive=redact_sensitive,
+            )
+
+        success = await firewall_manager.update_firewall_group(group_id, controller_updates)
         if success:
             return {"success": True, "message": f"Firewall group '{group_id}' updated successfully."}
         return {"success": False, "error": f"Failed to update firewall group '{group_id}'."}
@@ -803,8 +1205,9 @@ async def delete_firewall_group(
 ) -> Dict[str, Any]:
     """Deletes a firewall group."""
     if not confirm:
-        return create_preview(
+        return delete_preview(
             resource_type="firewall_group",
+            resource_id=group_id,
             resource_data={"group_id": group_id},
             resource_name=group_id,
             warnings=["Firewall policies referencing this group via ip_group_id or port_group_id may break."],
@@ -847,8 +1250,9 @@ async def delete_firewall_policy(
 ) -> Dict[str, Any]:
     """Delete a firewall policy by ID."""
     if not confirm:
-        return create_preview(
+        return delete_preview(
             resource_type="firewall_policy",
+            resource_id=policy_id,
             resource_data={"policy_id": policy_id},
             resource_name=policy_id,
             warnings=["Removing an ALLOW rule may block traffic. Removing a BLOCK rule may open access."],

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.redaction import redact_sensitive_fields
 
 from unifi_api.auth.middleware import require_scope
 from unifi_api.auth.scopes import Scope
@@ -122,8 +123,8 @@ async def get_camera(
         await _maybe_set_site(cm, site_id)
         try:
             camera = await mgr.get_camera(camera_id)
-        except ValueError:
-            raise HTTPException(status_code=404, detail="camera not found")
+        except UniFiNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="camera not found") from exc
 
     type_class = request.app.state.type_registry.lookup("protect", "cameras/{id}")
     data = type_class.from_manager_output(camera).to_dict()
@@ -229,14 +230,15 @@ async def get_camera_streams(
 
     type_registry = request.app.state.type_registry
     tool_type = type_registry.lookup_tool("protect_get_camera_streams")
+    redact_sensitive = request.app.state.config.policy.response.redact_sensitive_fields
     if tool_type is not None:
         type_class, kind = tool_type
-        data = type_class.from_manager_output(streams).to_dict()
+        data = type_class.from_manager_output(streams, redact_sensitive=redact_sensitive).to_dict()
         hint = type_class.render_hint(kind)
     else:
         registry = request.app.state.serializer_registry
         serializer = registry.serializer_for_tool("protect_get_camera_streams")
-        data = serializer.serialize(streams)
+        data = redact_sensitive_fields(serializer.serialize(streams), redact_sensitive=redact_sensitive)
         hint = registry.render_hint_for_tool("protect_get_camera_streams")
     return {
         "data": data,

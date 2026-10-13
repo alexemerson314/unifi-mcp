@@ -16,6 +16,7 @@ from dataclasses import asdict
 from typing import Any
 
 import strawberry
+from unifi_core.redaction import redact_value
 
 
 def _get(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -27,11 +28,33 @@ def _get(obj: Any, *keys: str, default: Any = None) -> Any:
     return default
 
 
+@strawberry.type(description="A recurring WLAN schedule window.")
+class WlanScheduleWindow:
+    duration_minutes: int
+    name: str | None
+    start_days_of_week: list[str]
+    start_hour: int
+    start_minute: int
+
+    @classmethod
+    def from_manager_output(cls, obj: Any) -> "WlanScheduleWindow":
+        raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
+        days = raw.get("start_days_of_week") or []
+        return cls(
+            duration_minutes=raw.get("duration_minutes", 0),
+            name=raw.get("name"),
+            start_days_of_week=list(days) if isinstance(days, list) else [],
+            start_hour=raw.get("start_hour", 0),
+            start_minute=raw.get("start_minute", 0),
+        )
+
+
 @strawberry.type(description="A UniFi WLAN/SSID configuration.")
 class Wlan:
     id: strawberry.ID | None
     name: str | None
-    enabled: bool
+    setting_preference: str | None
+    enabled: bool | None
     security: str | None
     network_id: str | None
     hide_ssid: bool | None
@@ -41,6 +64,11 @@ class Wlan:
     guest_policy: bool | None
     usergroup_id: str | None
     fast_roaming_enabled: bool | None
+    rrm_enabled: bool | None
+    roaming_assistant_na_enabled: bool | None
+    roaming_assistant_na_rssi: int | None
+    roaming_assistant_6e_enabled: bool | None
+    roaming_assistant_6e_rssi: int | None
     pmf_mode: str | None
     wpa3_support: bool | None
     wpa3_transition: bool | None
@@ -48,12 +76,16 @@ class Wlan:
     mac_filter_policy: str | None
     mac_filter_list: list[str] | None
     schedule_enabled: bool | None
+    schedule_reversed: bool | None
+    schedule: list[str] | None
+    schedule_with_duration: list[WlanScheduleWindow] | None
     l2_isolation: bool | None
     wlan_band: str | None
     multicast_enhance_enabled: bool | None
     dtim_mode: str | None
     dtim_na: int | None
     dtim_ng: int | None
+    minrate_setting_preference: str | None
     minrate_ng_enabled: bool | None
     minrate_ng_data_rate_kbps: int | None
     minrate_na_enabled: bool | None
@@ -65,6 +97,16 @@ class Wlan:
     ap_group_ids: list[str] | None
     ap_group_mode: str | None
 
+    source_api: str | None = None
+    integration_id: strawberry.ID | None = strawberry.field(
+        default=None,
+        description=(
+            "Public Integration inventory UUID, not a legacy resource ID. "
+            "These IDs are scoped to the Integration inventory tool family — "
+            "do not pass them to legacy resource tools."
+        ),
+    )
+
     @classmethod
     def render_hint(cls, kind: str) -> dict:
         return {
@@ -75,20 +117,29 @@ class Wlan:
         }
 
     @classmethod
-    def from_manager_output(cls, obj: Any) -> "Wlan":
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "Wlan":
         raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
+        schedule_windows = raw.get("schedule_with_duration")
         return cls(
+            source_api=raw.get("source_api"),
+            integration_id=raw.get("integration_id"),
             id=raw.get("_id") or raw.get("id"),
             name=raw.get("name"),
-            enabled=bool(raw.get("enabled", False)),
+            setting_preference=raw.get("setting_preference"),
+            enabled=raw.get("enabled") if raw.get("source_api") == "integration" else bool(raw.get("enabled", False)),
             security=raw.get("security"),
             network_id=raw.get("networkconf_id") or raw.get("network_id"),
             hide_ssid=raw.get("hide_ssid"),
             vlan_id=raw.get("vlan") or raw.get("vlan_id"),
-            x_passphrase=raw.get("x_passphrase"),
+            x_passphrase=redact_value("x_passphrase", raw.get("x_passphrase"), redact_sensitive=redact_sensitive),
             guest_policy=raw.get("guest_policy"),
             usergroup_id=raw.get("usergroup_id"),
             fast_roaming_enabled=raw.get("fast_roaming_enabled"),
+            rrm_enabled=raw.get("rrm_enabled"),
+            roaming_assistant_na_enabled=raw.get("roaming_assistant_na_enabled"),
+            roaming_assistant_na_rssi=raw.get("roaming_assistant_na_rssi"),
+            roaming_assistant_6e_enabled=raw.get("roaming_assistant_6e_enabled"),
+            roaming_assistant_6e_rssi=raw.get("roaming_assistant_6e_rssi"),
             pmf_mode=raw.get("pmf_mode"),
             wpa3_support=raw.get("wpa3_support"),
             wpa3_transition=raw.get("wpa3_transition"),
@@ -96,12 +147,20 @@ class Wlan:
             mac_filter_policy=raw.get("mac_filter_policy"),
             mac_filter_list=raw.get("mac_filter_list"),
             schedule_enabled=raw.get("schedule_enabled"),
+            schedule_reversed=raw.get("schedule_reversed"),
+            schedule=raw.get("schedule"),
+            schedule_with_duration=(
+                [WlanScheduleWindow.from_manager_output(window) for window in schedule_windows]
+                if isinstance(schedule_windows, list)
+                else None
+            ),
             l2_isolation=raw.get("l2_isolation"),
             wlan_band=raw.get("wlan_band"),
-            multicast_enhance_enabled=raw.get("multicast_enhance_enabled"),
+            multicast_enhance_enabled=raw.get("mcastenhance_enabled"),
             dtim_mode=raw.get("dtim_mode"),
             dtim_na=raw.get("dtim_na"),
             dtim_ng=raw.get("dtim_ng"),
+            minrate_setting_preference=raw.get("minrate_setting_preference"),
             minrate_ng_enabled=raw.get("minrate_ng_enabled"),
             minrate_ng_data_rate_kbps=raw.get("minrate_ng_data_rate_kbps"),
             minrate_na_enabled=raw.get("minrate_na_enabled"),
@@ -115,4 +174,8 @@ class Wlan:
         )
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        if self.source_api is None:
+            out.pop("source_api", None)
+            out.pop("integration_id", None)
+        return out

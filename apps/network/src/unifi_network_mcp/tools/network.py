@@ -7,12 +7,12 @@ including managing LAN networks and WLANs.
 
 import json
 import logging
-from typing import Annotated, Any, Dict
+from typing import Annotated, Any, Dict, Optional
 
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from unifi_core.confirmation import create_preview, toggle_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, toggle_preview, update_preview
 from unifi_core.network.models.ap_group import (
     from_controller as ap_group_from_controller,
 )
@@ -22,38 +22,61 @@ from unifi_core.network.models.ap_group import (
 from unifi_core.network.models.ap_group import (
     to_controller_update as ap_group_to_update,
 )
-from unifi_core.network.models.networks import (
-    from_controller as network_from_controller,
-)
-from unifi_core.network.models.networks import (
-    to_controller_update as network_to_update,
-)
-from unifi_core.network.models.wlans import (
-    MUTABLE_FIELDS as WLAN_MUTABLE_FIELDS,
-)
-from unifi_core.network.models.wlans import (
-    to_controller_create as wlan_to_create,
-)
-from unifi_core.network.models.wlans import (
-    to_controller_update as wlan_to_update,
-)
-from unifi_network_mcp.runtime import network_manager, server
+from unifi_core.network.models.networks import DELETABLE_PURPOSES as NETWORK_DELETABLE_PURPOSES
+from unifi_core.network.models.networks import MDNS_ENABLED_DESCRIPTION, validate_wan_dns_state
+from unifi_core.network.models.networks import validate_create as validate_network_create
+from unifi_core.network.models.networks import validate_update as validate_network_update
+from unifi_core.network.models.vpn import is_vpn_network
+from unifi_core.network.models.wlans import validate_create as validate_wlan_create
+from unifi_core.network.models.wlans import validate_update as validate_wlan_update
+from unifi_core.network.read_views import shape_network_details, shape_network_list, shape_wlan_list
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_core.write_verification import format_tool_payload
+from unifi_network_mcp.runtime import network_manager, server, should_redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
 
 
 @server.tool(
     name="unifi_list_networks",
+    auth="either",
     description=(
-        "Returns all configured networks (LAN, WAN, VLAN-only) with name, purpose, "
+        "Returns configured networks (LAN, WAN, VLAN-only) with name, purpose, "
         "IP subnet, VLAN ID, DHCP settings, and enabled state. "
         "Use to understand network topology and VLAN layout. "
+        "Filters: search (name/VLAN substring), purpose (corporate/guest/wan/vlan-only), "
+        "limit (default 25), fields (comma-separated subset). "
         "For a single network's full config, use unifi_get_network_details. "
         "For wireless SSIDs, use unifi_list_wlans."
+        " API-key inventory uses legacy reads when supported, otherwise limited public inventory. "
+        "Public results include source_api=integration and integration_id; missing legacy fields are unknown. "
+        "These IDs are scoped to the Integration inventory tool family — do not pass them to other resource tools. "
+        "Full details and mutations can require session credentials."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
-async def list_networks() -> Dict[str, Any]:
+async def list_networks(
+    search: Annotated[
+        Optional[str],
+        Field(description="Filter by name (case-insensitive substring) or VLAN ID (exact match, e.g. '20')"),
+    ] = None,
+    purpose: Annotated[
+        Optional[str],
+        Field(description="Filter by purpose (corporate, guest, wan, vlan-only)"),
+    ] = None,
+    limit: Annotated[int, Field(description="Maximum number of networks to return (default 25)")] = 25,
+    fields: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Comma-separated list of fields to return per network (default: all). "
+                "Available: _id, name, enabled, purpose, ip_subnet, vlan_enabled, vlan, "
+                "dhcpd_enabled, dhcpd_start, dhcpd_stop. "
+                "Example: fields='_id,name,vlan,purpose' returns only those fields."
+            )
+        ),
+    ] = None,
+) -> Dict[str, Any]:
     """Lists all networks configured on the UniFi Network controller for the current site using the V1 API structure.
 
     Returns:
@@ -113,13 +136,14 @@ async def list_networks() -> Dict[str, Any]:
     """
     try:
         networks_data = await network_manager.get_networks()
-        formatted = [network_from_controller(n).model_dump(exclude_none=True) for n in networks_data]
-        return {
-            "success": True,
-            "site": network_manager._connection.site,
-            "count": len(formatted),
-            "networks": formatted,
-        }
+        return shape_network_list(
+            networks_data,
+            site=network_manager._connection.site,
+            search=search,
+            purpose=purpose,
+            limit=limit,
+            fields=fields,
+        )
     except Exception as e:
         logger.error("Error listing networks in tool: %s", e, exc_info=True)
         return {"success": False, "error": f"Failed to list networks: {e}"}
@@ -127,11 +151,36 @@ async def list_networks() -> Dict[str, Any]:
 
 @server.tool(
     name="unifi_get_network_details",
-    description="Get details for a specific network by ID.",
+    description=(
+        "Get details for a specific network by ID. By default (summary=false) returns the full raw "
+        "network configuration. Set summary=true to trim to selected sections via include "
+        "(basic, dhcp, ipv6, vpn, wan, all).\n\n"
+        f"mDNS field note: {MDNS_ENABLED_DESCRIPTION}\n\n"
+        "Examples: <no args> (full raw); summary=true,include='basic' (minimal); "
+        "summary=true,include='basic,dhcp' (adds DHCP server config); summary=true,include='all'."
+    ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_network_details(
     network_id: Annotated[str, Field(description="Unique identifier (_id) of the network (from unifi_list_networks)")],
+    include: Annotated[
+        str,
+        Field(
+            description=(
+                "Comma-separated sections to return when summary=true (default 'basic'). "
+                "Sections: basic, dhcp, ipv6, vpn, wan, all."
+            )
+        ),
+    ] = "basic",
+    summary: Annotated[
+        bool,
+        Field(
+            description=(
+                "When false (default), returns the full raw network object. "
+                "When true, trims to the sections named in include."
+            )
+        ),
+    ] = False,
 ) -> Dict[str, Any]:
     """Gets the detailed configuration of a specific network by its ID.
 
@@ -168,37 +217,65 @@ async def get_network_details(
         }
     }
     """
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         if not network_id:
             return {"success": False, "error": "network_id is required"}
-        # Assuming manager get_network_details returns the raw dict or None
         network = await network_manager.get_network_details(network_id)
-        if network:
-            # Ensure serializable
-            return {
-                "success": True,
-                "site": network_manager._connection.site,
-                "network_id": network_id,
-                "details": json.loads(json.dumps(network, default=str)),
-            }
-        else:
-            return {
-                "success": False,
-                "error": f"Network with ID '{network_id}' not found.",
-            }
+        response = shape_network_details(
+            network,
+            site=network_manager._connection.site,
+            network_id=network_id,
+            include=include,
+            summary=summary,
+        )
+        return redact_sensitive_fields(response, redact_sensitive=redact_sensitive)
     except Exception as e:
         logger.error("Error getting network details for %s: %s", network_id, e, exc_info=True)
         return {"success": False, "error": f"Failed to get network details for {network_id}: {e}"}
+
+
+# WAN fields whose change can interrupt internet connectivity. When any appear in an
+# update diff, the confirm-preview surfaces an explicit warning (see update_network).
+CONNECTIVITY_CRITICAL_WAN_FIELDS: frozenset[str] = frozenset(
+    {
+        "wan_type",
+        "wan_networkgroup",
+        "wan_dns_preference",
+        "wan_dns1",
+        "wan_dns2",
+        "wan_load_balance_type",
+        "wan_load_balance_weight",
+        "wan_failover_priority",
+        "wan_sla",
+        "wan_vlan_enabled",
+        "mac_override_enabled",
+    }
+)
+
+# Moving a network between firewall zones changes its security-policy scope.
+SECURITY_CRITICAL_NETWORK_FIELDS: frozenset[str] = frozenset({"firewall_zone_id"})
+VPN_FIREWALL_ZONE_WARNING = (
+    "WARNING: VPN networks can only use the system-defined Vpn firewall zone. "
+    "UniFi may persist a custom zone without enforcing its policies; confirmed assignments "
+    "to any other zone are rejected."
+)
 
 
 @server.tool(
     name="unifi_update_network",
     description="Update specific fields of an existing network (LAN/VLAN). "
     "Pass only the fields you want to change — current values are automatically preserved. "
-    "Basic: name, purpose ('corporate'/'guest'/'vlan-only'), vlan_enabled (bool), vlan (str), "
+    "Every network field below is a key inside the update_data dict, not a top-level argument, e.g. "
+    "update_data={'dhcpd_enabled': false}. Unknown keys are rejected. "
+    "Basic: name, purpose ('corporate'/'vlan-only'), vlan_enabled (bool), vlan (str), "
     "ip_subnet (CIDR), enabled (bool), network_isolation_enabled (bool, corporate only), "
-    "internet_access_enabled (bool), upnp_lan_enabled (bool). "
-    "DHCP: dhcpd_enabled (bool), dhcpd_start (IP), dhcpd_stop (IP), dhcpd_leasetime (int seconds), "
+    "internet_access_enabled (bool), upnp_lan_enabled (bool), "
+    "firewall_zone_id (str, V2 firewall-zone ID — assigns the network to a zone; these IDs are scoped "
+    "to the V2 firewall/network tool family, so do not pass Integration API firewall-zone UUIDs). "
+    "VPN network entries—site-vpn, remote-user-vpn, vpn-client, and vpn-server—may only use the system-defined "
+    "Vpn zone; custom-zone assignments are rejected because UniFi persists them without enforcing their policies. "
+    "DHCP: dhcpd_enabled (bool), dhcpd_start (IP), dhcpd_stop (IP), dhcpd_leasetime (int seconds), auto_scale_enabled (bool), "
     "dhcpd_gateway (IP), dhcpd_gateway_enabled (bool), dhcp_relay_enabled (bool), "
     "dhcpd_conflict_checking (bool), dhcpguard_enabled (bool, requires dhcpd_ip_1), dhcpd_ip_1 (IP, trusted DHCP server for guard), dhcpd_boot_enabled (bool), dhcpd_boot_server (IP), dhcpd_boot_filename (str), dhcpd_tftp_server (str, DHCP opt 150). "
     "DHCP options: dhcpd_dns_1 (IP), dhcpd_dns_2 (IP), dhcpd_dns_enabled (bool), "
@@ -206,8 +283,30 @@ async def get_network_details(
     "dhcpd_wins_1 (IP), dhcpd_wins_2 (IP), dhcpd_wins_enabled (bool), dhcpd_unifi_controller (IP). "
     "DNS: domain_name (str). "
     "Multicast: igmp_snooping (bool), igmp_querier_switches (list of {switch_mac, querier_address}), "
-    "igmp_flood_unknown_multicast (bool), mdns_enabled (bool). "
-    "Requires confirmation.",
+    "igmp_flood_unknown_multicast (bool). "
+    "WAN (gateway uplink, purpose='wan' networks): wan_type ('dhcp'/'static'/'pppoe'/'disabled'), "
+    "wan_networkgroup ('WAN'/'WAN2'), wan_dns_preference ('auto'/'manual'), "
+    "wan_dns1 (IPv4, required for manual DNS), wan_dns2 (IPv4), "
+    "wan_load_balance_type ('failover-only'/'weighted'), wan_load_balance_weight (int 0-100), "
+    "wan_failover_priority (int), wan_sla (str, controller WAN-SLA configuration ID), "
+    "report_wan_event (bool), wan_smartq_enabled (bool), wan_vlan_enabled (bool), "
+    "igmp_proxy_upstream (bool), igmp_proxy_for (JSON: 'none' or list of network refs), "
+    "mac_override_enabled (bool), wan_ip_aliases (list). "
+    "WAN IPv6 (dual-stack; does not affect IPv4 internet): ipv6_enabled (bool), wan_type_v6 (str), "
+    "ipv6_setting_preference ('auto'/'manual'), "
+    "ipv6_wan_delegation_type ('none'/'pd'/'single_network'/'static'), wan_dhcpv6_pd_size (int), "
+    "wan_dhcpv6_pd_size_auto (bool), wan_ipv6_dns_preference ('auto'/'manual'), wan_ipv6_dns1 (str), wan_ipv6_dns2 (str). "
+    "LAN IPv6 (per-network): ipv6_interface_type ('none'/'static'/'pd'), "
+    "ipv6_aliases (list of CIDR strings, 'Additional IPs' — replaces the whole list), "
+    "ipv6_ra_enabled (bool), ipv6_ra_priority ('high'/'medium'/'low'), ipv6_ra_preferred_lifetime (int seconds), "
+    "ipv6_client_address_assignment ('slaac'/'dhcpv6'), ipv6_pd_interface (str), ipv6_pd_prefixid (hex str), "
+    "ipv6_pd_auto_prefixid_enabled (bool), ipv6_pd_start (str), ipv6_pd_stop (str), "
+    "dhcpdv6_enabled (bool), dhcpdv6_allow_slaac (bool), dhcpdv6_dns_auto (bool), "
+    "dhcpdv6_leasetime (int seconds), dhcpdv6_start (str), dhcpdv6_stop (str). "
+    "WARNING: changing wan_type/wan_networkgroup/DNS/VLAN/failover/load-balance/mac-override on a WAN can interrupt internet connectivity. "
+    "WARNING: setting ipv6_interface_type='static' on a delegated ('pd') network releases its delegated prefix. "
+    "Confirmed writes are read back exactly; responses list persisted, unchanged, dropped, and controller-coerced fields. "
+    "A failed result may represent a partial write and is not a rollback. Requires confirmation.",
     permission_category="networks",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
@@ -218,7 +317,9 @@ async def update_network(
     ],
     update_data: Annotated[
         Dict[str, Any],
-        Field(description="Dictionary of fields to update. See tool description for all supported fields."),
+        Field(
+            description="Dict of network fields to change (keys listed in the tool description), e.g. {'enabled': false}."
+        ),
     ],
     confirm: Annotated[
         bool,
@@ -235,7 +336,7 @@ async def update_network(
         update_data (Dict[str, Any]): Dictionary of fields to update.
             Allowed fields (all optional):
             - name (string): New network name.
-            - purpose (string): New purpose ("corporate", "guest", "vlan-only").
+            - purpose (string): New purpose ("corporate" or "vlan-only"). Setting "guest" is rejected because current controllers can silently place it in the Internal firewall zone.
             - vlan_enabled (boolean): Enable/disable VLAN tagging.
             - vlan (integer): New VLAN ID (1-4094).
             - ip_subnet (string): New IP subnet (CIDR format).
@@ -243,6 +344,9 @@ async def update_network(
             - network_isolation_enabled (boolean): Enable network isolation (corporate networks only).
             - internet_access_enabled (boolean): Allow this network to access the internet.
             - upnp_lan_enabled (boolean): Enable UPnP on this network.
+            - firewall_zone_id (string): V2 firewall-zone ID. VPN network entries may only use the
+              system-defined Vpn zone; custom zones are rejected because the controller does not
+              apply their policies to tunnel interfaces.
             - dhcpd_enabled (boolean): Enable the DHCP server.
             - dhcpd_start (string): DHCP range start IP.
             - dhcpd_stop (string): DHCP range end IP.
@@ -271,13 +375,60 @@ async def update_network(
             - igmp_snooping (boolean): Enable IGMP snooping.
             - igmp_querier_switches (list): IGMP querier assignment.
             - igmp_flood_unknown_multicast (boolean): Flood unknown multicast.
-            - mdns_enabled (boolean): Enable mDNS reflection.
+            WAN uplink fields (purpose='wan' networks — changing connectivity-critical ones
+            surfaces a warning in the confirm-preview):
+            - wan_type (string): WAN IPv4 type: 'dhcp', 'static', 'pppoe', 'disabled'.
+            - wan_networkgroup (string): Physical WAN: 'WAN' (primary) or 'WAN2' (secondary).
+            - wan_dns_preference (string): WAN DNS source: 'auto' or 'manual'.
+            - wan_dns1 (string): Primary WAN IPv4 DNS server; required for manual DNS.
+            - wan_dns2 (string): Secondary WAN IPv4 DNS server.
+            - wan_load_balance_type (string): Dual-WAN mode: 'failover-only' or 'weighted'.
+            - wan_load_balance_weight (integer): Load-balance weight (0-100, used when 'weighted').
+            - wan_failover_priority (integer): Failover priority (lower = higher priority).
+            - wan_smartq_enabled (boolean): Enable Smart Queues (QoS/bufferbloat) on the WAN.
+            - wan_vlan_enabled (boolean): Enable VLAN tagging on the WAN uplink.
+            - igmp_proxy_upstream (boolean): Enable IGMP proxy on this WAN (IPTV multicast).
+            - igmp_proxy_for (JSON): IGMP proxy downstream scope ('none' or list of network refs).
+            - mac_override_enabled (boolean): Enable MAC clone/override on the WAN.
+            - wan_ip_aliases (list): Secondary IP aliases on the WAN.
+            WAN IPv6 uplink fields (dual-stack; changing these does not drop IPv4 internet):
+            - ipv6_enabled (boolean): Enable IPv6 on the WAN uplink.
+            - wan_type_v6 (string): WAN IPv6 type (e.g. 'disabled', 'dhcpv6', 'slaac', 'static').
+            - ipv6_setting_preference (string): IPv6 settings source: 'auto' or 'manual'.
+            - ipv6_wan_delegation_type (string): IPv6 prefix-delegation type:
+              'none', 'pd', 'single_network', or 'static'.
+            - wan_dhcpv6_pd_size (integer): DHCPv6 prefix-delegation size (e.g. 64).
+            - wan_dhcpv6_pd_size_auto (boolean): Auto-negotiate the DHCPv6 PD size.
+            - wan_ipv6_dns_preference (string): WAN IPv6 DNS source: 'auto' or 'manual'.
+            - wan_ipv6_dns1 (string): Primary WAN IPv6 DNS server.
+            - wan_ipv6_dns2 (string): Secondary WAN IPv6 DNS server.
+            LAN IPv6 fields (per-network; independent of the WAN uplink fields above):
+            - ipv6_interface_type (string): LAN IPv6 mode: 'none', 'static', or 'pd'.
+            - ipv6_aliases (list of strings): Additional IPv6 prefixes on this network
+              ('Additional IPs'), e.g. a ULA alongside a delegated prefix. Replaces the
+              whole list — pass every prefix you want to keep.
+            - ipv6_ra_enabled (boolean): Enable IPv6 Router Advertisements on this network.
+            - ipv6_ra_priority (string): RA router preference: 'high', 'medium', 'low'.
+            - ipv6_ra_preferred_lifetime (integer): RA preferred lifetime in seconds.
+            - ipv6_client_address_assignment (string): Client addressing: 'slaac' or 'dhcpv6'.
+            - ipv6_pd_interface (string): WAN the prefix is delegated from (e.g. 'wan').
+            - ipv6_pd_prefixid (string): Per-network prefix ID within the delegated prefix (hex).
+            - ipv6_pd_auto_prefixid_enabled (boolean): Auto-assign the prefix ID; set False to pin it.
+            - ipv6_pd_start (string): Start of the range within the delegated prefix (e.g. '::2').
+            - ipv6_pd_stop (string): End of the range within the delegated prefix (e.g. '::7d1').
+            - dhcpdv6_enabled (boolean): Enable the DHCPv6 server on this network.
+            - dhcpdv6_allow_slaac (boolean): Permit SLAAC alongside DHCPv6.
+            - dhcpdv6_dns_auto (boolean): Advertise DNS automatically over DHCPv6.
+            - dhcpdv6_leasetime (integer): DHCPv6 lease time in seconds.
+            - dhcpdv6_start (string): Start of the DHCPv6 assignment range (e.g. '::2').
+            - dhcpdv6_stop (string): End of the DHCPv6 assignment range (e.g. '::7d1').
         confirm (bool): Must be set to `True` to execute. Defaults to `False`.
 
     Important Constraints:
         - Network isolation (network_isolation_enabled) is ONLY supported on networks with purpose="corporate".
         - Attempting to enable isolation on "guest" or other network types will fail with an API error.
-        - To isolate a guest network: (1) Change its purpose from "guest" to "corporate", then (2) enable network_isolation_enabled.
+        - VPN network entries can only use the system-defined Vpn firewall zone; custom zones are not enforced.
+        - Create or move guest networks to the Hotspot firewall zone in the UniFi UI; the legacy API cannot do this safely.
 
     Returns:
         Dict: Success status, ID, updated fields, details, or error message.
@@ -290,64 +441,87 @@ async def update_network(
         }
     """
     logger.info("unifi_update_network tool called (network_id=%s, confirm=%s)", network_id, confirm)
+    redact_sensitive = should_redact_sensitive_fields()
     if not network_id:
         return {"success": False, "error": "network_id is required"}
     if not update_data:
         return {"success": False, "error": "update_data cannot be empty"}
 
-    # Translate to controller-safe mutable fields
-    validated_data = network_to_update(update_data)
-    if not validated_data:
-        logger.warning("Network update data for ID %s is empty after filtering.", network_id)
-        return {
-            "success": False,
-            "error": "No valid mutable fields provided for update.",
-        }
+    try:
+        validated_data = validate_network_update(update_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
-    # Fetch current state for preview
-    current = await network_manager.get_network_details(network_id)
+    # Fetch current state for preview and confirmed-update validation.
+    try:
+        current = await network_manager.get_network_details(network_id)
+    except Exception as e:
+        logger.error("Failed to read network %s before update: %s", network_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to prepare network update for {network_id}: {e}"}
     if not current:
         return {"success": False, "error": "Network not found"}
+    try:
+        validate_wan_dns_state(current, validated_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     if not confirm:
-        return update_preview(
-            resource_type="network",
-            resource_id=network_id,
-            resource_name=current.get("name"),
-            current_state=current,
-            updates=validated_data,
+        wan_critical = sorted(set(validated_data) & CONNECTIVITY_CRITICAL_WAN_FIELDS)
+        security_critical = sorted(set(validated_data) & SECURITY_CRITICAL_NETWORK_FIELDS)
+        warnings = []
+        if wan_critical and current.get("purpose") == "wan":
+            wan_name = current.get("name") or network_id
+            warnings.append(
+                "WARNING: Changing "
+                + ", ".join(wan_critical)
+                + f" on WAN '{wan_name}' may interrupt internet connectivity. "
+                "Verify the values before setting confirm=true."
+            )
+        if security_critical:
+            effective_network = {**current, **validated_data}
+            if is_vpn_network(effective_network):
+                warnings.append(VPN_FIREWALL_ZONE_WARNING)
+            else:
+                warnings.append(
+                    "WARNING: Changing firewall_zone_id moves this network into a different V2 firewall zone and "
+                    "changes which security policies apply. Verify the V2 zone ID before setting confirm=true."
+                )
+        if validated_data.get("ipv6_interface_type") == "static" and current.get("ipv6_interface_type") == "pd":
+            warnings.append(
+                "WARNING: Switching ipv6_interface_type from 'pd' to 'static' releases this "
+                "network's delegated prefix; clients addressed from it lose their IPv6 "
+                "addresses. Verify before setting confirm=true."
+            )
+        warnings = warnings or None
+        return redact_sensitive_fields(
+            update_preview(
+                resource_type="network",
+                resource_id=network_id,
+                resource_name=current.get("name"),
+                current_state=current,
+                updates=validated_data,
+                warnings=warnings,
+            ),
+            redact_sensitive=redact_sensitive,
         )
-
-    # Basic cross-field validation (more complex logic might need Pydantic models)
-    if "vlan_enabled" in validated_data and validated_data["vlan_enabled"] and "vlan" not in validated_data:
-        # Check if existing network already has VLAN ID if only enabling
-        pass  # Let manager handle fetching existing state for merge
-    if "vlan" in validated_data and (int(validated_data["vlan"]) < 1 or int(validated_data["vlan"]) > 4094):
-        return {"success": False, "error": "'vlan' must be between 1 and 4094."}
 
     updated_fields_list = list(validated_data.keys())
     logger.info("Attempting to update network '%s' with fields: %s", network_id, ", ".join(updated_fields_list))
     try:
-        success, error_detail = await network_manager.update_network(network_id, validated_data)
-
-        if success:
-            updated_network = await network_manager.get_network_details(network_id)
+        write_result = await network_manager.update_network(network_id, validated_data)
+        payload = format_tool_payload(
+            write_result,
+            site=network_manager._connection.site,
+            success_message=f"Network '{network_id}' updated successfully.",
+        )
+        payload["network_id"] = network_id
+        payload["updated_fields"] = updated_fields_list
+        if write_result.success:
             logger.info("Successfully updated network (%s)", network_id)
-            return {
-                "success": True,
-                "network_id": network_id,
-                "updated_fields": updated_fields_list,
-                "details": json.loads(json.dumps(updated_network, default=str)),
-            }
         else:
-            logger.error("Failed to update network (%s): %s", network_id, error_detail)
-            network_after_update = await network_manager.get_network_details(network_id)
-            return {
-                "success": False,
-                "network_id": network_id,
-                "error": f"Failed to update network ({network_id}): {error_detail}",
-                "details_after_attempt": json.loads(json.dumps(network_after_update, default=str)),
-            }
+            payload["error"] = f"Failed to update network ({network_id}): {write_result.error}"
+            logger.error("Network update had unpersisted fields (%s): %s", network_id, write_result.error)
+        return redact_sensitive_fields(payload, redact_sensitive=redact_sensitive)
 
     except Exception as e:
         logger.error("Error updating network %s: %s", network_id, e, exc_info=True)
@@ -355,8 +529,76 @@ async def update_network(
 
 
 @server.tool(
+    name="unifi_delete_network",
+    description=(
+        "Delete a LAN/VLAN network by ID. Requires confirmation. Only LAN-class networks (purpose corporate/"
+        "guest/vlan-only) are deletable; WAN uplinks and VPN networkconf entries are refused. WARNING: dependent "
+        "WLANs, clients, routes, and firewall policies may lose connectivity or become invalid."
+    ),
+    permission_category="networks",
+    permission_action="delete",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+)
+async def delete_network(
+    network_id: Annotated[
+        str, Field(description="Unique identifier (_id) of the network to delete (from unifi_list_networks)")
+    ],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, deletes the network. When false (default), returns a live-state preview"),
+    ] = False,
+) -> Dict[str, Any]:
+    """Delete a network after previewing its live controller state."""
+    redact_sensitive = should_redact_sensitive_fields()
+    try:
+        current = await network_manager.get_network_details(network_id)
+        purpose = current.get("purpose")
+        if purpose not in NETWORK_DELETABLE_PURPOSES:
+            hint = " Use unifi_delete_vpn_client for VPN client configurations." if purpose == "vpn-client" else ""
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing to delete network {network_id}: purpose '{purpose}' is not a LAN/VLAN network. "
+                    "Deleting WAN or VPN networkconf entries can sever gateway connectivity." + hint
+                ),
+            }
+        if not confirm:
+            return redact_sensitive_fields(
+                delete_preview(
+                    resource_type="network",
+                    resource_id=network_id,
+                    resource_data=current,
+                    resource_name=current.get("name", network_id),
+                    warnings=[
+                        "Dependent WLANs, clients, routes, and firewall policies may lose connectivity or become invalid"
+                    ],
+                ),
+                redact_sensitive=redact_sensitive,
+            )
+
+        success = await network_manager.delete_network(network_id)
+        if success:
+            return {
+                "success": True,
+                "network_id": network_id,
+                "message": f"Network '{current.get('name', network_id)}' deleted successfully.",
+            }
+        return {"success": False, "error": f"Failed to delete network '{network_id}'."}
+    except Exception as e:
+        logger.error("Error deleting network %s: %s", network_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to delete network {network_id}: {e}"}
+
+
+@server.tool(
     name="unifi_create_network",
-    description="Create a new network (LAN/VLAN) with schema validation. Requires confirmation.",
+    description=(
+        "Create a new network (LAN/VLAN) with schema validation. Guest creation requires an explicit, verified built-in "
+        "Hotspot firewall_zone_id and network isolation disabled. Guest previews validate the live zone; confirmed creates "
+        "verify both guest purpose and zone. Updating purpose to guest remains unsupported. VPN entries may only specify the system-defined "
+        "Vpn firewall zone; custom zones are persisted without enforcement and therefore rejected. Confirmed creates are "
+        "read back and report exact persisted, dropped, and coerced fields; a failed result may still identify a created resource for cleanup. "
+        "Requires confirmation."
+    ),
     permission_category="networks",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
@@ -365,7 +607,7 @@ async def create_network(
     network_data: Annotated[
         Dict[str, Any],
         Field(
-            description="Network configuration dict. Required: name (str), purpose (str: 'corporate', 'guest', 'wan', 'vlan-only', 'vpn-client', 'vpn-server'). Required if purpose != 'vlan-only': ip_subnet (CIDR, e.g. '192.168.1.0/24'). Required if purpose == 'vlan-only': vlan (int 1-4094). Optional: vlan_enabled, vlan, dhcpd_enabled, dhcpd_start, dhcpd_stop, dhcpd_leasetime, domain_name, enabled, network_isolation_enabled, upnp_lan_enabled. See update_network for the full list of supported DHCP/DNS fields."
+            description="Network configuration dict. Required: name (str), purpose (str: 'corporate', 'guest', 'wan', 'vlan-only', 'vpn-client', 'vpn-server'). Guest creation requires firewall_zone_id for the built-in Hotspot zone and network_isolation_enabled=false or omitted; switch-routed and SD-WAN guest networks are unsupported. Required if purpose != 'vlan-only': ip_subnet (CIDR, e.g. '192.168.1.0/24'). Required if purpose == 'vlan-only': vlan (int 1-4094). Optional: vlan_enabled, vlan, dhcpd_enabled, dhcpd_start, dhcpd_stop, dhcpd_leasetime, domain_name, enabled, network_isolation_enabled, upnp_lan_enabled, firewall_zone_id (V2 firewall-zone ID from unifi_list_firewall_zones; do not pass Integration API UUIDs; VPN entries may only specify the system-defined Vpn zone). See update_network for the full list of supported fields."
         ),
     ],
     confirm: Annotated[
@@ -381,7 +623,7 @@ async def create_network(
 
     Required parameters in network_data:
     - name (string): Network name
-    - purpose (string): Network purpose/type ("corporate", "guest", "wan", "vlan-only", "vpn-client", "vpn-server")
+    - purpose (string): Network purpose/type ("corporate", "guest", "wan", "vlan-only", "vpn-client", "vpn-server"). Guest creation requires an explicit built-in Hotspot firewall_zone_id, verified against the controller.
 
     If purpose is not "vlan-only":
     - ip_subnet (string): IP subnet in CIDR notation (e.g., "192.168.1.0/24") is required
@@ -402,12 +644,16 @@ async def create_network(
     - enabled (boolean): Whether the network is enabled (default: true)
     - network_isolation_enabled (boolean): Enable network isolation (IMPORTANT: Only works on networks with purpose="corporate")
     - upnp_lan_enabled (boolean): Enable UPnP on this network
+    - firewall_zone_id (string): V2 firewall-zone ID from unifi_list_firewall_zones; do not pass Integration API UUIDs. VPN entries may only specify the system-defined Vpn zone.
     (see update_network for the full list of additional DHCP/DNS fields that can
     also be supplied at creation time)
 
     Important Constraints:
     - Network isolation (network_isolation_enabled) is ONLY supported on networks with purpose="corporate".
     - It cannot be enabled on "guest" networks.
+    - Guest creation supports gateway-routed networks with a verified built-in Hotspot zone.
+      Updating an existing network to purpose=guest, switch-routed guest networks and SD-WAN are unsupported.
+    - VPN network entries can only use the system-defined Vpn firewall zone; custom zones are not enforced.
     - All DHCP fields use the `dhcpd_*` prefix (the UniFi API field names); the
       legacy `dhcp_enabled`/`dhcp_start`/`dhcp_stop` names are NOT accepted.
 
@@ -429,115 +675,53 @@ async def create_network(
     - details (object): Details of the created network
     - error (string): Error message if unsuccessful
     """
-    # Filter input to known mutable fields
-    validated_data = network_to_update(network_data) if network_data else {}
-    # Supplement with any required-on-create fields that to_controller_update might drop
-    # (to_controller_update drops None; required fields must still be present)
-    for k in ("name", "purpose", "ip_subnet", "vlan", "vlan_enabled", "dhcpd_start", "dhcpd_stop"):
-        if k in network_data and k not in validated_data and network_data[k] is not None:
-            validated_data[k] = network_data[k]
-    if not validated_data:
-        return {"success": False, "error": "network_data cannot be empty"}
-
-    # Required fields check
-    required_fields = ["name", "purpose"]
-    missing_fields = [field for field in required_fields if field not in validated_data]
-    if missing_fields:
-        error = f"Missing required fields: {', '.join(missing_fields)}"
-        logger.warning(error)
-        return {"success": False, "error": error}
-
-    # Additional validation for purpose type
-    purpose = validated_data.get("purpose")
-    # Ensure purpose is one of the allowed values
-    allowed_purposes = [
-        "corporate",
-        "guest",
-        "wan",
-        "vlan-only",
-        "vpn-client",
-        "vpn-server",
-    ]  # Consider adding "bridge"? Check schema
-    if purpose not in allowed_purposes:
-        return {
-            "success": False,
-            "error": f"Invalid 'purpose': {purpose}. Must be one of {allowed_purposes}.",
-        }
-
-    # Validation based on purpose
-    if purpose != "vlan-only" and not validated_data.get("ip_subnet"):
-        return {
-            "success": False,
-            "error": f"'ip_subnet' is required for network purpose '{purpose}'",
-        }
-
-    if purpose == "vlan-only" and not validated_data.get("vlan"):
-        return {
-            "success": False,
-            "error": "'vlan' is required for network purpose 'vlan-only'.",
-        }
-
-    # Validation for DHCP — UniFi API uses dhcpd_* field names
-    dhcpd_enabled = validated_data.get("dhcpd_enabled", True)
-    if (
-        purpose != "vlan-only"
-        and dhcpd_enabled
-        and (not validated_data.get("dhcpd_start") or not validated_data.get("dhcpd_stop"))
-    ):
-        return {
-            "success": False,
-            "error": "'dhcpd_start' and 'dhcpd_stop' are required if dhcpd_enabled is true (and purpose is not vlan-only).",
-        }
-
-    # Validation for VLAN
-    vlan_enabled = validated_data.get("vlan_enabled", False)
-    vlan_id = validated_data.get("vlan")
-    if vlan_enabled and not vlan_id:
-        return {
-            "success": False,
-            "error": "'vlan' is required when vlan_enabled is true",
-        }
-
-    if vlan_id is not None and (int(vlan_id) < 1 or int(vlan_id) > 4094):
-        return {"success": False, "error": "'vlan' must be between 1 and 4094."}
+    redact_sensitive = should_redact_sensitive_fields()
+    try:
+        validated_data = validate_network_create(network_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    purpose = validated_data["purpose"]
 
     if not confirm:
-        return create_preview(
-            resource_type="network",
-            resource_data=validated_data,
-            resource_name=validated_data.get("name"),
-            warnings=["Creating a network may temporarily disrupt connectivity"],
+        if purpose == "guest":
+            try:
+                await network_manager.validate_firewall_zone_assignment({}, validated_data)
+            except ValueError as exc:
+                return {"success": False, "error": f"Failed to preview guest network: {exc}"}
+            except Exception as exc:
+                logger.error("Failed to preview guest network: %s", type(exc).__name__)
+                return {"success": False, "error": "Failed to preview guest network: check the controller connection"}
+        warnings = ["Creating a network may temporarily disrupt connectivity"]
+        if "firewall_zone_id" in validated_data and is_vpn_network(validated_data):
+            warnings.append(VPN_FIREWALL_ZONE_WARNING)
+        return redact_sensitive_fields(
+            create_preview(
+                resource_type="network",
+                resource_data=validated_data,
+                resource_name=validated_data.get("name"),
+                warnings=warnings,
+            ),
+            redact_sensitive=redact_sensitive,
         )
 
     logger.info("Attempting to create network '%s' with purpose '%s'", validated_data["name"], purpose)
     try:
-        # Use validated data directly
-        network_data = validated_data
-        network_data.setdefault("enabled", True)
-
-        # Assume manager returns the created dict or None/False
-        created_network = await network_manager.create_network(network_data)
-        if created_network and created_network.get("_id"):
-            new_network_id = created_network.get("_id")
-            logger.info("Successfully created network '%s' with ID %s", validated_data["name"], new_network_id)
-            return {
-                "success": True,
-                "site": network_manager._connection.site,
-                "message": f"Network '{validated_data['name']}' created successfully.",
-                "network_id": new_network_id,
-                "details": json.loads(json.dumps(created_network, default=str)),
-            }
-        else:
-            error_msg = (
-                created_network.get("error", "Manager returned failure")
-                if isinstance(created_network, dict)
-                else "Manager returned non-dict or failure"
+        write_result = await network_manager.create_network(validated_data)
+        payload = format_tool_payload(
+            write_result,
+            site=network_manager._connection.site,
+            success_message=f"Network '{validated_data['name']}' created successfully.",
+        )
+        if write_result.success:
+            logger.info(
+                "Successfully created network '%s' with ID %s", validated_data["name"], payload.get("network_id")
             )
-            logger.error("Failed to create network '%s'. Reason: %s", validated_data["name"], error_msg)
-            return {
-                "success": False,
-                "error": f"Failed to create network '{validated_data['name']}'. {error_msg}",
-            }
+        else:
+            payload["error"] = f"Failed to create network '{validated_data['name']}': {write_result.error}"
+            logger.error(
+                "Network create had unpersisted fields for '%s': %s", validated_data["name"], write_result.error
+            )
+        return redact_sensitive_fields(payload, redact_sensitive=redact_sensitive)
     except Exception as e:
         logger.error(
             "Error creating network '%s': %s",
@@ -550,10 +734,28 @@ async def create_network(
 
 @server.tool(
     name="unifi_list_wlans",
-    description="List all configured Wireless LANs (WLANs) on the Unifi Network controller.",
+    auth="either",
+    description=(
+        "List configured Wireless LANs (WLANs) on the Unifi Network controller.\n\n"
+        "Filters: search (SSID name substring), enabled_only, limit (default 25)."
+        " API-key inventory uses legacy reads when supported, otherwise limited public inventory. "
+        "Public results include source_api=integration and integration_id; missing legacy fields are unknown. "
+        "These IDs are scoped to the Integration inventory tool family — do not pass them to other resource tools. "
+        "Full details and mutations can require session credentials."
+    ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
-async def list_wlans() -> Dict[str, Any]:
+async def list_wlans(
+    search: Annotated[
+        Optional[str],
+        Field(description="Filter by SSID name (case-insensitive substring match)"),
+    ] = None,
+    enabled_only: Annotated[
+        bool,
+        Field(description="If true, only return enabled WLANs. Default false."),
+    ] = False,
+    limit: Annotated[int, Field(description="Maximum number of WLANs to return (default 25)")] = 25,
+) -> Dict[str, Any]:
     """Lists all WLANs (Wireless SSIDs) configured on the UniFi Network controller.
 
     Returns:
@@ -589,25 +791,13 @@ async def list_wlans() -> Dict[str, Any]:
     """
     try:
         wlans = await network_manager.get_wlans()
-        # Ensure wlans are dictionaries
-        wlans_raw = [w.raw if hasattr(w, "raw") else w for w in wlans]
-        formatted_wlans = [
-            {
-                "id": w.get("_id"),
-                "name": w.get("name"),
-                "enabled": w.get("enabled"),
-                "security": w.get("security"),
-                "network_id": w.get("networkconf_id"),  # Map internal key
-                "usergroup_id": w.get("usergroup_id"),
-            }
-            for w in wlans_raw
-        ]
-        return {
-            "success": True,
-            "site": network_manager._connection.site,
-            "count": len(formatted_wlans),
-            "wlans": formatted_wlans,
-        }
+        return shape_wlan_list(
+            wlans,
+            site=network_manager._connection.site,
+            search=search,
+            enabled_only=enabled_only,
+            limit=limit,
+        )
     except Exception as e:
         logger.error("Error listing WLANs: %s", e, exc_info=True)
         return {"success": False, "error": f"Failed to list WLANs: {e}"}
@@ -654,17 +844,21 @@ async def get_wlan_details(
         }
     }
     """
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         if not wlan_id:
             return {"success": False, "error": "wlan_id is required"}
         wlan = await network_manager.get_wlan_details(wlan_id)
         if wlan:
-            return {
-                "success": True,
-                "site": network_manager._connection.site,
-                "wlan_id": wlan_id,
-                "details": json.loads(json.dumps(wlan, default=str)),
-            }
+            return redact_sensitive_fields(
+                {
+                    "success": True,
+                    "site": network_manager._connection.site,
+                    "wlan_id": wlan_id,
+                    "details": json.loads(json.dumps(wlan, default=str)),
+                },
+                redact_sensitive=redact_sensitive,
+            )
         else:
             return {"success": False, "error": f"WLAN with ID '{wlan_id}' not found."}
     except Exception as e:
@@ -676,18 +870,28 @@ async def get_wlan_details(
     name="unifi_update_wlan",
     description="Update specific fields of an existing WLAN (SSID). "
     "Pass only the fields you want to change — current values are automatically preserved. "
+    "Every WLAN field below is a key inside the update_data dict, not a top-level argument, e.g. "
+    "update_data={'enabled': false, 'hide_ssid': true}. Unknown keys are rejected. "
     "Basic: name (str), security ('open'/'wpapsk'/'wpa2-psk'), x_passphrase (str), "
-    "enabled (bool), hide_ssid (bool), guest_policy (bool), usergroup_id (str), networkconf_id (str). "
+    "enabled (bool), hide_ssid (bool), guest_policy (controller-dependent bool; may be reported as dropped), "
+    "usergroup_id (str), networkconf_id (str). "
     "Security: wpa3_support (bool), wpa3_transition (bool), pmf_mode ('disabled'/'optional'/'required'), "
     "fast_roaming_enabled (bool), group_rekey (int seconds, 0=disabled). "
+    "Roaming: rrm_enabled (bool, 802.11k neighbour reports), "
+    "roaming_assistant_na_enabled (bool), roaming_assistant_na_rssi (int dBm, 5GHz kick threshold e.g. -77), "
+    "roaming_assistant_6e_enabled (bool), roaming_assistant_6e_rssi (int dBm, 6GHz kick threshold e.g. -88). "
     "Access control: mac_filter_enabled (bool), mac_filter_policy ('allow'/'deny'), "
     "mac_filter_list (list of MAC strings), l2_isolation (bool). "
     "Radio: wlan_band ('both'/'2g'/'5g'), multicast_enhance_enabled (bool), "
     "dtim_mode ('default'/'custom'), dtim_na (int 1-255), dtim_ng (int 1-255), "
-    "minrate_ng_enabled (bool), minrate_ng_data_rate_kbps (int), "
+    "minrate_setting_preference ('auto'/'manual'), minrate_ng_enabled (bool), minrate_ng_data_rate_kbps (int), "
     "minrate_na_enabled (bool), minrate_na_data_rate_kbps (int). "
-    "Other: schedule_enabled (bool), uapsd_enabled (bool), proxy_arp (bool), iapp_enabled (bool). "
-    "Requires confirmation.",
+    "Scheduling: schedule_enabled (bool), schedule_reversed (bool), "
+    "schedule (list[str], e.g. 'mon-fri|0100-0700'), schedule_with_duration "
+    "(list of objects with duration_minutes, optional name, start_days_of_week, start_hour, start_minute). "
+    "Other: uapsd_enabled (bool), proxy_arp (bool), iapp_enabled (bool). "
+    "Confirmed writes are read back exactly; responses list persisted, unchanged, dropped, and controller-coerced fields. "
+    "A failed result may represent a partial write and is not a rollback. Requires confirmation.",
     permission_category="wlans",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
@@ -696,7 +900,9 @@ async def update_wlan(
     wlan_id: Annotated[str, Field(description="Unique identifier (_id) of the WLAN to update (from unifi_list_wlans)")],
     update_data: Annotated[
         Dict[str, Any],
-        Field(description="Dictionary of fields to update. See tool description for all supported fields."),
+        Field(
+            description="Dict of WLAN fields to change (keys listed in the tool description), e.g. {'enabled': false}."
+        ),
     ],
     confirm: Annotated[
         bool,
@@ -725,33 +931,39 @@ async def update_wlan(
             "details": { ... updated WLAN details ... }
         }
     """
+    redact_sensitive = should_redact_sensitive_fields()
     if not wlan_id:
         return {"success": False, "error": "wlan_id is required"}
     if not update_data:
         return {"success": False, "error": "update_data cannot be empty"}
 
-    # Translate to controller-compatible update payload via pydantic model
-    validated_data = wlan_to_update(update_data)
+    # Redaction-marker write-back is rejected centrally at the MCP dispatch
+    # boundary (StrictKwargFastMCP.call_tool), so no per-field check here.
 
-    if not validated_data:
-        logger.warning("WLAN update data for ID %s is empty after validation.", wlan_id)
-        return {
-            "success": False,
-            "error": "Update data is effectively empty or invalid.",
-        }
+    try:
+        validated_data = validate_wlan_update(update_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
-    # Fetch current state for preview
-    current = await network_manager.get_wlan_details(wlan_id)
+    # Fetch current state for preview and confirmed-update validation.
+    try:
+        current = await network_manager.get_wlan_details(wlan_id)
+    except Exception as e:
+        logger.error("Failed to read WLAN %s before update: %s", wlan_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to prepare WLAN update for {wlan_id}: {e}"}
     if not current:
         return {"success": False, "error": "WLAN not found"}
 
     if not confirm:
-        return update_preview(
-            resource_type="wlan",
-            resource_id=wlan_id,
-            resource_name=current.get("name"),
-            current_state=current,
-            updates=validated_data,
+        return redact_sensitive_fields(
+            update_preview(
+                resource_type="wlan",
+                resource_id=wlan_id,
+                resource_name=current.get("name"),
+                current_state=current,
+                updates=validated_data,
+            ),
+            redact_sensitive=redact_sensitive,
         )
 
     # Basic cross-field validation for password
@@ -762,26 +974,20 @@ async def update_wlan(
     updated_fields_list = list(validated_data.keys())
     logger.info("Attempting to update WLAN '%s' with fields: %s", wlan_id, ", ".join(updated_fields_list))
     try:
-        success, error_detail = await network_manager.update_wlan(wlan_id, validated_data)
-
-        if success:
-            updated_wlan = await network_manager.get_wlan_details(wlan_id)
+        write_result = await network_manager.update_wlan(wlan_id, validated_data)
+        payload = format_tool_payload(
+            write_result,
+            site=network_manager._connection.site,
+            success_message=f"WLAN '{wlan_id}' updated successfully.",
+        )
+        payload["wlan_id"] = wlan_id
+        payload["updated_fields"] = updated_fields_list
+        if write_result.success:
             logger.info("Successfully updated WLAN (%s)", wlan_id)
-            return {
-                "success": True,
-                "wlan_id": wlan_id,
-                "updated_fields": updated_fields_list,
-                "details": json.loads(json.dumps(updated_wlan, default=str)),
-            }
         else:
-            logger.error("Failed to update WLAN (%s): %s", wlan_id, error_detail)
-            wlan_after_update = await network_manager.get_wlan_details(wlan_id)
-            return {
-                "success": False,
-                "wlan_id": wlan_id,
-                "error": f"Failed to update WLAN ({wlan_id}): {error_detail}",
-                "details_after_attempt": json.loads(json.dumps(wlan_after_update, default=str)),
-            }
+            payload["error"] = f"Failed to update WLAN ({wlan_id}): {write_result.error}"
+            logger.error("WLAN update had unpersisted fields (%s): %s", wlan_id, write_result.error)
+        return redact_sensitive_fields(payload, redact_sensitive=redact_sensitive)
 
     except Exception as e:
         logger.error("Error updating WLAN %s: %s", wlan_id, e, exc_info=True)
@@ -790,7 +996,11 @@ async def update_wlan(
 
 @server.tool(
     name="unifi_create_wlan",
-    description=("Create a new Wireless LAN (WLAN/SSID) with schema validation. Requires confirmation."),
+    description=(
+        "Create a new Wireless LAN (WLAN/SSID) with schema validation. Confirmed creates are read back and report "
+        "exact persisted, dropped, and controller-coerced fields; a failed result may still identify a created WLAN "
+        "for cleanup. Requires confirmation."
+    ),
     permission_category="wlans",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
@@ -799,7 +1009,7 @@ async def create_wlan(
     wlan_data: Annotated[
         Dict[str, Any],
         Field(
-            description="WLAN configuration dict. Required: name (SSID string), security ('open'/'wpa-psk'/'wpa2-psk'). Required if security != 'open': x_passphrase (password). Optional: enabled (bool, default true), hide_ssid (bool), guest_policy (bool), usergroup_id, networkconf_id (network to associate)"
+            description="WLAN configuration dict. Required: name (SSID string), security ('open'/'wpa-psk'/'wpa2-psk'). Required if security != 'open': x_passphrase (password). Optional: enabled (bool, default true), hide_ssid (bool), guest_policy (controller-dependent; current versions may silently ignore it and report it as dropped), usergroup_id, networkconf_id (network to associate). Roaming: rrm_enabled (bool, 802.11k neighbour reports), roaming_assistant_na_enabled (bool), roaming_assistant_na_rssi (int dBm, 5GHz kick threshold e.g. -77), roaming_assistant_6e_enabled (bool), roaming_assistant_6e_rssi (int dBm, 6GHz kick threshold e.g. -88). Scheduling: schedule_enabled (bool), schedule_reversed (bool), schedule (list[str]), schedule_with_duration (list of objects with duration_minutes, optional name, start_days_of_week, start_hour, start_minute)"
         ),
     ],
     confirm: Annotated[
@@ -823,9 +1033,18 @@ async def create_wlan(
     Optional parameters in wlan_data:
     - enabled (boolean): Whether the network is enabled (default: true)
     - hide_ssid (boolean): Whether to hide the SSID (default: false)
-    - guest_policy (boolean): Whether this is a guest network (default: false)
+    - guest_policy (boolean): Controller-dependent legacy flag. Current versions may silently ignore it; confirmed writes report it as dropped. Use firewall zones/policies for guest isolation.
     - usergroup_id (string): User group ID (default: default group)
     - networkconf_id (string): Network configuration ID to associate with (default: default LAN)
+    - rrm_enabled (boolean): Enable 802.11k Radio Resource Management (neighbour reports)
+    - roaming_assistant_na_enabled (boolean): Enable the 5GHz roaming assistant
+    - roaming_assistant_na_rssi (integer): 5GHz roaming assistant RSSI threshold in dBm (e.g. -77)
+    - roaming_assistant_6e_enabled (boolean): Enable the 6GHz roaming assistant
+    - roaming_assistant_6e_rssi (integer): 6GHz roaming assistant RSSI threshold in dBm (e.g. -88)
+    - schedule_enabled (boolean): Enable time-based WLAN scheduling
+    - schedule_reversed (boolean): Invert the controller's interpretation of schedule windows
+    - schedule (list[string]): Legacy compact schedule rules
+    - schedule_with_duration (list[object]): Recurring schedule windows with start day/time and duration
 
     Example:
     {
@@ -842,67 +1061,37 @@ async def create_wlan(
     - details (object): Details of the created WLAN
     - error (string): Error message if unsuccessful
     """
-    # Filter input to known mutable fields via pydantic model
-    from unifi_core.network.models.wlans import Wlan as WlanModel
-
+    redact_sensitive = should_redact_sensitive_fields()
     try:
-        wlan_model = WlanModel(**{k: v for k, v in wlan_data.items() if k in WLAN_MUTABLE_FIELDS})
-    except Exception as exc:
-        return {"success": False, "error": f"Invalid WLAN data: {exc}"}
-    validated_data = wlan_to_create(wlan_model)
-
-    # Required fields check
-    required_fields = ["name", "security"]
-    missing_fields = [field for field in required_fields if field not in validated_data]
-    if missing_fields:
-        error = f"Missing required fields: {', '.join(missing_fields)}"
-        logger.warning(error)
-        return {"success": False, "error": error}
-
-    # Check passphrase requirement
-    if validated_data.get("security") != "open" and not validated_data.get("x_passphrase"):
-        return {
-            "success": False,
-            "error": "'x_passphrase' is required when security is not 'open'",
-        }
+        validated_data = validate_wlan_create(wlan_data)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     if not confirm:
-        return create_preview(
-            resource_type="wlan",
-            resource_data=validated_data,
-            resource_name=validated_data.get("name"),
-            warnings=["Creating a WLAN may temporarily affect wireless connectivity"],
+        return redact_sensitive_fields(
+            create_preview(
+                resource_type="wlan",
+                resource_data=validated_data,
+                resource_name=validated_data.get("name"),
+                warnings=["Creating a WLAN may temporarily affect wireless connectivity"],
+            ),
+            redact_sensitive=redact_sensitive,
         )
 
     logger.info("Attempting to create WLAN '%s' with security '%s'", validated_data["name"], validated_data["security"])
     try:
-        # Pass validated data directly to manager
-        wlan_payload = validated_data
-        wlan_payload.setdefault("enabled", True)
-
-        created_wlan = await network_manager.create_wlan(wlan_payload)
-
-        if created_wlan and created_wlan.get("_id"):
-            new_wlan_id = created_wlan.get("_id")
-            logger.info("Successfully created WLAN '%s' with ID %s", validated_data["name"], new_wlan_id)
-            return {
-                "success": True,
-                "site": network_manager._connection.site,
-                "message": f"WLAN '{validated_data['name']}' created successfully.",
-                "wlan_id": new_wlan_id,
-                "details": json.loads(json.dumps(created_wlan, default=str)),
-            }
+        write_result = await network_manager.create_wlan(validated_data)
+        payload = format_tool_payload(
+            write_result,
+            site=network_manager._connection.site,
+            success_message=f"WLAN '{validated_data['name']}' created successfully.",
+        )
+        if write_result.success:
+            logger.info("Successfully created WLAN '%s' with ID %s", validated_data["name"], payload.get("wlan_id"))
         else:
-            error_msg = (
-                created_wlan.get("error", "Manager returned failure")
-                if isinstance(created_wlan, dict)
-                else "Manager returned non-dict or failure"
-            )
-            logger.error("Failed to create WLAN '%s'. Reason: %s", validated_data["name"], error_msg)
-            return {
-                "success": False,
-                "error": f"Failed to create WLAN '{validated_data['name']}'. {error_msg}",
-            }
+            payload["error"] = f"Failed to create WLAN '{validated_data['name']}': {write_result.error}"
+            logger.error("WLAN create had unpersisted fields for '%s': %s", validated_data["name"], write_result.error)
+        return redact_sensitive_fields(payload, redact_sensitive=redact_sensitive)
 
     except Exception as e:
         logger.error(
@@ -936,6 +1125,7 @@ async def delete_wlan(
     ] = False,
 ) -> Dict[str, Any]:
     """Delete a WLAN/SSID. All devices using this SSID will be disconnected."""
+    redact_sensitive = should_redact_sensitive_fields()
     if not confirm:
         # Fetch current WLAN details to show what will be deleted
         try:
@@ -946,6 +1136,7 @@ async def delete_wlan(
                     "name": wlan.get("name", "Unknown"),
                     "enabled": wlan.get("enabled"),
                     "security": wlan.get("security"),
+                    "x_passphrase": wlan.get("x_passphrase"),
                 }
                 if wlan
                 else {"wlan_id": wlan_id}
@@ -955,11 +1146,15 @@ async def delete_wlan(
             resource_data = {"wlan_id": wlan_id}
             resource_name = wlan_id
 
-        return create_preview(
-            resource_type="wlan",
-            resource_data=resource_data,
-            resource_name=resource_name,
-            warnings=["All devices using this SSID will be disconnected"],
+        return redact_sensitive_fields(
+            delete_preview(
+                resource_type="wlan",
+                resource_id=wlan_id,
+                resource_data=resource_data,
+                resource_name=resource_name,
+                warnings=["All devices using this SSID will be disconnected"],
+            ),
+            redact_sensitive=redact_sensitive,
         )
 
     try:
@@ -1249,8 +1444,9 @@ async def delete_ap_group(
             resource_data = {"group_id": group_id}
             resource_name = group_id
 
-        return create_preview(
+        return delete_preview(
             resource_type="ap_group",
+            resource_id=group_id,
             resource_data=resource_data,
             resource_name=resource_name,
             warnings=["APs in this group may lose their SSID assignments"],

@@ -59,6 +59,64 @@ class KnownFace(BaseModel):
     )
 
 
+class KnownLicensePlate(BaseModel):
+    """Canonical Protect License Plate Identity / vehicle recognition group row.
+
+    Mirrors :class:`KnownFace` exactly — the underlying Protect endpoint
+    (``recognition/vehicle/groups``) returns the same group shape as
+    ``recognition/face/groups``, just keyed by a license plate (``matched_name``)
+    instead of a recognized face. ``metadata`` typically carries vehicle
+    attributes (e.g. ``color`` and ``vehicleType`` sub-dicts) for plated vehicles.
+    """
+
+    id: Optional[str] = Field(
+        default=None,
+        description="License-plate identity id (UUID or 'vehicle_LPR-<PLATE>' string)",
+        json_schema_extra={"mutable": False},
+    )
+    name: Optional[str] = Field(default=None, description="Assigned license-plate identity name")
+    matched_name: Optional[str] = Field(
+        default=None, description="Recognized license plate text", json_schema_extra={"mutable": False}
+    )
+    type: Optional[str] = Field(
+        default=None, description="Recognition group type", json_schema_extra={"mutable": False}
+    )
+    image_path: Optional[str] = Field(
+        default=None, description="Controller image reference path", json_schema_extra={"mutable": False}
+    )
+    enhanced_path: Optional[str] = Field(
+        default=None, description="Controller enhanced image reference path", json_schema_extra={"mutable": False}
+    )
+    detections_count: Optional[int] = Field(
+        default=None, description="Number of detections in this group", json_schema_extra={"mutable": False}
+    )
+    first_detected_at: Optional[str] = Field(
+        default=None,
+        description="First detection timestamp in epoch milliseconds",
+        json_schema_extra={"mutable": False},
+    )
+    last_detected_at: Optional[str] = Field(
+        default=None, description="Last detection timestamp in epoch milliseconds", json_schema_extra={"mutable": False}
+    )
+    is_notification_enabled: Optional[bool] = Field(
+        default=None,
+        description="Whether notifications are enabled for this group",
+    )
+    is_degraded: Optional[bool] = Field(
+        default=None, description="Whether Protect marks this group as degraded", json_schema_extra={"mutable": False}
+    )
+    tags: list[Any] = Field(default_factory=list, description="Recognition tags", json_schema_extra={"mutable": False})
+    description: Optional[str] = Field(default=None, description="Optional group description")
+    created_at: Optional[str] = Field(
+        default=None, description="Creation timestamp in epoch milliseconds", json_schema_extra={"mutable": False}
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional controller metadata (e.g. color, vehicleType for vehicles)",
+        json_schema_extra={"mutable": False},
+    )
+
+
 class KnownFaceUpdate(BaseModel):
     """Mutable fields accepted by Known Face update operations."""
 
@@ -131,6 +189,35 @@ def from_controller(raw: Any) -> KnownFace:
     )
 
 
+def license_plate_from_controller(raw: Any) -> KnownLicensePlate:
+    """Build a KnownLicensePlate from a Protect recognition/vehicle group object."""
+    tags = _get(raw, "tags")
+    if not isinstance(tags, list):
+        tags = []
+
+    metadata = _get(raw, "metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return KnownLicensePlate(
+        id=_get(raw, "id"),
+        name=_get(raw, "name"),
+        matched_name=_get_any(raw, "matched_name", "matchedName"),
+        type=_get(raw, "type"),
+        image_path=_get_any(raw, "image_path", "imagePath"),
+        enhanced_path=_get_any(raw, "enhanced_path", "enhancedPath"),
+        detections_count=_get_any(raw, "detections_count", "detectionsCount"),
+        first_detected_at=_stringify(_get_any(raw, "first_detected_at", "firstDetectedAt")),
+        last_detected_at=_stringify(_get_any(raw, "last_detected_at", "lastDetectedAt")),
+        is_notification_enabled=_get_any(raw, "is_notification_enabled", "isNotificationEnabled"),
+        is_degraded=_get_any(raw, "is_degraded", "isDegraded"),
+        tags=tags,
+        description=_get(raw, "description"),
+        created_at=_stringify(_get_any(raw, "created_at", "createdAt")),
+        metadata=metadata,
+    )
+
+
 def links_from_controller(raw: Any) -> RecognitionLinks:
     """Build pagination links from a Protect recognition response."""
     if not isinstance(raw, dict):
@@ -157,3 +244,47 @@ def to_controller_update(fields: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("fields must include at least one supported mutable field")
 
     return {_TO_CONTROLLER_UPDATE[key]: value for key, value in supplied.items()}
+
+
+class KnownLicensePlateUpdate(BaseModel):
+    """Mutable fields accepted by Known License Plate update operations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, description="Assigned license-plate identity name")
+    description: Optional[str] = Field(default=None, description="Optional group description")
+    is_notification_enabled: Optional[bool] = Field(
+        default=None,
+        description="Whether notifications are enabled for this group",
+    )
+
+
+PLATE_MUTABLE_FIELDS = frozenset(KnownLicensePlateUpdate.model_fields.keys())
+PLATE_READ_ONLY_FIELDS = frozenset(KnownLicensePlate.model_fields.keys()) - PLATE_MUTABLE_FIELDS
+
+_TO_CONTROLLER_PLATE_UPDATE = {
+    "name": "name",
+    "description": "description",
+    "is_notification_enabled": "isNotificationEnabled",
+}
+
+
+def to_controller_plate_update(fields: dict[str, Any]) -> dict[str, Any]:
+    """Translate a partial Known License Plate update into Protect API field names."""
+    if not fields:
+        raise ValueError("fields must include at least one supported mutable field")
+
+    unknown = set(fields) - PLATE_MUTABLE_FIELDS - PLATE_READ_ONLY_FIELDS
+    if unknown:
+        raise ValueError(f"Unsupported known license plate fields: {sorted(unknown)}")
+
+    read_only = set(fields) & PLATE_READ_ONLY_FIELDS
+    if read_only:
+        raise ValueError(f"Read-only known license plate fields cannot be updated: {sorted(read_only)}")
+
+    update = KnownLicensePlateUpdate(**fields)
+    supplied = update.model_dump(exclude_unset=True)
+    if not supplied:
+        raise ValueError("fields must include at least one supported mutable field")
+
+    return {_TO_CONTROLLER_PLATE_UPDATE[key]: value for key, value in supplied.items()}

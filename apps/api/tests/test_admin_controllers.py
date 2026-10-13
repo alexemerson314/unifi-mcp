@@ -63,7 +63,7 @@ async def _seed_controller(
             Controller(
                 id=cid,
                 name=name,
-                base_url="https://10.0.0.1:443",
+                base_url="https://192.0.2.1:443",
                 product_kinds=products,
                 credentials_blob=cred_blob,
                 verify_tls=False,
@@ -102,7 +102,7 @@ async def test_controllers_page_shell_renders_unauth_and_table_fragment_lists_ro
         r = await c.get("/admin/controllers/_table", headers={"Authorization": f"Bearer {key}"})
         assert r.status_code == 200
         assert "home-net" in r.text
-        assert "https://10.0.0.1:443" in r.text
+        assert "https://192.0.2.1:443" in r.text
         assert "hunter2" not in r.text
 
 
@@ -117,7 +117,7 @@ async def test_controllers_create_round_trips(tmp_path: Path, monkeypatch) -> No
             headers=headers,
             data={
                 "name": "added-via-ui",
-                "base_url": "https://10.1.1.1:443",
+                "base_url": "https://192.0.2.2:443",
                 "username": "u",
                 "password": "p",
                 "api_token": "",
@@ -136,6 +136,46 @@ async def test_controllers_create_round_trips(tmp_path: Path, monkeypatch) -> No
         assert len(match) == 1
         assert match[0].is_default is True
         assert match[0].verify_tls is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credentials,product",
+    [
+        ({}, "network"),
+        ({"username": "u"}, "network"),
+        ({"api_token": "synthetic"}, "protect"),
+    ],
+)
+async def test_admin_create_rejects_invalid_credentials(tmp_path, monkeypatch, credentials, product):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key = await _bootstrap_app_with_admin_key(tmp_path)
+    headers = {"Authorization": f"Bearer {key}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/admin/controllers/create",
+            headers=headers,
+            data={"name": "Invalid", "base_url": "https://controller.test", "product_kinds": [product], **credentials},
+        )
+        assert response.status_code == 422
+        assert (await client.get("/v1/controllers", headers=headers)).json() == []
+
+
+@pytest.mark.asyncio
+async def test_admin_update_rejects_key_only_protect_without_persistence(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key = await _bootstrap_app_with_admin_key(tmp_path)
+    cid = await _seed_controller(app, username="", password="", api_token="synthetic")
+    headers = {"Authorization": f"Bearer {key}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        before = (await client.get(f"/v1/controllers/{cid}", headers=headers)).json()
+        response = await client.post(
+            f"/admin/controllers/{cid}/update",
+            headers=headers,
+            data={"name": "Invalid", "base_url": "https://controller.test", "product_kinds": ["protect"]},
+        )
+        assert response.status_code == 422
+        assert (await client.get(f"/v1/controllers/{cid}", headers=headers)).json() == before
 
 
 @pytest.mark.asyncio
@@ -158,7 +198,7 @@ async def test_controllers_edit_with_blank_password_preserves_creds(tmp_path: Pa
             headers=headers,
             data={
                 "name": "home-renamed",
-                "base_url": "https://10.0.0.1:443",
+                "base_url": "https://192.0.2.1:443",
                 "username": "",
                 "password": "",
                 "api_token": "",

@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from unifi_access_mcp.runtime import event_manager, server
+from unifi_core.access.managers.event_manager import MAX_EVENT_QUERY_LIMIT
 from unifi_core.access.models.events import (
     activity_summary_from_controller,
     event_from_controller,
@@ -38,7 +39,12 @@ async def access_list_events(
     topic: Annotated[
         str,
         Field(
-            description="Event topic to query: 'admin' (user/account changes) or 'admin_activity' (admin actions). Default: admin."
+            description=(
+                "Event topic, mirroring the Access UI's syslog Category filter: 'unlocks' "
+                "(door grants and open/close), 'access_denial' (refused attempts), 'ring' "
+                "(doorbell), 'updates', 'critical', 'admin' (user/account changes), "
+                "'admin_activity' (admin actions). No other value is accepted. Default: admin."
+            )
         ),
     ] = "admin",
     start: Annotated[
@@ -59,10 +65,12 @@ async def access_list_events(
     ] = None,
     limit: Annotated[
         int,
-        Field(description="Maximum number of events to return (default 30)."),
+        Field(ge=0, le=MAX_EVENT_QUERY_LIMIT, description="Maximum number of events to return (0-5000, default 30)."),
     ] = 30,
 ) -> Dict[str, Any]:
     """List access events."""
+    if limit < 0:
+        return {"success": False, "error": "Failed to list events: limit must be zero or greater"}
     logger.info("access_list_events tool called (topic=%s, door=%s, user=%s, limit=%s)", topic, door_id, user_id, limit)
     try:
         raw_events = await event_manager.list_events(
@@ -92,7 +100,7 @@ async def access_list_events(
     auth="local_only",
 )
 async def access_get_event(
-    event_id: Annotated[str, Field(description="Event UUID (from access_list_events or access_recent_events)")],
+    event_id: Annotated[str, Field(description="Event ID (from access_list_events or access_recent_events)")],
 ) -> Dict[str, Any]:
     """Get a single event by ID."""
     logger.info("access_get_event tool called for %s", event_id)
@@ -122,7 +130,14 @@ async def access_get_event(
 async def access_recent_events(
     event_type: Annotated[
         Optional[str],
-        Field(description=("Filter by event type: door_open, door_close, access_granted, access_denied, door_alarm.")),
+        Field(
+            description=(
+                "Filter by event type, matched exactly against the controller's own dotted "
+                "event names as delivered over the websocket - e.g. 'access.door.unlock', "
+                "'access.dps.status.update', 'access.logs.add', 'access.hw.door_bell', "
+                "'access.data.device.remote_unlock'. Omit to return every buffered event."
+            )
+        ),
     ] = None,
     door_id: Annotated[
         Optional[str],

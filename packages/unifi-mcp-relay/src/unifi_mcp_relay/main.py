@@ -12,7 +12,8 @@ from typing import Any
 from unifi_mcp_relay.client import RelayClient
 from unifi_mcp_relay.config import RelayConfig
 from unifi_mcp_relay.discovery import ServerInfo, discover_all
-from unifi_mcp_relay.forwarder import ToolForwarder
+from unifi_mcp_relay.forwarder import RelayBatchJobs, ToolForwarder
+from unifi_mcp_relay.policy import filter_relay_tools, relay_call_rejection
 from unifi_mcp_relay.protocol import ToolInfo
 
 logger = logging.getLogger("unifi-mcp-relay")
@@ -22,6 +23,11 @@ class DiscoveryNotReadyError(RuntimeError):
     """Raised when configured local MCP servers are not ready for relay registration."""
 
 
+def _catalog_snapshot(tools: list[ToolInfo]) -> tuple[ToolInfo, ...]:
+    """Return an order-independent snapshot for complete catalog comparison."""
+    return tuple(sorted(tools, key=lambda tool: (tool.server_origin or "", tool.name)))
+
+
 class RelaySidecar:
     """Top-level orchestrator that wires discovery, forwarding, and the relay client together."""
 
@@ -29,7 +35,11 @@ class RelaySidecar:
         self._config = config
         self._client = RelayClient(config)
         self._forwarder: ToolForwarder | None = None
+        # Shared by replacement forwarders, including completions of in-flight
+        # calls on the old one. Never shared across separate relay instances.
+        self._batch_jobs: RelayBatchJobs = {}
         self._catalog: list[ToolInfo] = []
+        self._advertised_catalog: tuple[ToolInfo, ...] = ()
         self._refresh_task: asyncio.Task | None = None
         self._running: bool = False
 
@@ -51,11 +61,11 @@ class RelaySidecar:
 
         catalog: list[ToolInfo] = []
         for info in servers:
-            catalog.extend(info.tools)
+            catalog.extend(filter_relay_tools(info.tools))
         if not catalog:
             raise DiscoveryNotReadyError("configured local MCP servers returned an empty tool catalog")
 
-        forwarder = ToolForwarder(servers)
+        forwarder = ToolForwarder(servers, batch_jobs=self._batch_jobs)
         await forwarder.open()
 
         # Close old forwarder only after the replacement is ready, so a
@@ -112,6 +122,10 @@ class RelaySidecar:
         if self._forwarder is None:
             return None, "Forwarder not initialized"
 
+        rejection = relay_call_rejection(tool_name, arguments)
+        if rejection is not None:
+            return None, rejection
+
         outcome = await self._forwarder.forward_with_error(tool_name, arguments)
         if isinstance(outcome, str):
             # forward_with_error returns a string on error
@@ -127,13 +141,13 @@ class RelaySidecar:
 
             logger.info("[main] Refresh: re-discovering tool catalog...")
             try:
-                old_names = {t.name for t in self._catalog}  # Save BEFORE refresh
                 await self._discover_catalog()
-                new_names = {t.name for t in self._catalog}  # Compare AFTER refresh
+                new_catalog = _catalog_snapshot(self._catalog)
 
-                if old_names != new_names:
+                if self._advertised_catalog != new_catalog:
                     sent = await self._client.send_catalog_update(self._catalog)
                     if sent:
+                        self._advertised_catalog = new_catalog
                         logger.info("[main] Sent catalog_update with %d tools", len(self._catalog))
                     else:
                         logger.warning("[main] Could not send catalog_update: client not connected")
@@ -160,12 +174,14 @@ class RelaySidecar:
 
         try:
             catalog = await self._wait_for_startup_catalog()
+            self._advertised_catalog = _catalog_snapshot(catalog)
 
             self._refresh_task = asyncio.create_task(self._refresh_loop())
 
             await self._client.run(
                 tools=catalog,
                 tool_call_handler=self._handle_tool_call,
+                catalog_provider=lambda: self._catalog,
             )
         finally:
             self._running = False

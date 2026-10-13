@@ -16,7 +16,27 @@ type AccessDevice {
   type: String
   isOnline: Boolean
   firmwareVersion: String
-  location: String
+  mac: String
+  ip: String
+  location: AccessLocation
+}
+
+"""
+A single per-device config/settings entry (key/value with category tag).
+"""
+type AccessDeviceConfig {
+  deviceId: ID
+  key: String
+  value: String
+  tag: String
+  updateTime: String
+  createTime: String
+}
+
+"""A device's config/settings entries."""
+type AccessDeviceConfigPage {
+  items: [AccessDeviceConfig!]!
+  nextCursor: String
 }
 
 """Paginated page of UniFi Access devices."""
@@ -33,6 +53,7 @@ type AccessEvent {
   doorId: String
   userId: String
   credentialId: String
+  message: String
   result: String
 
   """The door this event references."""
@@ -56,6 +77,18 @@ type AccessHealth {
   numOfflineDevices: Int
 }
 
+"""
+Structured location reference (door / floor / building) for an Access device.
+"""
+type AccessLocation {
+  uniqueId: ID
+  name: String
+  upId: ID
+  locationType: String
+  fullName: String
+  level: Int
+}
+
 """Read-only access to UniFi Access resources."""
 type AccessQuery {
   """List doors on the Access controller (paginated)."""
@@ -76,6 +109,11 @@ type AccessQuery {
   """Look up a single Access device by id."""
   device(controller: ID!, id: ID!): AccessDevice
 
+  """
+  List a device's config/settings entries (e.g. reader voice greeting). Secrets redacted.
+  """
+  deviceConfigs(controller: ID!, deviceId: ID!): AccessDeviceConfigPage!
+
   """List Access users (employees / cardholders, paginated)."""
   users(controller: ID!, limit: Int! = 50, cursor: String = null): UserPage!
 
@@ -94,14 +132,20 @@ type AccessQuery {
   """List Access schedules (weekly access windows)."""
   schedules(controller: ID!, limit: Int! = 50, cursor: String = null): SchedulePage!
 
-  """List Access visitors (time-bounded guest passes)."""
+  """
+  List Access Developer API visitors. Returned UUIDs are scoped to the visitor family and must not be passed to other Access user or credential operations.
+  """
   visitors(controller: ID!, limit: Int! = 50, cursor: String = null): VisitorPage!
 
-  """Look up a single Access visitor by id."""
+  """
+  Look up one Access Developer API visitor using a UUID returned by the visitor family; IDs from other Access user or credential operations are not accepted.
+  """
   visitor(controller: ID!, id: ID!): Visitor
 
-  """List Access events (paginated, most recent first)."""
-  events(controller: ID!, limit: Int! = 50, cursor: String = null): AccessEventPage!
+  """
+  List Access events by system-log topic, paginated most recent first. Use unlocks for door grants and open/close history, access_denial for refused attempts, ring for doorbells, or updates, critical, admin, and admin_activity.
+  """
+  events(controller: ID!, limit: Int! = 50, cursor: String = null, topic: String! = "admin"): AccessEventPage!
 
   """Look up a single Access event by id."""
   event(controller: ID!, id: ID!): AccessEvent
@@ -136,6 +180,10 @@ type AclRule {
   destinationType: String
   sourceMacs: [String!]!
   destinationMacs: [String!]!
+  sourceNetmask: Int
+  destinationNetmask: Int
+  sourceMacMask: String
+  destinationMacMask: String
 }
 
 """Paginated page of ACL rules."""
@@ -187,6 +235,31 @@ type AlarmPage {
 """Wrapper for protect_alarm_list_profiles — {profiles, count}."""
 type AlarmProfileList {
   profiles: JSON
+  count: Int
+
+  """Whether the result has complete Alarm Manager v2 coverage."""
+  complete: Boolean
+
+  """Explains missing v2-only profile fields when complete is false."""
+  coverageNotice: String
+}
+
+"""A UniFi Protect alarm rule (normalized; includes AI-powered alarms)."""
+type AlarmRule {
+  id: ID
+  title: String
+  enabled: Boolean
+  triggers: JSON
+  actions: JSON
+  scope: JSON
+  stats: JSON
+  createdAt: String
+  updatedAt: String
+}
+
+"""Wrapper for protect_alarm_list_rules — {rules, count}."""
+type AlarmRuleList {
+  rules: JSON
   count: Int
 }
 
@@ -253,10 +326,14 @@ type BackupPage {
   nextCursor: String
 }
 
+"""A signed integer that can exceed GraphQL Int's 32-bit range."""
+scalar BigInt
+
 """A client currently blocked on the UniFi Network controller."""
 type BlockedClient {
   mac: ID
   hostname: String
+  name: String
   lastSeen: String
   blocked: Boolean!
 }
@@ -275,10 +352,13 @@ type Camera {
   model: String
   type: String
   state: String
+  firmwareVersion: String
   isRecording: Boolean
   isMotionDetected: Boolean
   isSmartDetected: Boolean
   host: String
+  smartDetectTypes: [String!]
+  isPtz: Boolean
   channels: JSON
   irLedMode: String
   hdrMode: String
@@ -350,13 +430,20 @@ type Client {
   mac: ID
   ip: String
   hostname: String
-  isWired: Boolean!
-  isGuest: Boolean!
+  name: String
+  isWired: Boolean
+  isGuest: Boolean
   status: String!
   lastSeen: String
   firstSeen: String
   note: String
   usergroupId: String
+  sourceApi: String
+
+  """
+  Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family — do not pass them to legacy resource tools.
+  """
+  integrationId: ID
 
   """The AP or switch this client connects through."""
   device: Device
@@ -382,6 +469,7 @@ type ClientLookup {
   mac: ID
   ip: String
   hostname: String
+  name: String
   isOnline: Boolean!
   lastSeen: String
 }
@@ -432,6 +520,12 @@ type ContentFilter {
   clientMacs: [String!]!
   networkIds: [String!]!
   scheduleMode: String
+  scheduleDays: [String!]
+  scheduleTimeAllDay: Boolean
+  scheduleTimeStart: String
+  scheduleTimeEnd: String
+  scheduleDateStart: String
+  scheduleDateEnd: String
 }
 
 """Paginated page of content filters."""
@@ -458,6 +552,22 @@ type CredentialPage {
   nextCursor: String
 }
 
+type CustomService {
+  name: String
+  address: String
+}
+
+"""Detection-search filter vocabulary (the 'Find Anything' label groups)."""
+type DetectionSearchLabels {
+  colors: JSON
+  vehicleTypes: JSON
+  smartDetectTypes: JSON
+  eventTypes: JSON
+  groupType: JSON
+  devices: JSON
+  doorAccess: JSON
+}
+
 """A UniFi network device (AP, switch, gateway)."""
 type Device {
   mac: ID
@@ -469,6 +579,16 @@ type Device {
   state: String
   ip: String
   ports: JSON
+  systemStats: JSON
+  generalTemperature: Float
+  temperatures: JSON
+  uptimeStats: JSON
+  sourceApi: String
+
+  """
+  Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family — do not pass them to legacy resource tools.
+  """
+  integrationId: ID
 
   """Clients currently connected through this AP/switch."""
   portClients: [Client!]!
@@ -597,6 +717,26 @@ type DpiStats {
   categories: JSON!
 }
 
+"""A Dynamic DNS provider entry configured on the controller."""
+type DynamicDns {
+  id: ID
+  siteId: String
+  hostName: String
+  service: String
+  server: String
+  login: String
+  xPassword: String
+  interface: String
+  customService: String
+  options: [String!]
+}
+
+"""Paginated page of Dynamic DNS entries."""
+type DynamicDnsPage {
+  items: [DynamicDns!]!
+  nextCursor: String
+}
+
 """A UniFi Protect event row (list + detail share this shape)."""
 type Event {
   id: ID
@@ -610,6 +750,9 @@ type Event {
   recognizedPersonId: ID
   recognizedPersonName: String
   recognizedPersonConfidence: Int
+  recognizedPlateText: String
+  recognizedPlateGroupId: ID
+  recognizedPlateConfidence: Int
   detectedThumbnailId: ID
 }
 
@@ -622,6 +765,12 @@ type EventLog {
   mac: String
   ip: String
   severity: String
+  category: String
+  subcategory: String
+  event: String
+  srcIp: String
+  dstIp: String
+  initiatorId: String
 }
 
 """Paginated page of event-log entries."""
@@ -648,7 +797,7 @@ type EventThumbnail {
   sizeBytes: Int
 }
 
-"""Wrapper for event-type prefix descriptors."""
+"""Wrapper for exact event-key descriptors."""
 type EventTypes {
   eventTypes: JSON!
 }
@@ -665,6 +814,13 @@ type FirewallGroup {
 type FirewallGroupPage {
   items: [FirewallGroup!]!
   nextCursor: String
+}
+
+"""
+User-defined firewall policy ordering for a source/destination zone pair. Policy IDs in this object are UniFi integration-API UUIDs scoped to the ordering tool family — use them only with the matching reorder mutation. They do NOT correspond to the policy IDs returned by other controller-API firewall queries.
+"""
+type FirewallPolicyOrdering {
+  ordering: JSON!
 }
 
 """A firewall policy rule."""
@@ -696,7 +852,9 @@ type FirewallRulePage {
   nextCursor: String
 }
 
-"""A firewall zone (V2 /firewall/zone-matrix entry)."""
+"""
+A firewall zone from the V2 controller API. Its ID is a V2 ObjectID, not an Integration API UUID.
+"""
 type FirewallZone {
   id: ID
   name: String
@@ -712,11 +870,91 @@ type FirmwareStatus {
   devicesWithUpdates: Int
 }
 
+"""UniFi gateway (USG) security / NAT / connection-tracking settings."""
+type GatewaySettings {
+  id: ID
+  key: String
+  geoIpFilteringEnabled: Boolean
+  geoIpFilteringBlock: String
+  geoIpFilteringCountries: String
+  geoIpFilteringTrafficDirection: String
+  synCookies: Boolean
+  broadcastPing: Boolean
+  receiveRedirects: Boolean
+  sendRedirects: Boolean
+  dnsVerification: JSON
+  upnpEnabled: Boolean
+  upnpNatPmpEnabled: Boolean
+  upnpSecureMode: Boolean
+  upnpWanInterface: String
+  mssClamp: String
+  ftpModule: Boolean
+  greModule: Boolean
+  h323Module: Boolean
+  pptpModule: Boolean
+  sipModule: Boolean
+  tftpModule: Boolean
+  offloadAccounting: Boolean
+  offloadL2Blocking: Boolean
+  offloadSch: Boolean
+  icmpTimeout: Int
+  otherTimeout: Int
+  udpStreamTimeout: Int
+  udpOtherTimeout: Int
+  tcpEstablishedTimeout: Int
+  tcpCloseTimeout: Int
+  tcpCloseWaitTimeout: Int
+  tcpFinWaitTimeout: Int
+  tcpLastAckTimeout: Int
+  tcpSynRecvTimeout: Int
+  tcpSynSentTimeout: Int
+  tcpTimeWaitTimeout: Int
+  timeoutSettingPreference: String
+  echoServer: String
+  unbindWanMonitors: Boolean
+}
+
+"""Signature status from a legacy Network gateway device."""
+type GatewaySignature {
+  """
+  Legacy Network device ID, not an Integration API UUID; null if unknown.
+  """
+  deviceId: ID
+
+  """Gateway MAC address; null if unknown."""
+  macAddress: String
+
+  """Gateway display name; null if unknown."""
+  name: String
+
+  """Signature rule count; null if unknown."""
+  ruleCount: BigInt
+
+  """Signature update time in Unix milliseconds; null if unknown."""
+  updateTime: BigInt
+
+  """Controller signature type; null if unknown."""
+  signatureType: String
+
+  """Activation state; null if unknown."""
+  isActivating: Boolean
+}
+
 """Service health snapshot — smoke field for the GraphQL endpoint."""
 type HealthSnapshot {
   ok: Boolean!
   version: String!
   pythonVersion: String!
+}
+
+"""
+Bounded, read-only incident evidence: a unifi-incident-evidence-view (every source's coverage, failures and budget usage plus bounded record citations) or, with detail full, the whole unifi-incident-evidence document.
+"""
+type IncidentEvidence {
+  """
+  The unifi-incident-evidence-view, or the unifi-incident-evidence document with detail full. Check coverage_complete before treating an empty result as an all-clear.
+  """
+  document: JSON!
 }
 
 """
@@ -747,6 +985,70 @@ type KnownFace {
 type KnownFacePage {
   items: [KnownFace!]!
   nextCursor: String
+}
+
+"""A UniFi Protect license-plate identity (vehicle recognition group)."""
+type KnownLicensePlate {
+  id: ID
+  name: String
+  matchedName: String
+  type: String
+  imagePath: String
+  enhancedPath: String
+  detectionsCount: Int
+  firstDetectedAt: String
+  lastDetectedAt: String
+  isNotificationEnabled: Boolean
+  isDegraded: Boolean
+  tags: JSON
+  description: String
+  createdAt: String
+  metadata: JSON
+}
+
+"""Paginated page of UniFi Protect license-plate identities."""
+type KnownLicensePlatePage {
+  items: [KnownLicensePlate!]!
+  nextCursor: String
+}
+
+"""
+A rule from the legacy (pre-zone-based) firewall engine, read from V1 /rest/firewallrule. Distinct from FirewallRule, which models the V2 zone-based engine: actions are lowercase (accept/drop/reject), rules belong to a ruleset rather than a zone pair, and source/destination are flat fields rather than nested objects. Read-only.
+"""
+type LegacyFirewallRule {
+  id: ID
+  name: String
+  ruleset: String
+  ruleIndex: Int
+  action: String
+  enabled: Boolean
+  protocol: String
+  protocolV6: String
+  protocolMatchExcepted: Boolean
+  srcAddress: String
+  srcAddressIpv6: String
+  srcPort: String
+  srcMacAddress: String
+  srcFirewallgroupIds: [String!]!
+  srcNetworkconfId: String
+  srcNetworkconfType: String
+  dstAddress: String
+  dstAddressIpv6: String
+  dstPort: String
+  dstFirewallgroupIds: [String!]!
+  dstNetworkconfId: String
+  dstNetworkconfType: String
+  stateNew: Boolean
+  stateEstablished: Boolean
+  stateRelated: Boolean
+  stateInvalid: Boolean
+  icmpTypename: String
+  icmpv6Typename: String
+  ipsec: String
+  logging: Boolean
+  settingPreference: String
+  noEdit: Boolean
+  noDelete: Boolean
 }
 
 """A UniFi Protect light (PIR-triggered floodlight)."""
@@ -809,12 +1111,75 @@ type LldpRow {
   capabilities: [String!]!
 }
 
+"""Site-wide mDNS services; network scope is read-only."""
+type MdnsSettings {
+  id: ID
+  siteId: String
+  mode: String
+  predefinedServices: [PredefinedService!]!
+  customServices: [CustomService!]!
+  enabledFor: String
+  enabledForNetworkIds: [String!]!
+}
+
+"""
+Read-only device management (mgmt) posture: device SSH state, key and credential presence. No credential, hash or key material is ever returned.
+"""
+type MgmtSettings {
+  xSshEnabled: Boolean
+  xSshUsername: String
+  xSshAuthPasswordEnabled: Boolean
+  xSshBindWildcard: Boolean
+  sshKeysPresent: Boolean
+  sshKeysCount: Int
+  sshPasswordSet: Boolean
+  sshPasswordHashSet: Boolean
+  mgmtKeySet: Boolean
+  apiTokenSet: Boolean
+  debugToolsEnabled: Boolean
+  autoUpgrade: Boolean
+  autoUpgradeHour: Int
+  advancedFeatureEnabled: Boolean
+  unifiIdpEnabled: Boolean
+  wifimanEnabled: Boolean
+}
+
+"""
+A V2 controller NAT rule. Its ID is scoped to the NAT tool family; do not pass it to port-forward or Integration API tools.
+"""
+type NatRule {
+  id: ID
+  isPredefined: Boolean
+  settingPreference: String
+  type: String
+  description: String
+  enabled: Boolean
+  ruleIndex: Int
+  protocol: String
+  ipVersion: String
+  inInterface: String
+  outInterface: String
+  ipAddress: String
+  port: String
+  logging: Boolean
+  exclude: Boolean
+  pppoeUseBaseInterface: Boolean
+  sourceFilter: JSON
+  destinationFilter: JSON
+}
+
+"""Paginated page of V2 NAT rules."""
+type NatRulePage {
+  items: [NatRule!]!
+  nextCursor: String
+}
+
 """A UniFi LAN/VLAN network configuration."""
 type Network {
   id: ID
   name: String
   purpose: String
-  enabled: Boolean!
+  enabled: Boolean
   vlanEnabled: Boolean
   vlan: String
   ipSubnet: String
@@ -844,13 +1209,73 @@ type Network {
   dhcpRelayEnabled: Boolean
   dhcpdIp1: String
   dhcpguardEnabled: Boolean
+  autoScaleEnabled: Boolean
   igmpSnooping: Boolean
   igmpQuerierSwitches: JSON
   igmpFloodUnknownMulticast: Boolean
+
+  """
+  Whether mDNS is enabled for this network. Read-only and not authoritative: mDNS is configured site-wide on current UniFi Network versions, and this key only mirrors that site-wide scope — the mirror can go stale for hours, so treat the site-level setting as the source of truth (this server does not expose it). The controller accepts this field on the per-network write path but silently ignores it; unifi_update_network rejects it as read-only.
+  """
   mdnsEnabled: Boolean
   networkIsolationEnabled: Boolean
   internetAccessEnabled: Boolean
   upnpLanEnabled: Boolean
+
+  """
+  V2 firewall-zone ID. These IDs are scoped to the V2 firewall/network tool family; do not pass Integration API firewall-zone UUIDs.
+  """
+  firewallZoneId: String
+  wanType: String
+  wanNetworkgroup: String
+  wanDnsPreference: String
+  wanDns1: String
+  wanDns2: String
+  wanLoadBalanceType: String
+  wanLoadBalanceWeight: Int
+  wanFailoverPriority: Int
+
+  """Controller WAN-SLA configuration ID for this uplink."""
+  wanSla: String
+  reportWanEvent: Boolean
+  wanSmartqEnabled: Boolean
+  wanVlanEnabled: Boolean
+  igmpProxyUpstream: Boolean
+  igmpProxyFor: JSON
+  macOverrideEnabled: Boolean
+  wanIpAliases: JSON
+  ipv6Enabled: Boolean
+  wanTypeV6: String
+  ipv6SettingPreference: String
+  ipv6WanDelegationType: String
+  wanDhcpv6PdSize: Int
+  wanDhcpv6PdSizeAuto: Boolean
+  wanIpv6DnsPreference: String
+  wanIpv6Dns1: String
+  wanIpv6Dns2: String
+  ipv6InterfaceType: String
+  ipv6Aliases: [String!]
+  ipv6RaEnabled: Boolean
+  ipv6RaPriority: String
+  ipv6RaPreferredLifetime: Int
+  ipv6ClientAddressAssignment: String
+  ipv6PdInterface: String
+  ipv6PdPrefixid: String
+  ipv6PdAutoPrefixidEnabled: Boolean
+  ipv6PdStart: String
+  ipv6PdStop: String
+  dhcpdv6Enabled: Boolean
+  dhcpdv6AllowSlaac: Boolean
+  dhcpdv6DnsAuto: Boolean
+  dhcpdv6Leasetime: Int
+  dhcpdv6Start: String
+  dhcpdv6Stop: String
+  sourceApi: String
+
+  """
+  Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family — do not pass them to legacy resource tools.
+  """
+  integrationId: ID
 
   """Clients on this network."""
   clients: [Client!]!
@@ -893,7 +1318,7 @@ type NetworkQuery {
   """Look up a single device by MAC address."""
   device(controller: ID!, mac: ID!, site: String! = "default"): Device
 
-  """Get the radio configuration for a UniFi access point."""
+  """Get the radio configuration for a UniFi device with radios."""
   deviceRadio(controller: ID!, mac: ID!, site: String! = "default"): DeviceRadio
 
   """Get LLDP neighbors reported by a switch."""
@@ -953,6 +1378,14 @@ type NetworkQuery {
   """Look up a single DNS record by id."""
   dnsRecord(controller: ID!, id: ID!, site: String! = "default"): DnsRecord
 
+  """
+  List Dynamic DNS provider entries on the given controller/site (paginated).
+  """
+  dynamicDns(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): DynamicDnsPage!
+
+  """Look up a single Dynamic DNS entry by id."""
+  dynamicDnsEntry(controller: ID!, id: ID!, site: String! = "default"): DynamicDns
+
   """List configured static routes (paginated)."""
   routes(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): RoutePage!
 
@@ -983,6 +1416,16 @@ type NetworkQuery {
   """List firewall zones (typically a small flat list — no pagination)."""
   firewallZones(controller: ID!, site: String! = "default"): [FirewallZone!]!
 
+  """
+  List legacy (pre-zone-based) firewall rules. Sites still running the legacy engine return no zone-based policies or zones, so an empty firewallPolicies result does not mean no firewall rules are configured — check here as well.
+  """
+  legacyFirewallRules(controller: ID!, site: String! = "default"): [LegacyFirewallRule!]!
+
+  """
+  Get user-defined firewall policy ordering for a source/destination zone pair. Returns policy IDs from the UniFi integration API (UUIDs); these IDs are scoped to the ordering tool family and do NOT correspond to the policy IDs returned by firewallPolicies or other controller-API firewall queries. Requires a UniFi API key (UNIFI_API_KEY).
+  """
+  firewallPolicyOrdering(controller: ID!, sourceFirewallZoneId: String!, destinationFirewallZoneId: String!, site: String! = "default"): FirewallPolicyOrdering!
+
   """List QoS rules on the given controller/site (paginated)."""
   qosRules(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): QosRulePage!
 
@@ -1012,6 +1455,16 @@ type NetworkQuery {
 
   """Look up a single OON policy by id."""
   oonPolicy(controller: ID!, id: ID!, site: String! = "default"): OonPolicy
+
+  """
+  List V2 NAT rules in descending controller ID order. These IDs are scoped to the V2 NAT tool family — do not pass them to port-forward or Integration API tools.
+  """
+  natRules(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): NatRulePage!
+
+  """
+  Get a V2 NAT rule by its NAT-family ID; do not use port-forward or Integration API IDs.
+  """
+  natRule(controller: ID!, id: ID!, site: String! = "default"): NatRule
 
   """List port forwards on the given controller/site (paginated)."""
   portForwards(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): PortForwardPage!
@@ -1067,7 +1520,35 @@ type NetworkQuery {
   """Get SNMP settings."""
   snmpSettings(controller: ID!, site: String! = "default"): SnmpSettings
 
-  """Get the controller's event-type prefix catalog."""
+  """Get site-wide mDNS service settings and read-only network scope."""
+  mdnsSettings(controller: ID!, site: String! = "default"): MdnsSettings
+
+  """
+  Get site-wide threat management (IDS/IPS) and traffic identification settings.
+  """
+  threatManagementSettings(controller: ID!, site: String! = "default"): ThreatManagementSettings
+
+  """
+  Get CyberSecure threat posture for HOUR, DAY, WEEK, or MONTH using a Network session.
+  """
+  threatPosture(controller: ID!, site: String! = "default", period: String! = "DAY"): ThreatPosture
+
+  """
+  Collect bounded, read-only Network event evidence for one incident window as a unifi-incident-evidence-view (coverage plus bounded record citations), or with detail full the whole unifi-incident-evidence document. Stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear. Not cached.
+  """
+  incidentEvidence(controller: ID!, start: String!, end: String!, site: String! = "default", deviceMacs: [String!] = null, locationId: String = null, maxWindowSeconds: Int! = 86400, maxEvents: Int! = 1000, maxCalls: Int! = 20, maxElapsedMs: Int! = 30000, mappings: JSON = null, detail: String! = "view", maxRecordsReturned: Int = null, resumeAfter: String = null): IncidentEvidence!
+
+  """
+  Get device management (mgmt) settings: device SSH, debug tools, automatic upgrades.
+  """
+  mgmtSettings(controller: ID!, site: String! = "default"): MgmtSettings
+
+  """Get gateway (USG) security / NAT / connection-tracking settings."""
+  gatewaySettings(controller: ID!, site: String! = "default"): GatewaySettings
+
+  """
+  Get exact event keys sampled from the controller's 1,000 most recent events within the last 7 days.
+  """
   eventTypes(controller: ID!, site: String! = "default"): EventTypes
 
   """Get auto-backup schedule + retention settings."""
@@ -1093,6 +1574,14 @@ type NetworkQuery {
 
   """Get a client's current WiFi parameters (signal, rates)."""
   clientWifiDetails(controller: ID!, mac: ID!, site: String! = "default"): ClientWifiDetails
+
+  """Query historical traffic flows (Insights > Flows), paginated."""
+  trafficFlows(controller: ID!, site: String! = "default", withinHours: Int! = 24, timeFrom: Int = null, timeTo: Int = null, searchText: String = null, pageSize: Int! = 100, cursor: String = null): TrafficFlowPage!
+
+  """
+  Aggregated Insights > Flows summary (risk/region counts + Top-Talkers).
+  """
+  trafficFlowStatistics(controller: ID!, site: String! = "default", period: String! = "DAY", top: Int! = 10): TrafficFlowStatistics!
 
   """List switch port profiles on the given controller/site (paginated)."""
   portProfiles(controller: ID!, site: String! = "default", limit: Int! = 50, cursor: String = null): PortProfilePage!
@@ -1200,6 +1689,7 @@ type PortForward {
   enabled: Boolean!
   fwdProtocol: String
   dstPort: String
+  destinationIp: String
   fwdPort: String
   fwdIp: String
   src: String
@@ -1226,13 +1716,24 @@ type PortProfile {
   id: ID
   name: String
   forward: String
+  taggedVlanMgmt: String
   nativeNetworkconfId: String
   taggedNetworkconfIds: [String!]!
+  excludedNetworkconfIds: [String!]
   voiceNetworkconfId: String
   poeMode: String
   isolation: Boolean
   stpPortMode: Boolean
+  stpEdgeState: String
+  stpBpduGuardEnabled: Boolean
+  stpUplink: Boolean
   dot1xCtrl: String
+  stormctrlBcastEnabled: Boolean
+  stormctrlBcastRate: Int
+  stormctrlMcastEnabled: Boolean
+  stormctrlMcastRate: Int
+  stormctrlUcastEnabled: Boolean
+  stormctrlUcastRate: Int
 }
 
 """Paginated page of switch port profiles."""
@@ -1266,6 +1767,10 @@ type PortStats {
   portTable: [PortStatRow!]!
 }
 
+type PredefinedService {
+  code: String
+}
+
 """UniFi Protect NVR health snapshot (pass-through)."""
 type ProtectHealth {
   cpu: JSON
@@ -1277,6 +1782,11 @@ type ProtectHealth {
 
 """Read-only access to UniFi Protect resources."""
 type ProtectQuery {
+  """
+  Collect bounded, read-only Protect event evidence for one incident window as a unifi-incident-evidence-view (coverage plus bounded record citations), or with detail full the whole unifi-incident-evidence document. Each camera ID is its own source. Stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear. Not cached.
+  """
+  incidentEvidence(controller: ID!, start: String!, end: String!, cameraIds: [String!] = null, locationId: String = null, maxWindowSeconds: Int! = 86400, maxEvents: Int! = 1000, maxCalls: Int! = 20, maxElapsedMs: Int! = 30000, mappings: JSON = null, detail: String! = "view", maxRecordsReturned: Int = null, resumeAfter: String = null): IncidentEvidence!
+
   """List cameras on the Protect controller (paginated)."""
   cameras(controller: ID!, limit: Int! = 50, cursor: String = null): CameraPage!
 
@@ -1295,14 +1805,37 @@ type ProtectQuery {
   """List assigned Protect Known Faces / named face recognition groups."""
   knownFaces(controller: ID!, limit: Int! = 50, cursor: String = null, minConfidence: Int! = 30, includeInterest: Boolean! = true, groupTypes: [String!] = null, orderBy: String! = "name", orderDirection: String! = "asc"): KnownFacePage!
 
+  """
+  List UniFi Protect license-plate identities (vehicle recognition groups). Each entry's id is the value to use in a `license_plate_known` alarm-rule condition.
+  """
+  knownLicensePlates(controller: ID!, limit: Int! = 50, cursor: String = null, minConfidence: Int! = 30, includeInterest: Boolean! = true, groupTypes: [String!] = null, orderBy: String! = "name", orderDirection: String! = "asc"): KnownLicensePlatePage!
+
+  """
+  Search detections across cameras via Protect's 'Find Anything' filter vocabulary. Pass labels of the form 'prefix:value' (e.g. 'vehicleType:truck'); use detectionSearchLabels to discover legal values.
+  """
+  searchDetections(controller: ID!, labels: [String!]!, limit: Int! = 100, order: String! = "desc", excludeMotion: Boolean! = true, minConfidence: Int = null): [SmartDetection!]!
+
+  """The detection-search filter vocabulary ('Find Anything' label groups)."""
+  detectionSearchLabels(controller: ID!): DetectionSearchLabels!
+
   """List paired Protect chimes (paginated)."""
   chimes(controller: ID!, limit: Int! = 50, cursor: String = null): ChimePage!
 
   """Get the alarm system arm-state snapshot."""
   alarmStatus(controller: ID!): AlarmStatus
 
-  """List configured alarm profiles ({profiles, count})."""
+  """
+  List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.
+  """
   alarmProfiles(controller: ID!): AlarmProfileList
+
+  """
+  List configured alarm rules / Alarm Manager automations ({rules, count}).
+  """
+  alarmRules(controller: ID!): AlarmRuleList
+
+  """Fetch a single alarm rule (automation) by id."""
+  alarmRule(controller: ID!, id: ID!): AlarmRule
 
   """List Protect events (paginated, most recent first)."""
   events(controller: ID!, limit: Int! = 50, cursor: String = null, eventType: String = null, cameraId: String = null): EventPage!
@@ -1402,12 +1935,12 @@ type Query {
   access: AccessQuery!
 }
 
-"""Radio configuration entry on a UniFi access point."""
+"""Radio configuration entry on a UniFi device with radios."""
 type RadioEntry {
   name: String
   radio: String
   channel: Int
-  ht: Int
+  ht: String
   txPower: Int
   txPowerMode: String
   currentChannel: Int
@@ -1534,6 +2067,9 @@ type SmartDetection {
   recognizedPersonId: ID
   recognizedPersonName: String
   recognizedPersonConfidence: Int
+  recognizedPlateText: String
+  recognizedPlateGroupId: ID
+  recognizedPlateConfidence: Int
   detectedThumbnailId: ID
 }
 
@@ -1549,12 +2085,17 @@ type Snapshot {
   contentType: String
   capturedAt: String
   url: String
+  snapshotUrl: String
+  imageBase64: String
 }
 
 """Controller SNMP settings."""
 type SnmpSettings {
   enabled: Boolean!
   community: String
+  enabledV3: Boolean
+  username: String
+  xPassword: String
   port: Int
   version: String
 }
@@ -1615,6 +2156,78 @@ type SystemInfo {
   numClients: Int
 }
 
+"""
+Site-wide threat management (IDS/IPS) and traffic identification settings.
+"""
+type ThreatManagementSettings {
+  """
+  Raw IPS operation mode string from controller (e.g. 'disabled', 'ids', 'ips', 'ipsInline').
+  """
+  ipsMode: String
+
+  """
+  Normalized enabled state: true for known active modes, false for disabled, null for unknown/missing.
+  """
+  enabled: Boolean
+
+  """Enabled threat category codes (null when absent from controller)."""
+  enabledCategories: [String!]
+
+  """Protected network IDs (null when absent from controller)."""
+  enabledNetworks: [String!]
+
+  """
+  Traffic identification (DPI) enabled state (strict boolean, null if missing/malformed).
+  """
+  trafficIdentificationEnabled: Boolean
+
+  """
+  Device fingerprinting enabled state (strict boolean, null if missing/malformed).
+  """
+  deviceFingerprintingEnabled: Boolean
+
+  """Advanced filtering preference; null when missing or malformed."""
+  advancedFilteringPreference: String
+}
+
+"""
+CyberSecure summary and gateway signature status for a selected period.
+"""
+type ThreatPosture {
+  """HOUR, DAY, WEEK, or MONTH."""
+  period: String!
+
+  """Enterprise status; null if unknown."""
+  enterprise: Boolean
+
+  """Subscription status; null if unknown."""
+  hasSubscription: Boolean
+
+  """IPS enabled state; null if unknown."""
+  ipsEnabled: Boolean
+
+  """Activation state; null if unknown."""
+  isActivating: Boolean
+
+  """Scanned bytes during the period; null if unknown."""
+  scannedBytes: BigInt
+
+  """Signature capacity; null if unknown."""
+  signatureCapacity: BigInt
+
+  """Signature count; null if unknown."""
+  signatures: BigInt
+
+  """Threat count during the period; null if unknown."""
+  threats: BigInt
+
+  """Summary update time in Unix milliseconds; null if unknown."""
+  updatedTimestamp: BigInt
+
+  """Allowlisted per-gateway signature status."""
+  gatewaySignatures: [GatewaySignature!]!
+}
+
 """A top-traffic client entry."""
 type TopClient {
   mac: String
@@ -1622,6 +2235,94 @@ type TopClient {
   txBytes: Int
   rxBytes: Int
   totalBytes: Int
+}
+
+"""A single UniFi traffic-flow record."""
+type TrafficFlow {
+  id: String
+  action: String
+  risk: String
+  service: String
+  protocol: String
+  direction: String
+  count: Int
+  durationMilliseconds: Int
+  time: Int
+  flowStartTime: Int
+  flowEndTime: Int
+  bytesTotal: Int
+  bytesRx: Int
+  bytesTx: Int
+  source: TrafficFlowEndpoint!
+  destination: TrafficFlowEndpoint!
+}
+
+"""One side (source or destination) of a traffic flow."""
+type TrafficFlowEndpoint {
+  name: String
+  mac: String
+  ip: String
+  networkName: String
+  zoneName: String
+  domains: [String!]!
+}
+
+"""Paginated page of UniFi traffic flows."""
+type TrafficFlowPage {
+  items: [TrafficFlow!]!
+  nextCursor: String
+}
+
+"""Aggregated Insights > Flows summary (latest-statistics)."""
+type TrafficFlowStatistics {
+  allowedCountByRisk: JSON!
+  blockedCountByRisk: JSON!
+  allowedCountByRegionByRisk: JSON!
+  allCountByRegion: JSON!
+  blockedCountByRegion: JSON!
+  topClients: [TrafficFlowTopClient!]!
+  topBlockedClients: [TrafficFlowTopClient!]!
+  topDestinations: [TrafficFlowTopDestination!]!
+  topApplications: [TrafficFlowTopApplication!]!
+  topBlockedPolicies: [TrafficFlowTopPolicy!]!
+}
+
+"""An application in a traffic-flow Top-Talkers ranking (by bytes)."""
+type TrafficFlowTopApplication {
+  """
+  Low V2 traffic-flow application ID. Scoped to the V2 traffic-flow tool family; do not pass it to Integration API DPI tools.
+  """
+  applicationId: Int
+
+  """
+  V2 traffic-flow category ID used for one-way name annotation. Scoped to the V2 traffic-flow tool family; do not pass it to Integration API DPI tools.
+  """
+  categoryId: Int
+  bytes: Int
+  applicationName: String
+  categoryName: String
+}
+
+"""A client in a traffic-flow Top-Talkers ranking."""
+type TrafficFlowTopClient {
+  count: Int
+  clientMac: String
+  clientName: String
+}
+
+"""A destination in a traffic-flow Top-Talkers ranking."""
+type TrafficFlowTopDestination {
+  count: Int
+  destination: String
+  mostFrequentRegion: String
+}
+
+"""A policy in a traffic-flow blocked-flow ranking."""
+type TrafficFlowTopPolicy {
+  count: Int
+  policyId: String
+  policyName: String
+  policyType: String
 }
 
 """A traffic-route policy (V2 /trafficroutes entry)."""
@@ -1682,10 +2383,14 @@ type ViewerList {
   count: Int
 }
 
-"""A UniFi Access visitor (time-bounded guest pass)."""
+"""
+A time-bounded UniFi Access Developer API visitor pass. Its UUID is scoped to the Access Developer API visitor family and must not be passed to other Access user or credential operations.
+"""
 type Visitor {
   id: ID
   name: String
+  firstName: String
+  lastName: String
   hostUserId: String
   validFrom: String
   validUntil: String
@@ -1693,6 +2398,10 @@ type Visitor {
   credentialCount: Int
   email: String
   phone: String
+  company: String
+  visitReason: String
+  remarks: String
+  accessPolicyIds: [String!]
 }
 
 """Paginated page of UniFi Access visitors."""
@@ -1742,6 +2451,8 @@ type VpnServer {
   enabled: Boolean!
   listenPort: Int
   allowedSubnets: [String!]
+  alternateAddressEnabled: Boolean
+  alternateAddress: String
 }
 
 """Paginated page of VPN servers."""
@@ -1754,7 +2465,8 @@ type VpnServerPage {
 type Wlan {
   id: ID
   name: String
-  enabled: Boolean!
+  settingPreference: String
+  enabled: Boolean
   security: String
   networkId: String
   hideSsid: Boolean
@@ -1763,6 +2475,11 @@ type Wlan {
   guestPolicy: Boolean
   usergroupId: String
   fastRoamingEnabled: Boolean
+  rrmEnabled: Boolean
+  roamingAssistantNaEnabled: Boolean
+  roamingAssistantNaRssi: Int
+  roamingAssistant6eEnabled: Boolean
+  roamingAssistant6eRssi: Int
   pmfMode: String
   wpa3Support: Boolean
   wpa3Transition: Boolean
@@ -1770,12 +2487,16 @@ type Wlan {
   macFilterPolicy: String
   macFilterList: [String!]
   scheduleEnabled: Boolean
+  scheduleReversed: Boolean
+  schedule: [String!]
+  scheduleWithDuration: [WlanScheduleWindow!]
   l2Isolation: Boolean
   wlanBand: String
   multicastEnhanceEnabled: Boolean
   dtimMode: String
   dtimNa: Int
   dtimNg: Int
+  minrateSettingPreference: String
   minrateNgEnabled: Boolean
   minrateNgDataRateKbps: Int
   minrateNaEnabled: Boolean
@@ -1786,12 +2507,27 @@ type Wlan {
   iappEnabled: Boolean
   apGroupIds: [String!]
   apGroupMode: String
+  sourceApi: String
+
+  """
+  Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family — do not pass them to legacy resource tools.
+  """
+  integrationId: ID
 }
 
 """Paginated page of WLAN/SSID configurations."""
 type WlanPage {
   items: [Wlan!]!
   nextCursor: String
+}
+
+"""A recurring WLAN schedule window."""
+type WlanScheduleWindow {
+  durationMinutes: Int!
+  name: String
+  startDaysOfWeek: [String!]!
+  startHour: Int!
+  startMinute: Int!
 }
 
 ```
@@ -1812,21 +2548,22 @@ Read-only access to UniFi Access resources.
 - `credential: Credential`  — Look up a single Access credential by id.
 - `credentials: CredentialPage!`  — List Access credentials (NFC / PIN / etc., paginated).
 - `device: AccessDevice`  — Look up a single Access device by id.
+- `deviceConfigs: AccessDeviceConfigPage!`  — List a device's config/settings entries (e.g. reader voice greeting). Secrets redacted.
 - `devices: AccessDevicePage!`  — List Access devices (readers / hubs / locks, paginated).
 - `door: Door`  — Look up a single Access door by id.
 - `doorGroups: DoorGroupPage!`  — List Access door groups (paginated).
 - `doorStatus: DoorStatus`  — Get the live status (lock state + last event) of a door.
 - `doors: DoorPage!`  — List doors on the Access controller (paginated).
 - `event: AccessEvent`  — Look up a single Access event by id.
-- `events: AccessEventPage!`  — List Access events (paginated, most recent first).
+- `events: AccessEventPage!`  — List Access events by system-log topic, paginated most recent first. Use unlocks for door grants and open/close history, access_denial for refused attempts, ring for doorbells, or updates, critical, admin, and admin_activity.
 - `health: AccessHealth`  — Get the Access health probe summary.
 - `policies: PolicyPage!`  — List Access policies (who-can-access-what bindings).
 - `policy: Policy`  — Look up a single Access policy by id.
 - `schedules: SchedulePage!`  — List Access schedules (weekly access windows).
 - `systemInfo: AccessSystemInfo`  — Get the Access application info (name + version + host).
 - `users: UserPage!`  — List Access users (employees / cardholders, paginated).
-- `visitor: Visitor`  — Look up a single Access visitor by id.
-- `visitors: VisitorPage!`  — List Access visitors (time-bounded guest passes).
+- `visitor: Visitor`  — Look up one Access Developer API visitor using a UUID returned by the visitor family; IDs from other Access user or credential operations are not accepted.
+- `visitors: VisitorPage!`  — List Access Developer API visitors. Returned UUIDs are scoped to the visitor family and must not be passed to other Access user or credential operations.
 
 
 ### `query.health`
@@ -1875,7 +2612,7 @@ Read-only access to UniFi Network resources.
 - `contentFilters: ContentFilterPage!`  — List content filters on the given controller/site (paginated).
 - `dashboardStats: [StatPoint!]!`  — Site dashboard timeseries (all-points).
 - `device: Device`  — Look up a single device by MAC address.
-- `deviceRadio: DeviceRadio`  — Get the radio configuration for a UniFi access point.
+- `deviceRadio: DeviceRadio`  — Get the radio configuration for a UniFi device with radios.
 - `deviceStats: [StatPoint!]!`  — Per-device stats timeseries (by MAC).
 - `devices: DevicePage!`  — List devices on the given controller/site (paginated).
 - `dnsRecord: DnsRecord`  — Look up a single DNS record by id.
@@ -1883,16 +2620,26 @@ Read-only access to UniFi Network resources.
 - `dpiApplications: DpiApplicationPage!`  — List DPI applications (paginated).
 - `dpiCategories: DpiCategoryPage!`  — List DPI categories (paginated).
 - `dpiStats: DpiStats`  — DPI stats catalog (applications + categories).
+- `dynamicDns: DynamicDnsPage!`  — List Dynamic DNS provider entries on the given controller/site (paginated).
+- `dynamicDnsEntry: DynamicDns`  — Look up a single Dynamic DNS entry by id.
 - `eventLog: EventLogPage!`  — List recent controller events (paginated).
-- `eventTypes: EventTypes`  — Get the controller's event-type prefix catalog.
+- `eventTypes: EventTypes`  — Get exact event keys sampled from the controller's 1,000 most recent events within the last 7 days.
 - `firewallGroup: FirewallGroup`  — Look up a single firewall group by id.
 - `firewallGroups: FirewallGroupPage!`  — List firewall address/port groups (paginated).
 - `firewallPolicies: FirewallRulePage!`  — List firewall policies/rules on the given controller/site (paginated).
 - `firewallPolicy: FirewallRule`  — Look up a single firewall policy/rule by id.
+- `firewallPolicyOrdering: FirewallPolicyOrdering!`  — Get user-defined firewall policy ordering for a source/destination zone pair. Returns policy IDs from the UniFi integration API (UUIDs); these IDs are scoped to the ordering tool family and do NOT correspond to the policy IDs returned by firewallPolicies or other controller-API firewall queries. Requires a UniFi API key (UNIFI_API_KEY).
 - `firewallZones: [FirewallZone!]!`  — List firewall zones (typically a small flat list — no pagination).
+- `gatewaySettings: GatewaySettings`  — Get gateway (USG) security / NAT / connection-tracking settings.
 - `gatewayStats: [StatPoint!]!`  — Gateway stats timeseries.
+- `incidentEvidence: IncidentEvidence!`  — Collect bounded, read-only Network event evidence for one incident window as a unifi-incident-evidence-view (coverage plus bounded record citations), or with detail full the whole unifi-incident-evidence document. Stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear. Not cached.
 - `ipsEvents: EventLogPage!`  — List recent IPS/IDS events (paginated).
+- `legacyFirewallRules: [LegacyFirewallRule!]!`  — List legacy (pre-zone-based) firewall rules. Sites still running the legacy engine return no zone-based policies or zones, so an empty firewallPolicies result does not mean no firewall rules are configured — check here as well.
 - `lldpNeighbors: LldpNeighbors`  — Get LLDP neighbors reported by a switch.
+- `mdnsSettings: MdnsSettings`  — Get site-wide mDNS service settings and read-only network scope.
+- `mgmtSettings: MgmtSettings`  — Get device management (mgmt) settings: device SSH, debug tools, automatic upgrades.
+- `natRule: NatRule`  — Get a V2 NAT rule by its NAT-family ID; do not use port-forward or Integration API IDs.
+- `natRules: NatRulePage!`  — List V2 NAT rules in descending controller ID order. These IDs are scoped to the V2 NAT tool family — do not pass them to port-forward or Integration API tools.
 - `networkDetail: Network`  — Look up a single LAN/VLAN network by id. (Named ``networkDetail`` because ``network`` is reserved for the namespace.)
 - `networkHealth: [NetworkHealth!]!`  — Get the controller's network-health subsystems list.
 - `networkStats: [StatPoint!]!`  — Network-wide stats timeseries.
@@ -1919,7 +2666,11 @@ Read-only access to UniFi Network resources.
 - `switchCapabilities: SwitchCapabilities`  — Get switch capabilities (caps dict + STP / dot1x flags).
 - `switchPorts: SwitchPorts`  — Get the port-override wrapper for a switch (name/model + per-port overrides).
 - `systemInfo: SystemInfo`  — Get controller system info (build, uptime, hardware).
+- `threatManagementSettings: ThreatManagementSettings`  — Get site-wide threat management (IDS/IPS) and traffic identification settings.
+- `threatPosture: ThreatPosture`  — Get CyberSecure threat posture for HOUR, DAY, WEEK, or MONTH using a Network session.
 - `topClients: [TopClient!]!`  — List top-traffic clients within a window.
+- `trafficFlowStatistics: TrafficFlowStatistics!`  — Aggregated Insights > Flows summary (risk/region counts + Top-Talkers).
+- `trafficFlows: TrafficFlowPage!`  — Query historical traffic flows (Insights > Flows), paginated.
 - `trafficRoute: TrafficRoute`  — Look up a single traffic-route policy by id.
 - `trafficRoutes: TrafficRoutePage!`  — List traffic-route policies (V2 /trafficroutes) (paginated).
 - `userGroup: UserGroup`  — Look up a single QoS user group by id.
@@ -1942,23 +2693,29 @@ Read-only access to UniFi Protect resources.
 
 **Fields:**
 
-- `alarmProfiles: AlarmProfileList`  — List configured alarm profiles ({profiles, count}).
+- `alarmProfiles: AlarmProfileList`  — List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.
+- `alarmRule: AlarmRule`  — Fetch a single alarm rule (automation) by id.
+- `alarmRules: AlarmRuleList`  — List configured alarm rules / Alarm Manager automations ({rules, count}).
 - `alarmStatus: AlarmStatus`  — Get the alarm system arm-state snapshot.
 - `camera: Camera`  — Look up a single Protect camera by id.
 - `cameraAnalytics: CameraAnalytics`  — Get analytics summary for a Protect camera.
 - `cameraStreams: CameraStreams`  — Get the stream catalog (channels + RTSPS URLs) for a camera.
 - `cameras: CameraPage!`  — List cameras on the Protect controller (paginated).
 - `chimes: ChimePage!`  — List paired Protect chimes (paginated).
+- `detectionSearchLabels: DetectionSearchLabels!`  — The detection-search filter vocabulary ('Find Anything' label groups).
 - `event: Event`  — Look up a single Protect event by id.
 - `eventThumbnail: EventThumbnail`  — Get the thumbnail for a Protect event.
 - `events: EventPage!`  — List Protect events (paginated, most recent first).
 - `firmwareStatus: FirmwareStatus`  — Get firmware status for the NVR plus its devices.
 - `health: ProtectHealth`  — Get the NVR health snapshot (cpu / memory / storage).
+- `incidentEvidence: IncidentEvidence!`  — Collect bounded, read-only Protect event evidence for one incident window as a unifi-incident-evidence-view (coverage plus bounded record citations), or with detail full the whole unifi-incident-evidence document. Each camera ID is its own source. Stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear. Not cached.
 - `knownFaces: KnownFacePage!`  — List assigned Protect Known Faces / named face recognition groups.
+- `knownLicensePlates: KnownLicensePlatePage!`  — List UniFi Protect license-plate identities (vehicle recognition groups). Each entry's id is the value to use in a `license_plate_known` alarm-rule condition.
 - `lights: LightPage!`  — List Protect lights (PIR-triggered floodlights).
 - `liveviews: LiveviewPage!`  — List Protect liveviews (multi-camera grid layouts).
 - `recordingStatus: RecordingStatusList`  — Get current recording state for one or all cameras ({cameras, count}).
 - `recordings: RecordingPage!`  — List Protect recording windows for a camera. UniFi Protect exposes a single continuous recording window per camera.
+- `searchDetections: [SmartDetection!]!`  — Search detections across cameras via Protect's 'Find Anything' filter vocabulary. Pass labels of the form 'prefix:value' (e.g. 'vehicleType:truck'); use detectionSearchLabels to discover legal values.
 - `sensors: SensorPage!`  — List Protect sensors (motion / leak / temperature).
 - `smartDetections: SmartDetectionPage!`  — List Protect smart-detection events (paginated, most recent first).
 - `snapshot: Snapshot`  — Capture a JPEG snapshot from a camera (metadata only).

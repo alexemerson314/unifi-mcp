@@ -6,22 +6,23 @@ from datetime import datetime, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 from unifi_api.auth.api_key import generate_key, hash_key
-from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig
+from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig, PolicyConfig, ResponsePolicyConfig
 from unifi_api.db.crypto import ColumnCipher, derive_key
 from unifi_api.db.models import ApiKey, Base, Controller
 from unifi_api.server import create_app
 
 
-def _cfg(tmp_path):
+def _cfg(tmp_path, *, redact_sensitive_fields: bool = True):
     return ApiConfig(
         http=HttpConfig(host="127.0.0.1", port=8080, cors_origins=()),
         logging=LoggingConfig(level="WARNING"),
         db=DbConfig(path=str(tmp_path / "state.db")),
+        policy=PolicyConfig(response=ResponsePolicyConfig(redact_sensitive_fields=redact_sensitive_fields)),
     )
 
 
-async def _bootstrap(tmp_path, products="network"):
-    app = create_app(_cfg(tmp_path))
+async def _bootstrap(tmp_path, products="network", *, redact_sensitive_fields: bool = True):
+    app = create_app(_cfg(tmp_path, redact_sensitive_fields=redact_sensitive_fields))
     async with app.state.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     sm = app.state.sessionmaker
@@ -69,7 +70,7 @@ class _FakeCM:
 
 def _stub_connection(app, cid: str) -> _FakeCM:
     fake = _FakeCM()
-    app.state.manager_factory._connection_cache[(cid, "network")] = fake
+    app.state.manager_factory._connection_cache[(cid, "network", "default")] = fake
     return fake
 
 
@@ -167,7 +168,7 @@ async def test_get_port_forward_404(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_get_port_forward_unifi_not_found(tmp_path, monkeypatch) -> None:
-    """Manager refactor PR #172: get_port_forward_by_id raises UniFiNotFoundError."""
+    """Manager-owned existence check: get_port_forward_by_id raises UniFiNotFoundError."""
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await _bootstrap(tmp_path)
     _stub_connection(app, cid)
@@ -274,4 +275,122 @@ async def test_get_snmp_settings_happy_path(tmp_path, monkeypatch) -> None:
     body = r.json()
     assert body["render_hint"]["kind"] == "detail"
     assert body["data"]["enabled"] is True
-    assert body["data"]["community"] == "public"
+    assert body["data"]["community"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_get_snmp_settings_exposes_v3_and_redacts_the_password(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    fake = [{"enabled": True, "community": "public", "enabledV3": True, "username": "monitor", "x_password": "p"}]
+
+    async def fake_get(self, section):
+        return fake
+
+    from unifi_core.network.managers.system_manager import SystemManager
+
+    monkeypatch.setattr(SystemManager, "get_settings", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/snmp-settings?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["enabled_v3"] is True
+    assert data["username"] == "monitor"
+    assert data["x_password"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_get_gateway_settings_happy_path(tmp_path, monkeypatch) -> None:
+    """Gateway (USG) settings singleton projects through the detail route."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    fake = {
+        "_id": "gw1",
+        "key": "usg",
+        "upnp_enabled": False,
+        "tcp_established_timeout": 7440,
+        "dns_verification": {"primary_dns_server": "1.1.1.1"},
+    }
+
+    async def fake_get(self):
+        return fake
+
+    from unifi_core.network.managers.gateway_settings_manager import GatewaySettingsManager
+
+    monkeypatch.setattr(GatewaySettingsManager, "get_gateway_settings", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/gateway-settings?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["render_hint"]["kind"] == "detail"
+    assert body["data"]["key"] == "usg"
+    assert body["data"]["upnp_enabled"] is False
+    assert body["data"]["tcp_established_timeout"] == 7440
+    assert body["data"]["dns_verification"]["primary_dns_server"] == "1.1.1.1"
+
+
+@pytest.mark.asyncio
+async def test_get_snmp_settings_policy_disabled_returns_raw_community(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+    _stub_connection(app, cid)
+
+    async def fake_get(self, section):
+        assert section == "snmp"
+        return [{"enabled": True, "community": "public", "port": 161, "version": "v2c", "x_password": "p"}]
+
+    from unifi_core.network.managers.system_manager import SystemManager
+
+    monkeypatch.setattr(SystemManager, "get_settings", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/snmp-settings?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["community"] == "public"
+    assert r.json()["data"]["x_password"] == "p"
+
+
+@pytest.mark.asyncio
+async def test_get_mgmt_settings_happy_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    fake = [{"x_ssh_enabled": True, "x_ssh_password": "clear", "x_ssh_sha512passwd": "$6$hash", "auto_upgrade": True}]
+
+    async def fake_get(self, section):
+        assert section == "mgmt"
+        return fake
+
+    from unifi_core.network.managers.system_manager import SystemManager
+
+    monkeypatch.setattr(SystemManager, "get_settings", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/mgmt-settings?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["render_hint"]["kind"] == "detail"
+    assert body["data"]["x_ssh_enabled"] is True
+    assert body["data"]["ssh_password_set"] is True
+    assert body["data"]["ssh_password_hash_set"] is True
+    assert "x_ssh_password" not in body["data"]
+    assert "$6$hash" not in r.text and "clear" not in r.text

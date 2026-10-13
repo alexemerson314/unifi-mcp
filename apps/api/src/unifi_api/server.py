@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from strawberry.fastapi import GraphQLRouter
@@ -96,6 +99,9 @@ from unifi_api.routes.resources.network import (
     dpi as net_dpi_routes,
 )
 from unifi_api.routes.resources.network import (
+    dynamic_dns as net_dynamic_dns_routes,
+)
+from unifi_api.routes.resources.network import (
     events as net_events_routes,
 )
 from unifi_api.routes.resources.network import (
@@ -108,10 +114,24 @@ from unifi_api.routes.resources.network import (
     firewall_zones as net_firewall_zones_routes,
 )
 from unifi_api.routes.resources.network import (
+    gateway_settings as net_gateway_settings_routes,
+)
+from unifi_api.routes.resources.network import incident_evidence as net_incident_evidence_routes
+from unifi_api.routes.resources.network import (
+    legacy_firewall_rules as net_legacy_firewall_rules_routes,
+)
+from unifi_api.routes.resources.network import (
     lldp as net_lldp_routes,
 )
 from unifi_api.routes.resources.network import (
     lookup as net_lookup_routes,
+)
+from unifi_api.routes.resources.network import mdns as net_mdns_routes
+from unifi_api.routes.resources.network import (
+    mgmt as net_mgmt_routes,
+)
+from unifi_api.routes.resources.network import (
+    nat_rules as net_nat_rules_routes,
 )
 from unifi_api.routes.resources.network import (
     networks as net_networks_routes,
@@ -146,6 +166,11 @@ from unifi_api.routes.resources.network import (
 from unifi_api.routes.resources.network import (
     system as net_system_routes,
 )
+from unifi_api.routes.resources.network import threat_management as net_threat_management_routes
+from unifi_api.routes.resources.network import threat_posture as net_threat_posture_routes
+from unifi_api.routes.resources.network import (
+    traffic_flows as net_traffic_flows_routes,
+)
 from unifi_api.routes.resources.network import (
     user_groups as net_user_groups_routes,
 )
@@ -169,6 +194,9 @@ from unifi_api.routes.resources.protect import (
 )
 from unifi_api.routes.resources.protect import (
     events as protect_events_routes,
+)
+from unifi_api.routes.resources.protect import (
+    incident_evidence as protect_incident_evidence_routes,
 )
 from unifi_api.routes.resources.protect import (
     lights as protect_lights_routes,
@@ -237,6 +265,16 @@ class _UnifiGraphQLRouter(GraphQLRouter):
         return data
 
 
+async def _request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's 422 body without the rejected input it would otherwise echo.
+
+    Keeps each error's type, location and message, the parts that say what
+    to fix, and drops ``input``, ``ctx`` and ``url``.
+    """
+    detail = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(detail)})
+
+
 def create_app(config: ApiConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -244,7 +282,7 @@ def create_app(config: ApiConfig) -> FastAPI:
         # available even when the lifespan isn't run (e.g. ASGITransport tests).
         # Loading is idempotent and fast (file reads), so re-loading here keeps
         # the lifespan as the canonical startup hook.
-        app.state.manifest_registry = ManifestRegistry.load_from_apps()
+        app.state.manifest_registry = ManifestRegistry.load()
 
         # Phase 4B: eagerly start event listening for every (controller, product)
         # pair so SSE subscribers see a warm buffer on first connect. Failures
@@ -264,38 +302,14 @@ def create_app(config: ApiConfig) -> FastAPI:
             for product in [p for p in controller.product_kinds.split(",") if p]:
                 try:
                     async with sm() as session:
-                        mgr = await app.state.manager_factory.get_domain_manager(
+                        await app.state.manager_factory.get_domain_manager(
                             session,
                             controller.id,
                             product,
                             "event_manager",
                         )
-                    if hasattr(mgr, "start_listening"):
-                        # Background-launch: aiounifi's start_websocket awaits
-                        # its own message loop, so awaiting here blocks the
-                        # whole lifespan. The WS subscription is best-effort
-                        # warm-up for SSE consumers; failing it must not
-                        # delay HTTP readiness.
-                        async def _bg_start(c_id: str, p: str, m=mgr) -> None:
-                            try:
-                                await m.start_listening()
-                                _streams_log.info(
-                                    "[streams] start_listening ok for %s/%s",
-                                    c_id,
-                                    p,
-                                )
-                            except Exception:
-                                _streams_log.warning(
-                                    "[streams] start_listening failed for %s/%s",
-                                    c_id,
-                                    p,
-                                    exc_info=True,
-                                )
-
-                        asyncio.create_task(
-                            _bg_start(controller.id, product),
-                            name=f"start_listening:{controller.id}/{product}",
-                        )
+                    # The factory owns listener startup and shutdown, including
+                    # managers created later after credential rotation.
                 except Exception:
                     _streams_log.warning(
                         "[streams] start_listening setup failed for %s/%s",
@@ -385,6 +399,7 @@ def create_app(config: ApiConfig) -> FastAPI:
         docs_url="/v1/docs",
         lifespan=lifespan,
     )
+    app.add_exception_handler(RequestValidationError, _request_validation_error)
 
     # Auth doesn't use FastAPI's HTTPBearer dependency (the middleware reads
     # the header directly to keep the audit-on-failure path simple), so the
@@ -445,17 +460,20 @@ def create_app(config: ApiConfig) -> FastAPI:
 
     cipher = ColumnCipher(derive_key(db_key))
     app.state.cipher = cipher
-    app.state.manager_factory = ManagerFactory(app.state.sessionmaker, cipher)
     app.state.subscriber_pool = SubscriberPool()
+    app.state.manager_factory = ManagerFactory(
+        app.state.sessionmaker, cipher, on_manager_discard=app.state.subscriber_pool.disconnect_manager
+    )
     app.state.argon_cache = ArgonVerifyCache()
     app.state.capability_cache = CapabilityCache()
     app.state.settings_service = SettingsService(app.state.sessionmaker)
     app.state.db_path = config.db.path
+    app.state.config = config
     app.state.api_version = _api_version
     app.state.started_at = datetime.now(timezone.utc)
     app.state.log_file_path = None  # Task 11 may override this if log file is enabled
     app.state.log_reader = LogReader(Path("/dev/null"))  # Task 11 may override
-    app.state.manifest_registry = ManifestRegistry.load_from_apps()
+    app.state.manifest_registry = ManifestRegistry.load()
     manifest_tool_names = set(app.state.manifest_registry.all_tools())
 
     # Phase 6 close — every read tool/resource is projected via a Strawberry
@@ -495,19 +513,29 @@ def create_app(config: ApiConfig) -> FastAPI:
         net_user_groups_routes,
         net_lookup_routes,
         net_routes_routes,
+        net_traffic_flows_routes,
         net_dns_routes,
+        net_dynamic_dns_routes,
         net_vpn_routes,
         net_ap_groups_routes,
         net_firewall_groups_routes,
         net_firewall_zones_routes,
+        net_legacy_firewall_rules_routes,
+        net_gateway_settings_routes,
         net_qos_routes,
         net_dpi_routes,
         net_content_filters_routes,
         net_acl_routes,
         net_oon_routes,
         net_port_forwards_routes,
+        net_nat_rules_routes,
         net_vouchers_routes,
         net_snmp_routes,
+        net_mdns_routes,
+        net_mgmt_routes,
+        net_threat_management_routes,
+        net_threat_posture_routes,
+        net_incident_evidence_routes,
         # Cluster 6: stats / events / system. The network events router owns
         # the bare /events path for both products via a capability-aware
         # dispatcher; it must be included before protect_events_routes so the
@@ -520,6 +548,7 @@ def create_app(config: ApiConfig) -> FastAPI:
     for r in (
         protect_cameras_routes,
         protect_events_routes,
+        protect_incident_evidence_routes,
         protect_recordings_routes,
         protect_lights_routes,
         protect_sensors_routes,
@@ -598,6 +627,7 @@ def create_app(config: ApiConfig) -> FastAPI:
             api_key_id=api_key_id,
             api_key_scopes=api_key_scopes,
             api_key_prefix=api_key_prefix,
+            redact_sensitive_fields=config.policy.response.redact_sensitive_fields,
         )
 
     graphql_app = _UnifiGraphQLRouter(

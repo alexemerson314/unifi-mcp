@@ -21,6 +21,8 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+_CONTROLLER_FIELD_NAMES = {"fwd_protocol": "proto", "fwd_ip": "fwd"}
+
 # ---------------------------------------------------------------------------
 # Pydantic domain model
 # ---------------------------------------------------------------------------
@@ -60,6 +62,10 @@ class PortForward(BaseModel):
     dst_port: Optional[str] = Field(
         default=None,
         description="External (destination) port or range",
+    )
+    destination_ip: Optional[str] = Field(
+        default=None,
+        description="WAN destination IPv4 address, or 'any' for all WAN addresses",
     )
     fwd_port: Optional[str] = Field(
         default=None,
@@ -124,6 +130,7 @@ def from_controller(raw: Any) -> PortForward:
         enabled=_get(raw, "enabled"),
         fwd_protocol=protocol,
         dst_port=_get(raw, "dst_port"),
+        destination_ip=_get(raw, "destination_ip"),
         fwd_port=_get(raw, "fwd_port"),
         fwd_ip=_get(raw, "fwd_ip") or _get(raw, "fwd"),
         src=_get(raw, "src"),
@@ -137,17 +144,30 @@ def to_controller_create(model: PortForward) -> Dict[str, Any]:
     for field_name in MUTABLE_FIELDS:
         value = getattr(model, field_name, None)
         if value is not None:
-            payload[field_name] = value
-    # Map fwd_protocol → proto for controller compatibility
-    if "fwd_protocol" in payload:
-        payload["proto"] = payload.pop("fwd_protocol")
+            payload[_CONTROLLER_FIELD_NAMES.get(field_name, field_name)] = value
+    # The controller ignores src unless source limiting is explicitly enabled.
+    payload["src_limiting_enabled"] = bool(model.src) and model.src != "any"
+    if model.src == "":
+        payload["src"] = "any"
     return payload
 
 
 def to_controller_update(fields: Dict[str, Any]) -> Dict[str, Any]:
-    """Filter a partial dict to only mutable, recognised keys.
+    """Translate a partial canonical dict to controller update fields.
 
     Read-only fields and unrecognised keys are dropped.
-    ``None`` values are dropped; boolean ``False`` is preserved.
+    ``None`` values are dropped except for ``src`` and ``destination_ip``, where
+    they clear restrictions using the controller's "any" sentinel. Boolean
+    ``False`` is preserved.
     """
-    return {k: v for k, v in fields.items() if k in MUTABLE_FIELDS and v is not None}
+    payload: Dict[str, Any] = {}
+    for key, value in fields.items():
+        if key not in MUTABLE_FIELDS or (value is None and key not in {"src", "destination_ip"}):
+            continue
+        payload[_CONTROLLER_FIELD_NAMES.get(key, key)] = value
+    if "destination_ip" in fields:
+        payload["destination_ip"] = fields["destination_ip"] or "any"
+    if "src" in fields:
+        payload["src"] = fields["src"] or "any"
+        payload["src_limiting_enabled"] = bool(fields["src"]) and fields["src"] != "any"
+    return payload

@@ -41,6 +41,16 @@ class TestProtectListEvents:
         assert len(result["data"]["events"]) == 2
 
     @pytest.mark.asyncio
+    async def test_negative_limit_is_rejected_before_controller_io(self, mock_event_manager):
+        from unifi_protect_mcp.tools.events import protect_list_events
+
+        mock_event_manager.list_events = AsyncMock()
+        result = await protect_list_events(limit=-1)
+
+        assert result == {"success": False, "error": "Failed to list events: limit must be zero or greater"}
+        mock_event_manager.list_events.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_with_filters(self, mock_event_manager):
         from unifi_protect_mcp.tools.events import protect_list_events
 
@@ -360,6 +370,25 @@ class TestProtectAcknowledgeEvent:
         result = await protect_acknowledge_event("evt-1", confirm=True)
         assert result["success"] is True
         assert result["data"]["acknowledged"] is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_reports_persistence_failure(self, mock_event_manager):
+        from unifi_protect_mcp.tools.events import protect_acknowledge_event
+
+        mock_event_manager.acknowledge_event = AsyncMock(
+            return_value={
+                "event_id": "evt-1",
+                "type": "motion",
+                "camera_id": "cam-001",
+                "current_is_favorite": False,
+                "proposed_is_favorite": True,
+            }
+        )
+        mock_event_manager.apply_acknowledge_event = AsyncMock(side_effect=RuntimeError("save rejected"))
+
+        result = await protect_acknowledge_event("evt-1", confirm=True)
+
+        assert result == {"success": False, "error": "Failed to acknowledge event: save rejected"}
 
     @pytest.mark.asyncio
     async def test_not_found(self, mock_event_manager):

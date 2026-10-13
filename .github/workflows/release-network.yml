@@ -22,17 +22,35 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/unifi-network-mcp
 
 jobs:
+  published-core-contract:
+    name: Verify published Core dependency floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install and verify the exact published Core floor
+        run: uv run scripts/check_pin_alignment.py --network-core-floor-only
+
   # ----------------------------------------------------------------------- 1
   test:
     name: Run unifi-network-mcp tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -49,7 +67,7 @@ jobs:
   # ----------------------------------------------------------------------- 2a
   publish-pypi:
     name: Build wheel + publish to PyPI
-    needs: test
+    needs: [test, published-core-contract]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -58,12 +76,12 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -86,14 +104,14 @@ jobs:
   # ----------------------------------------------------------------------- 2b
   publish-docker:
     name: Build + push Docker image
-    needs: test
+    needs: [test, published-core-contract]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -156,7 +174,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true

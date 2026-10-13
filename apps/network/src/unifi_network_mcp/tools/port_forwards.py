@@ -9,7 +9,7 @@ from typing import Annotated, Any, Dict
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
-from unifi_core.confirmation import toggle_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, toggle_preview, update_preview
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.models._actions import (
     PortForwardCreateInput,
@@ -17,7 +17,13 @@ from unifi_core.network.models._actions import (
     PortForwardUpdateInput,
 )
 from unifi_core.network.models.port_forwards import (
+    PortForward,
+)
+from unifi_core.network.models.port_forwards import (
     from_controller as pf_from_controller,
+)
+from unifi_core.network.models.port_forwards import (
+    to_controller_create as pf_to_create,
 )
 from unifi_core.network.models.port_forwards import (
     to_controller_update as pf_to_update,
@@ -197,6 +203,7 @@ async def toggle_port_forward(
 
         rule_name = rule.get("name", port_forward_id)
         current_enabled = rule.get("enabled", False)
+        normalized = pf_from_controller(rule)
 
         # Return preview when confirm=false
         if not confirm:
@@ -207,7 +214,7 @@ async def toggle_port_forward(
                 current_enabled=current_enabled,
                 additional_info={
                     "dst_port": rule.get("dst_port"),
-                    "fwd_ip": rule.get("fwd_ip"),
+                    "fwd_ip": normalized.fwd_ip,
                     "fwd_port": rule.get("fwd_port"),
                 },
             )
@@ -254,7 +261,7 @@ async def toggle_port_forward(
 # Create Port Forward
 @server.tool(
     name="unifi_create_port_forward",
-    description="Create a new port forwarding rule on your Unifi Network controller using schema validation.",
+    description="Create a new port forwarding rule on your Unifi Network controller using schema validation. Requires confirmation.",
     permission_category="port_forwards",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
@@ -263,9 +270,13 @@ async def create_port_forward(
     port_forward_data: Annotated[
         Dict[str, Any],
         Field(
-            description="Port forward configuration dict. Required: name (str), dst_port (external port, e.g. '80' or '10000-10010'), fwd_port (internal port), fwd_ip (internal IP, e.g. '192.168.1.100'). Optional: protocol ('tcp'/'udp'/'tcp_udp', default 'tcp_udp'), enabled (bool, default true), src_ip (source IP/CIDR), log (bool)"
+            description="Port forward configuration dict. Required: name (str), dst_port (external port, e.g. '80' or '10000-10010'), fwd_port (internal port), fwd_ip (internal IP, e.g. '192.168.1.100'). Optional: protocol ('tcp'/'udp'/'tcp_udp', default 'tcp_udp'), enabled (bool, default true), src_ip (source IP/CIDR), destination_ip (WAN destination IPv4 or 'any'), log (bool)"
         ),
     ],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, creates the rule. When false (default), validates and returns a preview"),
+    ] = False,
 ) -> Dict[str, Any]:
     """Create a new port forwarding rule with comprehensive validation.
 
@@ -279,6 +290,7 @@ async def create_port_forward(
     - protocol (string): Network protocol - "tcp", "udp", or "tcp_udp" (default: "tcp_udp")
     - enabled (boolean): Whether rule is enabled initially (default: true)
     - src_ip (string): Source IP/CIDR to match (default: any)
+    - destination_ip (string): WAN destination IPv4 address or 'any' (omit for controller default)
     - log (boolean): Whether to log rule matches (default: false)
 
     Example:
@@ -305,21 +317,28 @@ async def create_port_forward(
         return {"success": False, "error": err}
 
     try:
-        # Prepare data for the manager
-        rule_data = {
-            "name": validated.name,
-            "dst_port": validated.dst_port,
-            "fwd_port": validated.fwd_port,
-            "fwd_ip": validated.fwd_ip,
-            "proto": validated.protocol.replace("_", "/"),  # Manager expects 'tcp/udp'
-            "protocol_match_excepted": False,
-            "enabled": validated.enabled,
-            "log": validated.log,
-        }
+        rule_data = pf_to_create(
+            PortForward(
+                name=validated.name,
+                dst_port=validated.dst_port,
+                fwd_port=validated.fwd_port,
+                fwd_ip=validated.fwd_ip,
+                destination_ip=validated.destination_ip,
+                fwd_protocol=validated.protocol,
+                enabled=validated.enabled,
+                src=validated.src_ip or None,
+                log=validated.log,
+            )
+        )
+        rule_data["protocol_match_excepted"] = False
 
-        # Handle optional source IP
-        if validated.src_ip:
-            rule_data["src"] = validated.src_ip
+        if not confirm:
+            return create_preview(
+                resource_type="port_forward",
+                resource_data=validated.model_dump(exclude_none=True),
+                resource_name=validated.name,
+                warnings=["Creating an enabled port forward may expose an internal service to external traffic"],
+            )
 
         logger.info(
             "Attempting to create port forward: %s (%s %s -> %s:%s)",
@@ -361,13 +380,16 @@ async def create_port_forward(
             e,
             exc_info=True,
         )
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": f"Failed to create port forward '{port_forward_data.get('name', 'unknown')}': {e}",
+        }
 
 
 # --- NEW UPDATE TOOL ---
 @server.tool(
     name="unifi_update_port_forward",
-    description="Update specific fields of an existing port forwarding rule using schema validation. Requires confirmation.",
+    description="Update specific fields of an existing port forwarding rule using schema validation. Pass only the fields you want to change — current values are automatically preserved. Requires confirmation.",
     permission_category="port_forwards",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
@@ -382,7 +404,7 @@ async def update_port_forward(
     update_data: Annotated[
         Dict[str, Any],
         Field(
-            description="Dictionary of fields to update. Allowed keys: name, dst_port (external port), fwd_port (internal port), fwd_ip (internal IP), protocol ('tcp'/'udp'/'tcp_udp'), enabled (bool), src_ip (source IP/CIDR, empty string to remove), log (bool)"
+            description="Dictionary of fields to update. Allowed keys: name, dst_port (external port), destination_ip (WAN destination IPv4 or 'any'; null/empty sets 'any'), fwd_port (internal port), fwd_ip (internal IP), protocol ('tcp'/'udp'/'tcp_udp'), enabled (bool), src_ip (source IP/CIDR, empty string to remove), log (bool)"
         ),
     ],
     confirm: Annotated[
@@ -402,6 +424,7 @@ async def update_port_forward(
             Allowed fields (all optional):
             - name (string): New name for the rule.
             - dst_port (string): New destination/external port or range.
+            - destination_ip (string): WAN destination IPv4 address or "any" (null or empty sets "any").
             - fwd_port (string): New internal port or range.
             - fwd_ip (string): New internal IP address.
             - protocol (string): New protocol ("tcp", "udp", or "tcp_udp").
@@ -452,6 +475,10 @@ async def update_port_forward(
 
     # Build validated_data dict from the model (exclude unset/None values)
     validated_data = validated_obj.model_dump(exclude_none=True)
+    if "src_ip" in validated_obj.model_fields_set:
+        validated_data["src_ip"] = validated_obj.src_ip or "any"
+    if "destination_ip" in validated_obj.model_fields_set:
+        validated_data["destination_ip"] = validated_obj.destination_ip or "any"
 
     if not validated_data:
         logger.warning("Port forward update data for ID %s is empty after validation.", port_forward_id)
@@ -460,26 +487,33 @@ async def update_port_forward(
             "error": "Update data is effectively empty or invalid.",
         }
 
-    # Prepare the payload for the manager update function
-    update_payload = {}
-    updated_fields_list = []
-    for key, value in validated_data.items():
-        updated_fields_list.append(key)
-        if key == "protocol":
-            update_payload["proto"] = value.replace("_", "/")
-        elif key == "src_ip":
-            update_payload["src"] = value if value else None
-        elif key == "log":
-            update_payload["log"] = value
-        else:
-            update_payload[key] = value
+    canonical_updates = dict(validated_data)
+    if "protocol" in canonical_updates:
+        canonical_updates["fwd_protocol"] = canonical_updates.pop("protocol")
+    if "src_ip" in canonical_updates:
+        canonical_updates["src"] = canonical_updates.pop("src_ip") or None
+    update_payload = pf_to_update(canonical_updates)
+    updated_fields_list = list(validated_data)
+
+    try:
+        current_obj = await firewall_manager.get_port_forward_by_id(port_forward_id)
+        current_raw = current_obj.raw if hasattr(current_obj, "raw") else current_obj
+        current_state = pf_from_controller(current_raw).model_dump()
+        current_protocol = current_state.pop("fwd_protocol")
+        current_state["protocol"] = current_protocol.replace("/", "_") if current_protocol else None
+        current_state["src_ip"] = current_state.pop("src")
+    except UniFiNotFoundError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error("Error getting port forward %s for update: %s", port_forward_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to get port forward {port_forward_id} for update: {e}"}
 
     if not confirm:
         return update_preview(
             resource_type="port_forward",
             resource_id=port_forward_id,
-            resource_name=port_forward_id,
-            current_state={},
+            resource_name=current_state.get("name") or port_forward_id,
+            current_state=current_state,
             updates=validated_data,
         )
 
@@ -540,8 +574,7 @@ async def create_simple_port_forward(
     except ValidationError as exc:
         return {"success": False, "error": exc.errors()[0]["msg"]}
 
-    # Build API payload matching existing V1 schema keys
-    payload: Dict[str, Any] = {
+    preview_payload: Dict[str, Any] = {
         "name": r.name,
         "dst_port": str(r.ext_port),
         "fwd_port": str(r.int_port if r.int_port is not None else r.ext_port),
@@ -555,11 +588,23 @@ async def create_simple_port_forward(
     }
 
     if not confirm:
-        return {
-            "success": True,
-            "preview": payload,
-            "message": "Set confirm=true to apply.",
-        }
+        return create_preview(
+            resource_type="port_forward",
+            resource_data=preview_payload,
+            resource_name=r.name,
+            warnings=["Creating an enabled port forward may expose an internal service to external traffic"],
+        )
+
+    payload = pf_to_create(
+        PortForward(
+            name=preview_payload["name"],
+            dst_port=preview_payload["dst_port"],
+            fwd_port=preview_payload["fwd_port"],
+            fwd_ip=preview_payload["fwd_ip"],
+            fwd_protocol=preview_payload["protocol"],
+            enabled=preview_payload["enabled"],
+        )
+    )
 
     try:
         created = await firewall_manager.create_port_forward(payload)
@@ -578,3 +623,76 @@ async def create_simple_port_forward(
         "port_forward_id": created.get("_id"),
         "details": json.loads(json.dumps(created, default=str)),
     }
+
+
+@server.tool(
+    name="unifi_delete_port_forward",
+    description="Delete a port forwarding rule by ID. Requires confirmation. "
+    "WARNING: This permanently removes the rule; external access to the forwarded "
+    "service will stop. It cannot be undone - you must recreate the rule to restore it.",
+    permission_category="port_forwards",
+    permission_action="delete",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+)
+async def delete_port_forward(
+    port_forward_id: Annotated[
+        str,
+        Field(
+            description="Unique identifier (_id) of the port forwarding rule to delete (from unifi_list_port_forwards)"
+        ),
+    ],
+    confirm: Annotated[
+        bool,
+        Field(
+            description="When true, deletes the rule. When false (default), returns a preview. "
+            "WARNING: This permanently removes the rule and cannot be undone"
+        ),
+    ] = False,
+) -> Dict[str, Any]:
+    """Delete a port forwarding rule by its ID. Requires confirmation.
+
+    Args:
+        port_forward_id (str): The unique identifier (_id) of the port forwarding rule to delete.
+        confirm (bool): Must be explicitly set to `True` to execute the deletion. Defaults to `False`,
+            which returns a preview of the delete action.
+
+    Returns:
+        A dictionary containing:
+        - success (bool): Indicates if the operation was successful.
+        - message (str): A confirmation message on success.
+        - error (str, optional): An error message if the operation failed (e.g., rule not found).
+
+    Example response (success):
+    {
+        "success": True,
+        "message": "Port forward '60f5a9b3e4b0f4a7f7d6e8c1' deleted successfully."
+    }
+    """
+    if not port_forward_id:
+        return {"success": False, "error": "port_forward_id is required"}
+
+    if not confirm:
+        return delete_preview(
+            resource_type="port_forward",
+            resource_id=port_forward_id,
+            resource_data={"port_forward_id": port_forward_id},
+            resource_name=port_forward_id,
+            warnings=[
+                "This permanently removes the port forward rule; external access to the forwarded "
+                "service will stop. It cannot be undone - you must recreate the rule to restore it."
+            ],
+        )
+
+    try:
+        success = await firewall_manager.delete_port_forward(port_forward_id)
+        if success:
+            return {
+                "success": True,
+                "message": f"Port forward '{port_forward_id}' deleted successfully.",
+            }
+        return {"success": False, "error": f"Failed to delete port forward '{port_forward_id}'."}
+    except UniFiNotFoundError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error("Error deleting port forward %s: %s", port_forward_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to delete port forward {port_forward_id}: {e}"}

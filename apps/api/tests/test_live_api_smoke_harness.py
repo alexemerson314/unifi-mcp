@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
@@ -56,3 +57,101 @@ def test_report_counters():
     assert r.total == 2
     assert r.passed == 1
     assert r.failed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_smoke_closes_sessions_after_success_or_failure(tmp_path, monkeypatch, fail):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import live_api_smoke
+
+    invalidate = AsyncMock()
+    dispose = AsyncMock()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            manager_factory=SimpleNamespace(invalidate_controller=invalidate),
+            engine=SimpleNamespace(dispose=dispose),
+        )
+    )
+    bootstrap = AsyncMock(return_value=(app, "synthetic-key", {"network": "synthetic-controller"}))
+    monkeypatch.setattr(live_api_smoke, "load_env", lambda: {})
+    monkeypatch.setattr(live_api_smoke, "bootstrap_app_and_controllers", bootstrap)
+    monkeypatch.setattr(
+        live_api_smoke, "_run_assertion", AsyncMock(side_effect=RuntimeError("probe failed") if fail else None)
+    )
+    args = SimpleNamespace(controllers="", retry=1, installed=True, output=tmp_path / "report.json")
+    if fail:
+        with pytest.raises(RuntimeError, match="probe failed"):
+            await live_api_smoke.main_async(args)
+    else:
+        assert await live_api_smoke.main_async(args) == 0
+    bootstrap.assert_awaited_once_with({}, [], installed=True)
+    invalidate.assert_awaited_once_with("synthetic-controller")
+    dispose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_installed_smoke_does_not_add_checkout_to_import_path(monkeypatch):
+    import live_api_smoke
+
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    before = sys.path.copy()
+    app, _key, controllers = await live_api_smoke.bootstrap_app_and_controllers({}, [], installed=True)
+    try:
+        assert sys.path == before
+        assert controllers == {}
+    finally:
+        await app.state.engine.dispose()
+
+
+def test_api_image_catalog_validation_requires_exact_generated_names():
+    import api_image_smoke
+
+    expected = {"unifi_list_clients", "protect_list_cameras", "access_list_doors"}
+
+    result = api_image_smoke._validate_catalog_response(
+        {"items": [{"name": name} for name in sorted(expected)]},
+        expected,
+    )
+
+    assert result == {"count": 3, "missing": [], "unexpected": []}
+
+
+def test_api_image_catalog_validation_reports_drift():
+    import api_image_smoke
+
+    result = api_image_smoke._validate_catalog_response(
+        {"items": [{"name": "unifi_list_clients"}, {"name": "obsolete_tool"}]},
+        {"unifi_list_clients", "protect_list_cameras"},
+    )
+
+    assert result == {
+        "count": 2,
+        "missing": ["protect_list_cameras"],
+        "unexpected": ["obsolete_tool"],
+    }
+
+
+def test_api_image_catalog_fetch_can_read_response_larger_than_default_limit(monkeypatch):
+    import api_image_smoke
+
+    body = b'{"items":[' + (b'{"name":"unifi_list_clients"},' * 300) + b'{"name":"last"}]}'
+
+    class Response(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    monkeypatch.setattr(api_image_smoke.urllib.request, "urlopen", lambda *_args, **_kwargs: Response(body))
+
+    status, fetched, _elapsed = api_image_smoke._hit("http://example.test/catalog", "key", max_bytes=None)
+
+    assert status == 200
+    assert fetched.encode() == body
+    assert len(fetched) > 8192

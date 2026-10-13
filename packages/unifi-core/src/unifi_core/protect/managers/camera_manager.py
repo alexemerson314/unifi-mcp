@@ -10,10 +10,11 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from uiprotect.data.types import IRLEDMode, RecordingMode
+from uiprotect.data.types import IRLEDMode, PublicHdrMode, RecordingMode
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.protect.managers.connection_manager import ProtectConnectionManager
+from unifi_core.protect.models.cameras import normalize_hdr_mode, to_controller_update
 
 logger = logging.getLogger(__name__)
 
@@ -202,16 +203,11 @@ class CameraManager:
         streams: Dict[str, Any] = {}
         for ch in camera.channels:
             if ch.is_rtsp_enabled and ch.rtsp_alias:
-                # Build RTSP URL from the NVR host and the alias
-                nvr_host = (
-                    str(self._cm.client.bootstrap.nvr.host) if self._cm.client.bootstrap.nvr.host else self._cm.host
-                )
                 streams[ch.name] = {
                     "channel_id": ch.id,
                     "enabled": ch.enabled,
                     "rtsp_alias": ch.rtsp_alias,
-                    "rtsps_url": f"rtsps://{nvr_host}:7441/{ch.rtsp_alias}",
-                    "rtsp_url": f"rtsp://{nvr_host}:7447/{ch.rtsp_alias}",
+                    **self._rtsp_stream_urls(ch.rtsp_alias),
                     "width": ch.width,
                     "height": ch.height,
                     "fps": ch.fps,
@@ -324,6 +320,23 @@ class CameraManager:
     # Mutation methods
     # ------------------------------------------------------------------
 
+    async def _validate_settings(self, camera, settings: Dict[str, Any]) -> Dict[str, Any]:
+        settings = to_controller_update(settings)
+        if not settings:
+            raise ValueError("No supported camera settings provided")
+        if "ir_led_mode" in settings:
+            IRLEDMode(settings["ir_led_mode"])
+        if "hdr_mode" in settings and not camera.feature_flags.has_hdr:
+            raise ValueError("Cannot update HDR: this camera does not support HDR")
+        if "mic_volume" in settings and not camera.feature_flags.has_mic:
+            raise ValueError("Cannot update microphone volume: this camera has no microphone")
+        if settings.keys() & {"hdr_mode", "mic_volume"}:
+            self._cm.require_public_api_key("update camera HDR or microphone volume")
+            await self._cm.validate_public_id_portability(
+                resource_type="cameras", bootstrap_collection="cameras", public_list_method="get_cameras_public"
+            )
+        return settings
+
     async def update_camera_settings(self, camera_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
         """Update camera settings. Returns dict with current and proposed state.
 
@@ -331,13 +344,14 @@ class CameraManager:
         - ir_led_mode: str (auto, on, off, autoFilterOnly)
         - hdr_mode: str (auto, off, always)
         - mic_enabled: bool
-        - mic_volume: int (0-100)
+        - mic_volume: int (1-100; public API requires an API key)
         - status_light_on: bool
         - speaker_volume: int (0-100)
         - name: str
         - motion_detection: bool
         """
         camera = self._get_camera(camera_id)
+        settings = await self._validate_settings(camera, settings)
 
         current_state: Dict[str, Any] = {}
         proposed_changes: Dict[str, Any] = {}
@@ -348,8 +362,16 @@ class CameraManager:
                 proposed_changes["ir_led_mode"] = value
             elif key == "hdr_mode":
                 current_isp_hdr = camera.isp_settings.hdr_mode
-                current_state["hdr_mode"] = str(current_isp_hdr.value) if current_isp_hdr else None
-                proposed_changes["hdr_mode"] = value
+                current_state["hdr_mode"] = (
+                    "off"
+                    if not camera.hdr_mode
+                    else normalize_hdr_mode(current_isp_hdr.value)
+                    if current_isp_hdr
+                    else None
+                )
+                # Normalize so the preview shows what will actually be applied
+                # (and rejects invalid values before confirmation).
+                proposed_changes["hdr_mode"] = normalize_hdr_mode(value)
             elif key == "mic_enabled":
                 current_state["mic_enabled"] = camera.is_mic_enabled
                 proposed_changes["mic_enabled"] = value
@@ -385,6 +407,7 @@ class CameraManager:
         Calls the appropriate pyunifiprotect setter methods.
         """
         camera = self._get_camera(camera_id)
+        settings = await self._validate_settings(camera, settings)
         applied: List[str] = []
         errors: List[str] = []
 
@@ -395,17 +418,17 @@ class CameraManager:
                     await camera.set_ir_led_model(mode)
                     applied.append(f"ir_led_mode={value}")
                 elif key == "hdr_mode":
-                    await camera.set_hdr_mode(value)
-                    applied.append(f"hdr_mode={value}")
+                    mode = normalize_hdr_mode(value)
+                    await camera.set_hdr_mode_public(PublicHdrMode.ON if mode == "always" else PublicHdrMode(mode))
+                    applied.append(f"hdr_mode={mode}")
                 elif key == "mic_enabled":
-                    # There's no direct set_mic_enabled; adjust mic volume to 0 for disable
-                    # or use set_privacy for full mic control. Use save_device pattern.
+                    # Microphone enablement remains a separate session-auth setting.
                     data_before = camera.dict_with_excludes()
                     camera.is_mic_enabled = value
                     await camera.save_device(data_before)
                     applied.append(f"mic_enabled={value}")
                 elif key == "mic_volume":
-                    await camera.set_mic_volume(int(value))
+                    await camera.set_mic_volume_public(value)
                     applied.append(f"mic_volume={value}")
                 elif key == "status_light_on":
                     await camera.set_status_light(bool(value))
@@ -422,7 +445,7 @@ class CameraManager:
                 else:
                     errors.append(f"Unknown setting: {key}")
             except Exception as exc:
-                logger.error("Error applying camera setting %s=%s: %s", key, value, exc, exc_info=True)
+                logger.error("Failed to apply camera setting %s (%s)", key, type(exc).__name__)
                 errors.append(f"{key}: {exc}")
 
         result: Dict[str, Any] = {
@@ -460,6 +483,70 @@ class CameraManager:
             "recording_mode": mode.value,
             "enabled": enabled,
         }
+
+    @staticmethod
+    def _get_rtsp_channel(camera: Any, quality: str) -> Any:
+        """Return the camera channel matching a quality name (high/medium/low).
+
+        Channels are named "High"/"Medium"/"Low" on the controller; match
+        case-insensitively and raise an actionable error otherwise.
+        """
+        wanted = quality.strip().lower()
+        for channel in camera.channels or []:
+            if channel.name and channel.name.lower() == wanted:
+                return channel
+        available = ", ".join(c.name for c in (camera.channels or []) if c.name)
+        raise ValueError(f"Camera has no '{quality}' channel. Available channels: {available}")
+
+    def _rtsp_stream_urls(self, alias: str) -> Dict[str, str]:
+        """Build the RTSPS/RTSP URLs for a channel alias from the NVR host."""
+        host = str(self._cm.client.bootstrap.nvr.host) if self._cm.client.bootstrap.nvr.host else self._cm.host
+        return {
+            "rtsps_url": f"rtsps://{host}:7441/{alias}",
+            "rtsp_url": f"rtsp://{host}:7447/{alias}",
+        }
+
+    async def toggle_rtsp(self, camera_id: str, enabled: bool, quality: str = "high") -> Dict[str, Any]:
+        """Return current and proposed RTSP state for a channel (preview)."""
+        camera = self._get_camera(camera_id)
+        channel = self._get_rtsp_channel(camera, quality)
+        return {
+            "camera_id": camera_id,
+            "camera_name": camera.name,
+            "quality": quality,
+            "channel_name": channel.name,
+            "current_rtsp_enabled": channel.is_rtsp_enabled,
+            "proposed_rtsp_enabled": enabled,
+        }
+
+    async def apply_toggle_rtsp(self, camera_id: str, enabled: bool, quality: str = "high") -> Dict[str, Any]:
+        """Enable or disable RTSP publishing on a channel after confirmation.
+
+        Mutates ``channel.is_rtsp_enabled`` and persists via the diff-based
+        ``save_device`` flow (the same pattern used for ``mic_enabled``). The
+        controller assigns ``rtsp_alias`` server-side when RTSP is first
+        enabled; the resulting stream URLs are returned (and redacted at the
+        tool boundary).
+        """
+        camera = self._get_camera(camera_id)
+        channel = self._get_rtsp_channel(camera, quality)
+
+        if channel.is_rtsp_enabled != enabled:
+            data_before = camera.dict_with_excludes()
+            channel.is_rtsp_enabled = enabled
+            await camera.save_device(data_before)
+
+        result: Dict[str, Any] = {
+            "camera_id": camera_id,
+            "camera_name": camera.name,
+            "quality": quality,
+            "channel_name": channel.name,
+            "rtsp_enabled": channel.is_rtsp_enabled,
+        }
+        if channel.is_rtsp_enabled and channel.rtsp_alias:
+            result["rtsp_alias"] = channel.rtsp_alias
+            result.update(self._rtsp_stream_urls(channel.rtsp_alias))
+        return result
 
     async def ptz_goto_preset(self, camera_id: str, preset_slot: int) -> Dict[str, Any]:
         """Move a PTZ camera to a named preset position.

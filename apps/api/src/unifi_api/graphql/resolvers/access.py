@@ -6,10 +6,9 @@ Phase 6 PR4 Task C — wires every migrated access read tool into a typed
 - Fetch helpers route through ``ctx.cache.get_or_fetch`` so concurrent
   resolvers in the same request share a single manager round-trip.
 - Page wrappers carry pagination cursors per LIST resolver.
-- DETAIL resolvers either filter the cached LIST snapshot by primary key
-  (``door``, ``event``, ``user``, ``credential``, ``policy``, ``visitor``,
-  ``device``) or fetch per-id via cache when there is no list
-  (``doorStatus``, ``activitySummary``, ``systemInfo``, ``health``).
+- DETAIL resolvers either filter the cached LIST snapshot by primary key or
+  fetch per-id via cache when lookup needs manager-specific behavior (including
+  synthetic Access event IDs).
 
 Relationship edges (Door.policy_assignments, User.credentials, Event.door,
 Event.user) land in Task D. The ``access`` slot of ``EXEMPT_PRODUCTS`` in
@@ -27,10 +26,12 @@ from typing import Any
 
 import strawberry
 from strawberry.types import Info
+from unifi_core.exceptions import UniFiNotFoundError
 
 from unifi_api.graphql.context import GraphQLContext
 from unifi_api.graphql.permissions import IsRead
 from unifi_api.graphql.types.access.credentials import Credential
+from unifi_api.graphql.types.access.device_configs import AccessDeviceConfig
 from unifi_api.graphql.types.access.devices import AccessDevice
 from unifi_api.graphql.types.access.doors import Door, DoorGroup, DoorStatus
 from unifi_api.graphql.types.access.events import ActivitySummary, Event
@@ -39,6 +40,11 @@ from unifi_api.graphql.types.access.schedules import Schedule
 from unifi_api.graphql.types.access.system import AccessHealth, AccessSystemInfo
 from unifi_api.graphql.types.access.users import User
 from unifi_api.graphql.types.access.visitors import Visitor
+from unifi_api.services.access_event_key import (
+    event_sort_key,
+    paginate_access_events,
+    validate_access_event_topic,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -62,15 +68,15 @@ def _id_of(obj: Any) -> Any:
 
 
 def _decode_cursor(cursor: str | None):
-    """Translate an opaque cursor string to a Cursor (or raise ValueError)."""
+    """Translate an opaque cursor string to a Cursor (or raise InvalidCursor)."""
     from unifi_api.services.pagination import Cursor, InvalidCursor
 
     if not cursor:
         return None
     try:
         return Cursor.decode(cursor)
-    except InvalidCursor:
-        raise ValueError("invalid cursor")
+    except InvalidCursor as exc:
+        raise InvalidCursor("invalid cursor") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -83,17 +89,14 @@ def _id_key(obj: Any) -> tuple:
 
 
 def _event_key(obj: Any) -> tuple:
-    """Sort by (timestamp, id) — newest-first ordering is captured by the
-    REST routes; paginate() sorts ascending which is fine for cursor stability.
+    """Sort by the canonical Access event key.
+
+    Shared with the REST route and defined in ``unifi_api.services``, because cursor
+    windowing only works if every surface agrees: system-log rows carry
+    ``published`` rather than ``timestamp`` and an empty ``id``, so the old
+    ``(raw["timestamp"], raw["id"])`` collapsed every row onto ``(0, "")``.
     """
-    raw = _raw(obj)
-    if isinstance(raw, dict):
-        ts = raw.get("timestamp") or raw.get("time") or 0
-        rid = raw.get("id") or ""
-    else:
-        ts = getattr(raw, "timestamp", None) or getattr(raw, "time", None) or 0
-        rid = getattr(raw, "id", None) or ""
-    return (int(ts or 0), str(rid))
+    return event_sort_key(_raw(obj))
 
 
 def _visitor_key(obj: Any) -> tuple:
@@ -196,6 +199,27 @@ async def _fetch_devices(ctx: GraphQLContext, controller: str) -> list:
                 "access",
             )
             return list(await mgr.list_devices())
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_device_configs(ctx: GraphQLContext, controller: str, device_id: str) -> dict:
+    key = f"access/device-configs/{controller}/{device_id}"
+
+    async def _do() -> dict:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "access",
+                "device_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "access",
+            )
+            return await mgr.get_device_configs(device_id)
 
     return await ctx.cache.get_or_fetch(key, _do)
 
@@ -309,8 +333,9 @@ async def _fetch_events(
     ctx: GraphQLContext,
     controller: str,
     list_limit: int,
+    topic: str,
 ) -> list:
-    key = f"access/events/{controller}/{list_limit}"
+    key = f"access/events/{controller}/{topic}/{list_limit}"
 
     async def _do() -> list:
         async with ctx.sessionmaker() as session:
@@ -325,7 +350,35 @@ async def _fetch_events(
                 controller,
                 "access",
             )
-            return list(await mgr.list_events(limit=list_limit))
+            return list(await mgr.list_events(topic=topic, limit=list_limit))
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_event(
+    ctx: GraphQLContext,
+    controller: str,
+    event_id: str,
+) -> Any:
+    key = f"access/event/{controller}/{event_id}"
+
+    async def _do() -> Any:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "access",
+                "event_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "access",
+            )
+            try:
+                return await mgr.get_event(event_id)
+            except UniFiNotFoundError:
+                return None
 
     return await ctx.cache.get_or_fetch(key, _do)
 
@@ -418,6 +471,12 @@ class DoorGroupPage:
 @strawberry.type(description="Paginated page of UniFi Access devices.")
 class AccessDevicePage:
     items: list[AccessDevice]
+    next_cursor: str | None
+
+
+@strawberry.type(description="A device's config/settings entries.")
+class AccessDeviceConfigPage:
+    items: list[AccessDeviceConfig]
     next_cursor: str | None
 
 
@@ -609,6 +668,26 @@ class AccessQuery:
                 return AccessDevice.from_manager_output(d)
         return None
 
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description="List a device's config/settings entries (e.g. reader voice greeting). Secrets redacted.",
+    )
+    async def device_configs(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+        device_id: strawberry.ID,
+    ) -> AccessDeviceConfigPage:
+        ctx: GraphQLContext = info.context
+        info_dict = await _fetch_device_configs(ctx, controller, device_id)
+        return AccessDeviceConfigPage(
+            items=[
+                AccessDeviceConfig.from_manager_output(c, redact_sensitive=ctx.redact_sensitive_fields)
+                for c in info_dict.get("configs", [])
+            ],
+            next_cursor=None,
+        )
+
     # ---- Users -----------------------------------------------------------
 
     @strawberry.field(
@@ -671,7 +750,7 @@ class AccessQuery:
         )
         items: list[Credential] = []
         for c in page:
-            inst = Credential.from_manager_output(c)
+            inst = Credential.from_manager_output(c, redact_sensitive=ctx.redact_sensitive_fields)
             inst._controller_id = str(controller)
             items.append(inst)
         return CredentialPage(
@@ -693,7 +772,7 @@ class AccessQuery:
         raw = await _fetch_credentials(ctx, controller)
         for c in raw:
             if _id_of(c) == id:
-                inst = Credential.from_manager_output(c)
+                inst = Credential.from_manager_output(c, redact_sensitive=ctx.redact_sensitive_fields)
                 inst._controller_id = str(controller)
                 return inst
         return None
@@ -786,7 +865,10 @@ class AccessQuery:
 
     @strawberry.field(
         permission_classes=[IsRead],
-        description="List Access visitors (time-bounded guest passes).",
+        description=(
+            "List Access Developer API visitors. Returned UUIDs are scoped to the visitor family "
+            "and must not be passed to other Access user or credential operations."
+        ),
     )
     async def visitors(
         self,
@@ -814,7 +896,10 @@ class AccessQuery:
 
     @strawberry.field(
         permission_classes=[IsRead],
-        description="Look up a single Access visitor by id.",
+        description=(
+            "Look up one Access Developer API visitor using a UUID returned by the visitor family; "
+            "IDs from other Access user or credential operations are not accepted."
+        ),
     )
     async def visitor(
         self,
@@ -833,7 +918,11 @@ class AccessQuery:
 
     @strawberry.field(
         permission_classes=[IsRead],
-        description="List Access events (paginated, most recent first).",
+        description=(
+            "List Access events by system-log topic, paginated most recent first. "
+            "Use unlocks for door grants and open/close history, access_denial for refused attempts, "
+            "ring for doorbells, or updates, critical, admin, and admin_activity."
+        ),
     )
     async def events(
         self,
@@ -841,20 +930,20 @@ class AccessQuery:
         controller: strawberry.ID,
         limit: int = 50,
         cursor: str | None = None,
+        topic: str = "admin",
     ) -> AccessEventPage:
         ctx: GraphQLContext = info.context
+        topic = validate_access_event_topic(topic)
         # Mirror the REST route: pull a wider window from the manager so
         # paginate() has enough rows to cursor through.
-        raw = await _fetch_events(ctx, controller, max(limit, 100))
+        raw = await _fetch_events(ctx, controller, max(limit, 100), topic)
 
-        from unifi_api.services.pagination import paginate
-
-        cursor_obj = _decode_cursor(cursor)
-        page, next_cursor = paginate(
+        page, next_cursor = paginate_access_events(
             list(raw),
             limit=limit,
-            cursor=cursor_obj,
+            cursor=cursor,
             key_fn=_event_key,
+            topic=topic,
         )
         items: list[Event] = []
         for e in page:
@@ -863,7 +952,7 @@ class AccessQuery:
             items.append(inst)
         return AccessEventPage(
             items=items,
-            next_cursor=next_cursor.encode() if next_cursor else None,
+            next_cursor=next_cursor,
         )
 
     @strawberry.field(
@@ -877,16 +966,12 @@ class AccessQuery:
         id: strawberry.ID,
     ) -> Event | None:
         ctx: GraphQLContext = info.context
-        # Filter the cached events list — the REST detail endpoint hits a
-        # dedicated manager method, but the LIST snapshot is cheaper to
-        # reuse for resolver-graph queries.
-        raw = await _fetch_events(ctx, controller, 100)
-        for e in raw:
-            if _id_of(e) == id:
-                inst = Event.from_manager_output(e)
-                inst._controller_id = str(controller)
-                return inst
-        return None
+        raw = await _fetch_event(ctx, controller, str(id))
+        if raw is None:
+            return None
+        inst = Event.from_manager_output(raw)
+        inst._controller_id = str(controller)
+        return inst
 
     @strawberry.field(
         permission_classes=[IsRead],

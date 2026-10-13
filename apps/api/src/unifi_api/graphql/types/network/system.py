@@ -27,6 +27,8 @@ from dataclasses import asdict
 from typing import Any
 
 import strawberry
+from unifi_core.network.models.system import mgmt_from_controller, snmp_from_controller
+from unifi_core.redaction import redact_value
 
 
 def _get(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -289,6 +291,9 @@ class SiteSettings:
 class SnmpSettings:
     enabled: bool
     community: str | None
+    enabled_v3: bool | None
+    username: str | None
+    x_password: str | None
     port: int | None
     version: str | None
     _had_payload: strawberry.Private[bool] = True
@@ -298,7 +303,7 @@ class SnmpSettings:
         return {"kind": kind}
 
     @classmethod
-    def from_manager_output(cls, obj: Any) -> "SnmpSettings":
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "SnmpSettings":
         # Manager returns list[dict]; type unwraps first item to match the
         # legacy serializer contract.
         if isinstance(obj, list):
@@ -307,15 +312,24 @@ class SnmpSettings:
             return cls(
                 enabled=False,
                 community=None,
+                enabled_v3=None,
+                username=None,
+                x_password=None,
                 port=None,
                 version=None,
                 _had_payload=False,
             )
+        # Non-secret fields come from the core converter (one parser, one
+        # alias table); the two secrets are redacted here, at the boundary.
+        core = snmp_from_controller(obj)
         return cls(
             enabled=bool(obj.get("enabled", False)),
-            community=_get(obj, "community", default=""),
-            port=_get(obj, "port"),
-            version=_get(obj, "version"),
+            community=redact_value("community", _get(obj, "community", default=""), redact_sensitive=redact_sensitive),
+            enabled_v3=core.enabled_v3,
+            username=core.username,
+            x_password=redact_value("x_password", core.x_password, redact_sensitive=redact_sensitive),
+            port=core.port,
+            version=core.version,
             _had_payload=True,
         )
 
@@ -327,9 +341,54 @@ class SnmpSettings:
         return d
 
 
-@strawberry.type(description="Wrapper for event-type prefix descriptors.")
+@strawberry.type(
+    description="Read-only device management (mgmt) posture: device SSH state, key and credential presence. "
+    "No credential, hash or key material is ever returned."
+)
+class MgmtSettings:
+    x_ssh_enabled: bool | None
+    x_ssh_username: str | None
+    x_ssh_auth_password_enabled: bool | None
+    x_ssh_bind_wildcard: bool | None
+    ssh_keys_present: bool | None
+    ssh_keys_count: int | None
+    ssh_password_set: bool | None
+    ssh_password_hash_set: bool | None
+    mgmt_key_set: bool | None
+    api_token_set: bool | None
+    debug_tools_enabled: bool | None
+    auto_upgrade: bool | None
+    auto_upgrade_hour: int | None
+    advanced_feature_enabled: bool | None
+    unifi_idp_enabled: bool | None
+    wifiman_enabled: bool | None
+    _had_payload: strawberry.Private[bool] = True
+
+    @classmethod
+    def render_hint(cls, kind: str) -> dict:
+        return {"kind": kind}
+
+    @classmethod
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "MgmtSettings":
+        """The core converter is the allowlist: every credential and the key list
+        become presence flags, so ``redact_sensitive`` has nothing to hide. It is
+        accepted because the presence flags carry secret-shaped names and the
+        typed-projection contract (test_redaction_contract) requires the flag on
+        such types; the policy-gated action path passes it by reflection."""
+        had_payload = isinstance(obj, dict) or (isinstance(obj, list) and bool(obj) and isinstance(obj[0], dict))
+        return cls(**mgmt_from_controller(obj).model_dump(), _had_payload=had_payload)
+
+    def to_dict(self) -> dict:
+        if not self._had_payload:
+            return {}
+        d = asdict(self)
+        d.pop("_had_payload", None)
+        return d
+
+
+@strawberry.type(description="Wrapper for exact event-key descriptors.")
 class EventTypes:
-    # The catalog of event-type prefixes is unstructured (varies by
+    # The catalog of observed event keys is unstructured (varies by
     # firmware), so each descriptor passes through as a plain dict.
     # Exposed as a ``JSON`` scalar on the GraphQL surface so the
     # heterogeneous payload survives without an enumerated sub-type.

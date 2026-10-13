@@ -2,7 +2,7 @@
 
 The UniFi Network MCP server merges settings from three sources (highest priority first):
 
-1. **Environment variables** (or `.env` file)
+1. **Process environment variables** supplied by the launcher
 2. **YAML config file** (`src/unifi_network_mcp/config/config.yaml`)
 3. **Hardcoded defaults**
 
@@ -13,14 +13,40 @@ The Network server supports server-specific environment variables with the `UNIF
 | Server-specific variable | Shared fallback | Required | Default | Description |
 |--------------------------|-----------------|----------|---------|-------------|
 | `UNIFI_NETWORK_HOST` | `UNIFI_HOST` | Yes | -- | Controller IP or hostname |
-| `UNIFI_NETWORK_USERNAME` | `UNIFI_USERNAME` | Yes | -- | Local admin username |
-| `UNIFI_NETWORK_PASSWORD` | `UNIFI_PASSWORD` | Yes | -- | Admin password |
-| `UNIFI_NETWORK_API_KEY` | `UNIFI_API_KEY` | No | `""` | UniFi API key (experimental — read-only, subset of tools; username/password still required) |
+| `UNIFI_NETWORK_USERNAME` | `UNIFI_USERNAME` | For session tools | `""` | Local admin username; omit for API-key-only inventory |
+| `UNIFI_NETWORK_PASSWORD` | `UNIFI_PASSWORD` | For session tools | `""` | Admin password; omit for API-key-only inventory |
+| `UNIFI_NETWORK_API_KEY` | `UNIFI_API_KEY` | No | `""` | Inventory reads and explicit Integration API tools; legacy mutations/full details may still require username/password. Public fallback has limited fields and separate UUIDs; see the README authentication section. |
 | `UNIFI_NETWORK_PORT` | `UNIFI_PORT` | No | `443` | Controller HTTPS port |
 | `UNIFI_NETWORK_SITE` | `UNIFI_SITE` | No | `default` | UniFi site name |
 | `UNIFI_NETWORK_VERIFY_SSL` | `UNIFI_VERIFY_SSL` | No | `false` | SSL certificate verification |
+| `UNIFI_NETWORK_WEBSOCKET_ENABLED` | -- | No | `true` | Start the real-time event listener that feeds `unifi_recent_events` |
+| `UNIFI_NETWORK_EVENT_BUFFER_SIZE` | -- | No | `100` | Positive maximum events held in the websocket ring buffer; invalid values prevent startup |
+| `UNIFI_NETWORK_EVENT_BUFFER_TTL` | -- | No | `300` | Positive seconds before buffered events expire; invalid values prevent startup |
 
 **Resolution order:** `UNIFI_NETWORK_*` > `UNIFI_*` > YAML config > hardcoded default.
+
+### Keeping the password out of the client environment
+
+`UNIFI_NETWORK_PASSWORD` and `UNIFI_NETWORK_API_KEY` (and their `UNIFI_*` fallbacks) each accept two indirect spellings, so the secret only ever exists inside the server process:
+
+| Variable | Value |
+|----------|-------|
+| `UNIFI_NETWORK_PASSWORD_FILE` | Path to a file whose contents are the password (Docker and systemd secrets convention). Trailing newlines dropped. |
+| `UNIFI_NETWORK_PASSWORD_COMMAND` | An absolute argv whose stdout is the password, for example `/usr/bin/pass show unifi/admin`. Run without a shell, in a neutral working directory, with stdin closed and stderr discarded. |
+
+`UNIFI_NETWORK_API_KEY_FILE` and `UNIFI_NETWORK_API_KEY_COMMAND` behave the same way. Set exactly one spelling per level; every failure refuses startup with exit code 6, naming the variable and logging nothing the file or helper produced.
+
+The indirections are honoured only for variables present in the environment the server was started with. [docs/credential-providers.md](../../../docs/credential-providers.md) is the contract: the supported platforms, the executable-resolution rule, the timeout and the process lifecycle.
+
+The server does not discover or load `.env` files, including in its working directory or beside the installed package. Supply settings through exported variables, the MCP client's `env` block, or Docker `environment:` / `env_file:`. Use absolute paths for credential files. The launcher and any configuration files it explicitly loads must be controlled by the operator.
+
+If you previously relied on automatic `.env` loading, configure your launcher to load a trusted file explicitly. For example:
+
+```bash
+uv run --env-file /absolute/path/to/trusted.env --with unifi-network-mcp unifi-network-mcp
+```
+
+Only select files you trust; explicitly loading a project's malicious env file in the launcher puts those values in the trusted process environment. Docker Compose deployments that already use `env_file:` continue to work.
 
 ## Controller Type Detection
 
@@ -41,15 +67,32 @@ The server auto-detects whether your controller uses UniFi OS proxy paths (`/pro
 | `UNIFI_MCP_LOG_LEVEL` | `INFO` | Logging level |
 | `UNIFI_AUTO_CONFIRM` | `false` | Skip preview-then-confirm for mutations (for automation) |
 | `UNIFI_TOOL_REGISTRATION_MODE` | `lazy` | Tool loading: `lazy`, `eager`, or `meta_only` |
+| `UNIFI_DEFER_CONTROLLER_INIT` | `false` | By default the server answers the MCP client at once and connects to the controller in the background; tool calls wait for that connection for up to 15 seconds. Set `true` to make no connection at startup and connect on the first tool call instead. The real-time event listener starts in the background after the connection succeeds. |
+| `UNIFI_META_TOOLS_ENABLED` | `true` | Eager mode only. Set to `false` to omit indirect meta-tools, including `unifi_get_support_bundle`; `UNIFI_ENABLED_CATEGORIES` or `UNIFI_ENABLED_TOOLS` is then required. |
 | `UNIFI_ENABLED_CATEGORIES` | — | Comma-separated tool categories to load (eager mode only) |
 | `UNIFI_ENABLED_TOOLS` | — | Comma-separated tool names to register (eager mode only) |
 | `CONFIG_PATH` | — | Path to a custom config YAML file |
+| `UNIFI_SETTINGS_FILE` | — | Absolute path to a per-user file of `UNIFI_*` settings, read at startup; the process environment wins ([details](../../../README.md#configuration)) |
+
+## MCP Response Content
+
+`UNIFI_NETWORK_MCP_CONTENT_MODE` overrides the global `UNIFI_MCP_CONTENT_MODE`; if neither is set, the YAML value and then the `adaptive` default apply.
+
+The `adaptive` and `compact` modes affect response compaction only for tool results that already provide structured output. The lazy-loading meta-tools (`*_tool_index`, `*_execute`, `*_batch`, `*_batch_status`, and lazy-only `*_load_tools`) remain content-only and are independent of protocol-version response compatibility. For structured inner results, `*_execute` and `*_batch_status` expose one normalized JSON payload in `content` rather than a nested transport pair; content-only execute results remain unchanged. Response modes do not convert these meta-tools to `structuredContent`.
+
+| Mode | Behavior |
+|------|----------|
+| `adaptive` (default) | Classifies the request by the canonical date-based `protocolVersion` advertised during MCP initialization, not by client product or application version. For structured tool results, MCP `2025-06-18` or later receives concise `content` plus the full result once in `structuredContent`; earlier, missing, or malformed revisions retain full compatibility JSON in `content`. |
+| `compat` | Forces full compatibility JSON in `content` as well as the structured result. Use this for clients that consume the full result only from `content`, regardless of advertised revision. |
+| `compact` | For structured tool results, forces concise `content` plus the full `structuredContent` result even when no capable protocol revision was negotiated. |
+
+Network also bounds high-volume source data before MCP serialization: `unifi_get_dashboard` defaults to `summary=true`, and `unifi_list_rogue_aps` defaults to a summarized page of at most 100 records. Pass `summary=false` for full data within the selected dashboard request or rogue-AP page.
 
 ## Tool Registration Modes
 
 Standard MCP clients discover currently registered tools with `tools/list`.
-UniFi meta-tools are compatibility extensions for lazy loading and compact
-catalog discovery. See [MCP Discovery and UniFi Meta-Tools](../../../docs/tool-index.md).
+The meta-tools support lazy loading through filtered discovery, indirect
+execution, batch orchestration, and optional direct registration. See [MCP Discovery and Lazy-Loading Meta-Tools](../../../docs/tool-index.md).
 
 | Mode | Initial `tools/list` behavior | Best fit |
 |------|-------------------------------|----------|
@@ -65,7 +108,7 @@ HTTP is disabled by default. The stdio transport is recommended for most use cas
 |----------|---------|-------------|
 | `UNIFI_MCP_HTTP_ENABLED` | `false` | Enable HTTP transport |
 | `UNIFI_MCP_HTTP_TRANSPORT` | `streamable-http` | `streamable-http` (recommended) or `sse` (legacy) |
-| `UNIFI_MCP_HOST` | `0.0.0.0` | HTTP bind address |
+| `UNIFI_MCP_HOST` | `127.0.0.1` | HTTP bind address; remote access requires an authenticated proxy or relay |
 | `UNIFI_MCP_PORT` | `3000` | HTTP bind port |
 | `UNIFI_MCP_HTTP_FORCE` | `false` | Force HTTP in non-container environments |
 
@@ -81,9 +124,11 @@ HTTP is disabled by default. The stdio transport is recommended for most use cas
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `UNIFI_MCP_DIAGNOSTICS` | `false` | Enable structured logging for tool calls and API requests |
-| `UNIFI_MCP_DIAG_LOG_TOOL_ARGS` | `true` | Include tool arguments in diagnostic logs |
-| `UNIFI_MCP_DIAG_LOG_TOOL_RESULT` | `true` | Include tool results in diagnostic logs |
+| `UNIFI_MCP_DIAG_LOG_TOOL_ARGS` | `true` | Deprecated compatibility setting; arguments are never logged |
+| `UNIFI_MCP_DIAG_LOG_TOOL_RESULT` | `true` | Deprecated compatibility setting; result payloads are never logged |
 | `UNIFI_MCP_DIAG_MAX_PAYLOAD` | `2000` | Max characters for diagnostic payloads |
+
+Diagnostics include the tool name or HTTP method, duration, boolean outcome when available, and exception class. They omit arguments, results, controller request/response bodies, paths, and exception messages, even when the legacy payload flags are enabled.
 
 ## Permissions
 
@@ -142,10 +187,12 @@ unifi:
   api_key: ${oc.env:UNIFI_API_KEY,""}
 
 server:
-  host: ${oc.env:UNIFI_MCP_HOST,0.0.0.0}
+  host: ${oc.env:UNIFI_MCP_HOST,127.0.0.1}
   port: ${oc.env:UNIFI_MCP_PORT,3000}
   log_level: INFO
   tool_registration_mode: ${oc.env:UNIFI_TOOL_REGISTRATION_MODE,lazy}
+  defer_controller_init: ${oc.env:UNIFI_DEFER_CONTROLLER_INIT,false}
+  meta_tools_enabled: ${oc.env:UNIFI_META_TOOLS_ENABLED,true}
 
   http:
     enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,false}
@@ -159,4 +206,4 @@ permissions:
     delete: false
 ```
 
-You can override the config file location with `CONFIG_PATH=/path/to/config.yaml`.
+You can override the config file location with `CONFIG_PATH=/absolute/path/to/config.yaml` in the process environment. Relative paths are rejected. The server never automatically loads `config/config.yaml` from the working directory; existing custom YAML deployments must select their trusted file explicitly.

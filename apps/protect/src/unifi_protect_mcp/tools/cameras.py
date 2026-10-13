@@ -19,6 +19,7 @@ from unifi_core.protect.models._actions import (
     PtzZoomInput,
     RebootCameraInput,
     ToggleRecordingInput,
+    ToggleRtspInput,
 )
 from unifi_core.protect.models.cameras import (
     from_controller as camera_from_controller,
@@ -26,9 +27,11 @@ from unifi_core.protect.models.cameras import (
 from unifi_core.protect.models.cameras import (
     to_controller_update as camera_to_controller_update,
 )
-from unifi_protect_mcp.runtime import camera_manager, server
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_protect_mcp.runtime import camera_manager, server, should_redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Read-only tools
@@ -153,7 +156,10 @@ async def protect_get_camera_streams(
     logger.info("protect_get_camera_streams tool called for %s", camera_id)
     try:
         streams = await camera_manager.get_camera_streams(camera_id)
-        return {"success": True, "data": streams}
+        return redact_sensitive_fields(
+            {"success": True, "data": streams},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
@@ -196,10 +202,11 @@ async def protect_get_camera_analytics(
     description=(
         "Updates camera settings such as IR LED mode, HDR mode, mic/speaker volume, "
         "status light, and motion detection. Requires confirm=True to apply. "
+        "HDR and microphone volume require UNIFI_PROTECT_API_KEY or UNIFI_API_KEY. "
         "Supported keys: ir_led_mode, hdr_mode, mic_enabled, mic_volume, "
         "status_light_on, speaker_volume, name, motion_detection."
     ),
-    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     permission_category="camera",
     permission_action="update",
 )
@@ -210,8 +217,10 @@ async def protect_update_camera_settings(
         Field(
             description=(
                 "Dictionary of settings to update. Supported keys: "
-                "ir_led_mode (auto, on, autoFilterOnly), hdr_mode (true/false), "
-                "mic_enabled (true/false), mic_volume (0-100), "
+                "ir_led_mode (auto, on, autoFilterOnly), "
+                "hdr_mode (off, auto, or always; always = superHdr highest quality. "
+                "Booleans accepted: true=auto, false=off), "
+                "mic_enabled (true/false), mic_volume (1-100; zero is not supported by the public API), "
                 "status_light_on (true/false), speaker_volume (0-100), "
                 "name (string), motion_detection (true/false)."
             )
@@ -246,6 +255,12 @@ async def protect_update_camera_settings(
 
         # Apply the changes
         result = await camera_manager.apply_camera_settings(camera_id, filtered)
+        if result.get("errors"):
+            return {
+                "success": False,
+                "error": "Failed to update camera settings: " + "; ".join(result["errors"]),
+                "data": result,
+            }
         return {"success": True, "data": result}
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}
@@ -309,6 +324,78 @@ async def protect_toggle_recording(
     except Exception as e:
         logger.error("Error toggling recording for camera %s: %s", camera_id, e, exc_info=True)
         return {"success": False, "error": f"Failed to toggle recording: {e}"}
+
+
+@server.tool(
+    name="protect_toggle_rtsp",
+    description=(
+        "Enables or disables the RTSP/RTSPS stream on a camera channel. "
+        "When enabled, the controller publishes the channel and assigns a stream "
+        "alias; the RTSP/RTSPS URLs are returned. Choose the channel with "
+        "quality (high, medium, low; default high). Requires confirm=True to apply."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    permission_category="camera",
+    permission_action="update",
+)
+async def protect_toggle_rtsp(
+    camera_id: Annotated[str, Field(description="Camera UUID (from protect_list_cameras)")],
+    enabled: Annotated[
+        bool,
+        Field(description="When true, publishes an RTSP/RTSPS stream on the channel. When false, stops it."),
+    ],
+    quality: Annotated[
+        str,
+        Field(description="Channel quality to toggle: high, medium, or low. Defaults to high."),
+    ] = "high",
+    confirm: Annotated[
+        bool,
+        Field(description="When true, executes the mutation. When false (default), returns a preview of the changes."),
+    ] = False,
+) -> Dict[str, Any]:
+    """Toggle a camera channel's RTSP stream on/off with preview/confirm."""
+    logger.info(
+        "protect_toggle_rtsp tool called for %s (enabled=%s, quality=%s, confirm=%s)",
+        camera_id,
+        enabled,
+        quality,
+        confirm,
+    )
+    try:
+        try:
+            ToggleRtspInput(camera_id=camera_id, enabled=enabled, quality=quality)
+        except ValidationError as e:
+            return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
+
+        preview_data = await camera_manager.toggle_rtsp(camera_id, enabled, quality)
+
+        if not confirm:
+            return preview_response(
+                action="toggle",
+                resource_type="camera_rtsp",
+                resource_id=camera_id,
+                current_state={
+                    "quality": preview_data["quality"],
+                    "channel_name": preview_data["channel_name"],
+                    "rtsp_enabled": preview_data["current_rtsp_enabled"],
+                },
+                proposed_changes={
+                    "rtsp_enabled": preview_data["proposed_rtsp_enabled"],
+                },
+                resource_name=preview_data["camera_name"],
+            )
+
+        # Apply the change
+        result = await camera_manager.apply_toggle_rtsp(camera_id, enabled, quality)
+        return redact_sensitive_fields(
+            {"success": True, "data": result},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
+    except (UniFiNotFoundError, ValueError) as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error("Error toggling RTSP for camera %s: %s", camera_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to toggle RTSP: {e}"}
 
 
 @server.tool(

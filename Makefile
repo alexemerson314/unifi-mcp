@@ -1,7 +1,9 @@
-.PHONY: help sync build check test lint format format-check format-fix manifest generate server-manifests skill-references \
-       check-skill-references check-generated pre-commit ci core-test shared-test protocol-smoke \
-       relay-test worker-install worker-test worker-typecheck worker-build worker-check docker-relay \
-       docker-build docker-up docker-down docker-logs
+.PHONY: help sync build check test lint format format-check format-fix manifest generate api-action-catalog \
+       check-api-action-catalog server-manifests skill-references check-skill-references check-generated \
+       support-skills check-support-skills pre-commit ci core-test shared-test catalog-test protocol-smoke \
+       protocol-smoke-no-sync docs-test relay-test network-test protect-test access-test test-parallel \
+       worker-install worker-test worker-typecheck worker-build worker-check docker-relay docker-build \
+       docker-up docker-down docker-logs check-plugin-versions check-plugin-tool-refs
 
 help:
 	@echo "UniFi MCP Ecosystem — Top-Level Commands"
@@ -16,11 +18,14 @@ help:
 	@echo "  make format-fix     Auto-fix lint issues in the full workspace"
 	@echo "  make generate       Regenerate committed generated artifacts"
 	@echo "  make manifest       Regenerate tool manifests + skill references"
+	@echo "  make api-action-catalog  Regenerate the API action catalog"
 	@echo "  make check-generated  Check generated artifacts for drift"
 	@echo "  make ci             Lint + generated drift checks + tests"
 	@echo "  make server-manifests  Regenerate server.json for all apps (MCP Registry)"
 	@echo "  make skill-references  Update skill tool tables from manifests"
+	@echo "  make support-skills Generate product support-bundle skills"
 	@echo "  make pre-commit     Format + generate + lint + test + drift checks"
+	@echo "  make docs-test      Run documentation site contract tests"
 	@echo ""
 	@echo "  make docker-build   Build all Docker images"
 	@echo "  make docker-up      Start all servers (docker compose)"
@@ -29,6 +34,7 @@ help:
 	@echo ""
 	@echo "  make core-test      Run unifi-core tests only"
 	@echo "  make shared-test    Run unifi-mcp-shared tests only"
+	@echo "  make catalog-test   Run the root tests/ suite (generation, release and harness contracts)"
 	@echo "  make protocol-smoke Run MCP protocol conformance smoke tests"
 	@echo "  make worker-build   Install worker deps + typecheck Worker app"
 	@echo "  make worker-check   Run worker CLI tests + TypeScript checks"
@@ -41,16 +47,36 @@ build: docker-build worker-build
 check: format-check lint check-generated test worker-typecheck
 
 core-test:
-	uv run --package unifi-core pytest packages/unifi-core/tests -v
+	# --all-extras, not a named extra: the suite spans tests/network (aiounifi),
+	# tests/protect (uiprotect) and tests/access (py-unifi-access), and naming one
+	# installs that extra's deps while leaving the others' collection to fail.
+	uv run --package unifi-core --all-extras pytest packages/unifi-core/tests -v
 
 shared-test:
 	uv run --package unifi-mcp-shared pytest packages/unifi-mcp-shared/tests -v
 
-test: core-test shared-test relay-test protocol-smoke worker-test
-	$(MAKE) -C apps/network test
-	$(MAKE) -C apps/protect test
-	$(MAKE) -C apps/access test
+catalog-test:
+	uv run --all-packages pytest tests/ -v
+
+docs-test:
+	uv run python testsupport/run_unittest.py -s tests/docs -p 'test_*.py' -v
+
+test:
+	uv sync --all-packages
+	UV_NO_SYNC=1 $(MAKE) -j4 test-parallel
 	$(MAKE) -C apps/api test
+
+test-parallel: core-test shared-test catalog-test docs-test relay-test protocol-smoke-no-sync worker-test \
+               network-test protect-test access-test
+
+network-test:
+	$(MAKE) -C apps/network test
+
+protect-test:
+	$(MAKE) -C apps/protect test
+
+access-test:
+	$(MAKE) -C apps/access test
 
 lint:
 	uv run ruff check .
@@ -65,14 +91,21 @@ format-fix:
 	uv run ruff format .
 	uv run ruff check . --fix
 
-generate: manifest
+generate: manifest support-skills
 
 manifest:
 	$(MAKE) -C apps/network manifest
 	$(MAKE) -C apps/protect manifest
 	$(MAKE) -C apps/access manifest
+	$(MAKE) api-action-catalog
 	$(MAKE) skill-references
 	$(MAKE) server-manifests
+
+api-action-catalog:
+	uv run --package unifi-api-server python scripts/generate_api_action_catalog.py
+
+check-api-action-catalog:
+	uv run --package unifi-api-server python scripts/generate_api_action_catalog.py --check
 
 server-manifests:
 	$(MAKE) -C apps/network server-manifest
@@ -85,13 +118,31 @@ skill-references:
 check-skill-references:
 	python3 scripts/generate_skill_references.py --check
 
-check-generated: check-skill-references
+support-skills:
+	uv run python scripts/generate_support_skills.py
+
+check-support-skills:
+	uv run python scripts/generate_support_skills.py --check
+
+PLUGIN_VERSION_BASE ?= origin/main
+
+check-plugin-versions:
+	python3 scripts/plugin_versions.py check --base "$(PLUGIN_VERSION_BASE)"
+
+check-plugin-tool-refs:
+	python3 scripts/plugin_tool_refs.py
+
+check-generated: check-skill-references check-api-action-catalog check-support-skills
 
 relay-test:
 	uv run --package unifi-mcp-relay pytest packages/unifi-mcp-relay/tests -v
 
 protocol-smoke:
-	uv run --package unifi-network-mcp python scripts/smoke_mcp_metadata.py --server all --registration-mode all
+	uv sync --all-packages
+	UV_NO_SYNC=1 $(MAKE) protocol-smoke-no-sync
+
+protocol-smoke-no-sync:
+	uv run --no-sync --package unifi-network-mcp python scripts/smoke_mcp_metadata.py --server all --registration-mode all --client-mode all
 
 worker-install:
 	npm ci --prefix apps/worker
@@ -110,7 +161,15 @@ worker-check: worker-typecheck worker-test
 docker-relay:
 	docker build -f packages/unifi-mcp-relay/Dockerfile -t unifi-mcp-relay .
 
-pre-commit: format generate lint test check-generated worker-typecheck
+pre-commit:
+	$(MAKE) check-plugin-versions
+	$(MAKE) check-plugin-tool-refs
+	$(MAKE) format
+	$(MAKE) generate
+	$(MAKE) lint
+	$(MAKE) test
+	$(MAKE) check-generated
+	$(MAKE) worker-typecheck
 
 ci: check
 

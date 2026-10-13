@@ -73,7 +73,7 @@ class _FakeCM:
 
 def _stub_connection(app, cid: str) -> _FakeCM:
     fake = _FakeCM()
-    app.state.manager_factory._connection_cache[(cid, "network")] = fake
+    app.state.manager_factory._connection_cache[(cid, "network", "default")] = fake
     return fake
 
 
@@ -209,6 +209,40 @@ async def test_list_firewall_zones_happy_path(tmp_path, monkeypatch) -> None:
     assert names == {"internal", "external"}
 
 
+@pytest.mark.asyncio
+async def test_get_firewall_policy_ordering_happy_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    async def fake_get(self, source_zone, destination_zone):
+        assert source_zone == "zone-src"
+        assert destination_zone == "zone-dst"
+        return {
+            "orderedFirewallPolicyIds": {
+                "beforeSystemDefined": ["allow-1"],
+                "afterSystemDefined": ["block-1"],
+            }
+        }
+
+    from unifi_core.network.managers.firewall_manager import FirewallManager
+
+    monkeypatch.setattr(FirewallManager, "get_firewall_policy_ordering", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            (
+                f"/v1/sites/default/firewall/policy-ordering?controller={cid}"
+                "&source_firewall_zone_id=zone-src&destination_firewall_zone_id=zone-dst"
+            ),
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["render_hint"]["kind"] == "detail"
+    assert body["data"]["ordering"]["beforeSystemDefined"] == ["allow-1"]
+
+
 # ---------- QoS rules ----------
 
 
@@ -290,7 +324,7 @@ async def test_get_qos_rule_details_404(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_get_qos_rule_details_unifi_not_found(tmp_path, monkeypatch) -> None:
-    """Manager refactor PR #172: get_qos_rule_details raises UniFiNotFoundError."""
+    """Manager-owned existence check: get_qos_rule_details raises UniFiNotFoundError."""
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await _bootstrap(tmp_path)
     _stub_connection(app, cid)
@@ -479,7 +513,7 @@ async def test_get_content_filter_details_happy_path(tmp_path, monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_get_content_filter_details_unifi_not_found(tmp_path, monkeypatch) -> None:
-    """Manager refactor PR #172: get_content_filter_by_id raises UniFiNotFoundError."""
+    """Manager-owned existence check: get_content_filter_by_id raises UniFiNotFoundError."""
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await _bootstrap(tmp_path)
     _stub_connection(app, cid)
@@ -560,7 +594,7 @@ async def test_get_acl_rule_details_happy_path(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_get_acl_rule_details_unifi_not_found(tmp_path, monkeypatch) -> None:
-    """Manager refactor PR #172: get_acl_rule_by_id raises UniFiNotFoundError."""
+    """Manager-owned existence check: get_acl_rule_by_id raises UniFiNotFoundError."""
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await _bootstrap(tmp_path)
     _stub_connection(app, cid)

@@ -1,8 +1,8 @@
 # Tool Catalog
 
-The UniFi Protect MCP server exposes 43 tools, all prefixed with `protect_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
+The UniFi Protect MCP server exposes 63 tools (including 6 meta-tools), all prefixed with `protect_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
 
-Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy/meta-only workflows, call the `protect_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_protect_mcp/tools_manifest.json`.
+Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy workflows, call the `protect_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_protect_mcp/tools_manifest.json`. In `meta_only` mode, the index initially contains only meta-tools; executing a known domain tool lazily registers its module, so later index results can include those loaded tools.
 
 ## Meta-Tools
 
@@ -17,7 +17,7 @@ In lazy mode, an additional meta-tool is available:
 
 - `protect_load_tools` -- Load a set of tools by category or name for direct calling
 
-## Cameras (11 tools)
+## Cameras (12 tools)
 
 - `protect_list_cameras` -- List all cameras with name, model, state, recording mode
 - `protect_get_camera` -- Detailed camera info: firmware, IP, MAC, IR/HDR, smart detection, PTZ
@@ -26,20 +26,27 @@ In lazy mode, an additional meta-tool is available:
 - `protect_get_camera_analytics` -- Motion and smart detection analytics with timestamps
 - `protect_update_camera_settings` -- Update IR, HDR, mic, speaker, status light, motion detection (confirm required)
 - `protect_toggle_recording` -- Enable/disable recording on a camera (confirm required)
+- `protect_toggle_rtsp` -- Enable/disable the RTSP/RTSPS stream on a camera channel (high/medium/low; confirm required)
 - `protect_ptz_move` -- Move PTZ camera pan/tilt with normalized speeds (confirm required)
 - `protect_ptz_zoom` -- Zoom PTZ camera with normalized speed (confirm required)
 - `protect_ptz_preset` -- Move PTZ camera to a saved preset position (confirm required)
 - `protect_reboot_camera` -- Reboot a camera; interrupts active recordings (confirm required)
 
-## Events (7 tools)
+## Events (9 tools)
 
 - `protect_list_events` -- Query events from NVR with filters (time range, type, camera, limit)
 - `protect_get_event` -- Get single event details by ID
 - `protect_get_event_thumbnail` -- Get event thumbnail as base64 JPEG
 - `protect_list_smart_detections` -- List smart detections (person, vehicle, animal, package) with confidence filter
+- `protect_detection_search_labels` -- List Find Anything filter labels accepted by this controller
+- `protect_search_detections` -- Search detections across cameras with Find Anything labels such as `vehicleType:truck` or `color:white`
 - `protect_recent_events` -- Get events from the in-memory websocket buffer (fast, no API call)
 - `protect_subscribe_events` -- Get instructions for real-time event subscription via MCP resources
 - `protect_acknowledge_event` -- Mark event as favorite/acknowledged (confirm required)
+
+## Incident Evidence (1 tool)
+
+- `protect_get_incident_evidence` -- Bounded, read-only event evidence for one incident window as a bounded `unifi-incident-evidence-view` by default, or the whole `unifi-incident-evidence` document with `detail="full"`; each camera ID (at most 5) is its own source (see [incident evidence](../../../docs/incident-evidence.md)). Listed directly in lazy mode so read-only clients can call it.
 
 ## Recordings (4 tools)
 
@@ -71,21 +78,31 @@ In lazy mode, an additional meta-tool is available:
 - `protect_create_liveview` -- Validate liveview creation (not supported by uiprotect API)
 - `protect_delete_liveview` -- Validate liveview deletion (not supported by uiprotect API)
 
-## Alarm Manager (4 tools)
+## Alarm Manager (9 tools)
 
 Controls the UniFi Protect Alarm Manager (Protect 6.1+). Requires arm profiles to be configured in the Protect web UI first.
+
+The alarm-rule tools are version-agnostic. `protect_alarm_list_rules` / `protect_alarm_get_rule` surface **AI-powered alarms** (e.g. AI Natural Language) from the modern Alarm Manager when the account is **SuperAdmin**, and fall back to the legacy automations view otherwise. `protect_alarm_create_rule` prefers the modern Alarm Manager when it is available; `protect_alarm_update_rule` / `protect_alarm_delete_rule` route by rule id family, so v2 UUIDs stay on the modern path and legacy ObjectIDs stay on the legacy path. When the limited view is served, the response carries a standard MCP `_meta` notice that AI alarms require SuperAdmin. See the SuperAdmin note in the README.
 
 - `protect_alarm_list_profiles` -- List all configured arm profiles with id, name, armed state, default flag
 - `protect_alarm_get_status` -- Current armed/disarmed state across all profiles
 - `protect_alarm_arm` -- Arm the system for a given profile (confirm required; defaults to default profile)
 - `protect_alarm_disarm` -- Disarm the system for a given profile (confirm required; defaults to default profile)
+- `protect_alarm_list_rules` -- List alarm rules (normalized: id, title, enabled, triggers, actions, scope, stats), including AI alarms
+- `protect_alarm_get_rule` -- Fetch a single alarm rule by id (normalized)
+- `protect_alarm_create_rule` -- Create an alarm rule using the canonical shape returned by list/get (confirm required)
+- `protect_alarm_update_rule` -- Update an alarm rule; pass only changed canonical fields (confirm required)
+- `protect_alarm_delete_rule` -- Delete an alarm rule by v2 UUID or legacy ObjectID (confirm required)
 
-## Known Faces (4 tools)
+## Known Faces & License Plates (7 tools)
 
 - `protect_list_known_faces` -- List assigned and optionally unlabeled face recognition groups
 - `protect_update_known_face` -- Update Known Face metadata such as name, description, and notifications (confirm required)
 - `protect_merge_known_faces` -- Merge one face group into another (confirm required)
 - `protect_delete_known_face` -- Delete or remove a face recognition group (confirm required)
+- `protect_list_known_license_plates` -- List license-plate recognition groups (vehicle identities)
+- `protect_update_known_license_plate` -- Update Known License Plate metadata such as name, description, and notifications (confirm required)
+- `protect_delete_known_license_plate` -- Delete or remove a license-plate recognition group (confirm required)
 
 ## System (4 tools)
 

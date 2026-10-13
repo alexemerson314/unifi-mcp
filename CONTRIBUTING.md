@@ -13,11 +13,26 @@ Thanks for helping improve UniFi MCP. Please follow the
 - Do not include UniFi credentials, API keys, tokens, controller addresses, or
   other private deployment details in public issues, discussions, pull requests,
   screenshots, or logs.
+- For a Network, Protect, or Access MCP bug, prefer a reviewed
+  [sanitized support bundle](docs/support-bundles.md) over raw tool output or
+  diagnostic logs.
 - Report suspected vulnerabilities privately through
   [GitHub Security Advisories](https://github.com/sirkirby/unifi-mcp/security/advisories),
   not public issues.
 
 For more support routing details, see [SUPPORT.md](SUPPORT.md).
+
+## Where to Start Reading
+
+New to the codebase? Read these in order:
+
+1. **[README.md](README.md)** -- project overview and installation
+2. **[QUICKSTART.md](QUICKSTART.md)** -- get a server running in 5 minutes
+3. **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** -- monorepo layout, package responsibilities, and the tool/manager/connection layering
+4. **[AGENTS.md](AGENTS.md)** -- architecture rules, coding conventions, and permission/confirmation patterns enforced across servers
+5. **[docs/README.md](docs/README.md)** -- full documentation index (tool loading modes, permissions, deployment)
+
+The Monorepo Layout table below and the Development Workflow section are the fastest way to find where a change belongs once you know what you're changing.
 
 ## Prerequisites
 
@@ -66,15 +81,11 @@ make shared-test       # Run unifi-mcp-shared tests
 make relay-test        # Run unifi-mcp-relay tests
 make worker-build      # Install worker deps + typecheck the Worker app
 make worker-check      # Run worker CLI tests + TypeScript checks
-make network-test      # Run network server tests
-make network-lint      # Lint network server
-make network-manifest  # Regenerate network tools manifest
-make protect-test      # Run protect server tests
-make protect-lint      # Lint protect server
-make protect-manifest  # Regenerate protect tools manifest
-make access-test       # Run access server tests
-make access-lint       # Lint access server
-make access-manifest   # Regenerate access tools manifest
+
+# Individual apps (network, protect, access) — see "App-Level Makefile" below
+make -C apps/network test      # Run network server tests
+make -C apps/network lint      # Lint network server
+make -C apps/network manifest  # Regenerate network tools manifest
 ```
 
 ## App-Level Makefile
@@ -128,7 +139,7 @@ make pre-commit   # Format + lint + test
 1. Add the manager method in `apps/network/src/unifi_network_mcp/managers/<domain>_manager.py`
 2. Add the tool function in `apps/network/src/unifi_network_mcp/tools/<category>.py`
 3. Add the tool name to `TOOL_MODULE_MAP` in `apps/network/src/unifi_network_mcp/utils/lazy_tool_loader.py`
-4. Run `make network-manifest` from the repo root (or `make manifest` from `apps/network/`)
+4. Run `make manifest` from `apps/network/` (or `make manifest` from the repo root to regenerate every app)
 5. Add tests in `apps/network/tests/`
 6. Commit code + manifest + tests together
 
@@ -136,7 +147,7 @@ make pre-commit   # Format + lint + test
 
 1. Add the manager method in `apps/protect/src/unifi_protect_mcp/managers/<domain>_manager.py`
 2. Add the tool function in `apps/protect/src/unifi_protect_mcp/tools/<category>.py`
-3. Run `make protect-manifest` from the repo root (or `make manifest` from `apps/protect/`)
+3. Run `make manifest` from `apps/protect/` (or `make manifest` from the repo root to regenerate every app)
    - The manifest auto-discovers tools from `@server.tool()` decorators; no manual map update needed
 4. Add tests in `apps/protect/tests/`
 5. Commit code + manifest + tests together
@@ -145,7 +156,7 @@ make pre-commit   # Format + lint + test
 
 1. Add the manager method in `apps/access/src/unifi_access_mcp/managers/<domain>_manager.py`
 2. Add the tool function in `apps/access/src/unifi_access_mcp/tools/<category>.py`
-3. Run `make access-manifest` from the repo root (or `make manifest` from `apps/access/`)
+3. Run `make manifest` from `apps/access/` (or `make manifest` from the repo root to regenerate every app)
 4. Add tests in `apps/access/tests/`
 5. Commit code + manifest + tests together
 
@@ -209,13 +220,62 @@ Tests use `pytest-asyncio` for async support and `aioresponses` for HTTP mocking
 
 ## Release Process (Maintainers)
 
+These steps release Python packages and the Worker by tag. Plugins release by
+merge; see [Plugin changes](#plugin-changes). The `monorepo-release-pipeline`
+skill is the full procedure for both.
+
 1. Run `make pre-commit` from root.
 2. Determine release scope by package tag namespace (`core/v*`, `shared/v*`, `network/v*`, `protect/v*`, `access/v*`, `api/v*`, `relay/v*`, `worker/v*`).
-3. If a downstream package needs code from a newly released upstream package, update its `pyproject.toml` dependency range before tagging. For example, Protect/API releases that require new `unifi-core` models must allow the new `unifi-core` line.
-4. Run `uv lock --check` and commit any dependency-bound changes before creating local tags.
-5. Push tags in dependency order: `core` first, then `shared`, then app/API packages, then `relay`, then `worker` if the worker needs the released relay behavior. Wait for each upstream package to appear on PyPI before pushing dependents.
+3. Build release batches from actual dependency edges. A downstream package must wait when its
+   wheel metadata names the new upstream version, its code requires a newly published upstream API,
+   or its release workflow installs that new version. Existing compatible bounds alone do not
+   require a wait. Also keep Worker out of any batch containing a tag namespace configured in
+   `bump-plugin-versions.yml`: both workflows push writebacks to `main` without shared concurrency
+   or a non-fast-forward retry. Finish and fetch the plugin writeback before pushing Worker. An
+   API-only tag may share the Worker batch because it does not trigger plugin sync.
+4. Prepare dependency-bound changes per batch. If a downstream floor names an upstream version that
+   is not published yet, publish and validate the upstream batch first. Then update the downstream
+   `pyproject.toml` range, run `uv lock --check`, land that change on `main`, and create the downstream
+   tags from the updated commit. Never make the upstream tag wait on a floor bump that cannot pass
+   pin alignment until that upstream version exists on PyPI.
+5. Within each batch, push every tag back-to-back using a separate `git push origin <tag>` command
+   for each ref, then monitor the workflows concurrently. Do not combine multiple refs in one push.
+   Before starting a dependent batch, confirm each required upstream artifact is available on PyPI
+   or npm and its release workflow passed.
 6. CI publishes to PyPI or npm, builds Docker images where applicable, and creates GitHub Releases.
+   When a batch includes a tag namespace configured in `bump-plugin-versions.yml`, wait for the final
+   version-sync run. Network, Protect, or Access tags must produce the expected consolidated
+   writeback to `main`. A Core-, Shared-, or Relay-only trigger may complete successfully with
+   `No version changes to commit`; do not require a nonexistent writeback. API-only and Worker-only
+   batches do not trigger that workflow.
+
+### Plugin changes
+
+Plugins release by merge, not by tag: a plugin release is a version bump landing
+on `main`. Every change under `plugins/<name>/`, including docs, skills and setup
+scripts, needs a version bump of that plugin in the same PR. Run
+`make check-plugin-versions` and `make check-plugin-tool-refs` (both in
+`make pre-commit`; fetch history and tags first). The second fails when a shipped
+plugin file names a tool missing from the server release the plugin pins. Bump
+sizes, client update steps and release rules are in the `monorepo-release-pipeline`
+skill (Procedure E); user-facing support is in [plugin support](docs/plugin-support.md).
+When a release changes what existing users must do (a setting moves, a command
+changes, a migration is needed), add its notes to the
+[plugin upgrade guide](docs/plugin-upgrade.md). Real-client evidence for the
+support matrix comes from the [plugin acceptance procedure](docs/plugin-acceptance.md),
+run from `main` after the release merge.
+
+To try a Claude Code plugin change locally, run
+`claude --plugin-dir plugins/<name>`. That loads your working copy for the session
+and silently replaces an installed marketplace copy with the same manifest name:
+`claude plugin list` still shows the marketplace plugin as enabled, and only a
+`--debug` session logs that `--plugin-dir` overrode it. Managed settings that lock
+the plugin take precedence over `--plugin-dir`. Local loading does not exercise the
+marketplace path, where the installed copy under
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` changes only when the
+version changes, so the release is verified from `main` after merge.
 
 ## Questions?
 
-Open an issue or discussion at https://github.com/sirkirby/unifi-mcp/issues
+Review the [support bundle guide](docs/support-bundles.md), then open an issue or
+discussion at https://github.com/sirkirby/unifi-mcp/issues

@@ -52,6 +52,51 @@ def _stringify_dt(ts: Any) -> Optional[str]:
         return None
 
 
+_ACTIVE_CONNECTION_KEYS: tuple[str, ...] = (
+    "_uptime_by_uap",
+    "_uptime_by_usw",
+    "_uptime_by_ugw",
+    "uptime",
+)
+
+
+def _is_online(raw: dict) -> bool:
+    """Derive a client's online status from a controller record.
+
+    `is_online` is the canonical signal, but some controller firmwares
+    (e.g. UniFi OS 5.x + Network 10.x on UDM SE) omit it from /stat/sta
+    payloads. Fall back to active-connection indicators that only appear
+    when a client is currently associated.
+    """
+    if raw.get("is_online") is True:
+        return True
+    for key in _ACTIVE_CONNECTION_KEYS:
+        v = raw.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            return True
+    return False
+
+
+def _is_online_from(obj: Any) -> bool:
+    """Same as ``_is_online`` but accepts dict, ``.raw``-bearing object,
+    or a flat-attribute object — matching the access semantics of ``_get``.
+    """
+    if isinstance(obj, dict):
+        return _is_online(obj)
+    raw = getattr(obj, "raw", None)
+    if isinstance(raw, dict):
+        if _is_online(raw):
+            return True
+    # Flat-attribute fallback (e.g. lightweight test stand-ins)
+    if getattr(obj, "is_online", None) is True:
+        return True
+    for key in _ACTIVE_CONNECTION_KEYS:
+        v = getattr(obj, key, None)
+        if isinstance(v, (int, float)) and v > 0:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -72,7 +117,12 @@ class Client(BaseModel):
     )
     hostname: Optional[str] = Field(
         default=None,
-        description="Hostname or display name",
+        description="DHCP-reported hostname from the device itself",
+        json_schema_extra={"mutable": False},
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="User-assigned alias set in the UniFi console (preferred for display)",
         json_schema_extra={"mutable": False},
     )
     is_wired: bool = Field(
@@ -128,10 +178,11 @@ def client_from_controller(obj: Any) -> Client:
     return Client(
         mac=raw.get("mac"),
         ip=raw.get("last_ip") or raw.get("ip"),
-        hostname=raw.get("hostname") or raw.get("name"),
+        hostname=raw.get("hostname") or None,
+        name=raw.get("name") or None,
         is_wired=bool(raw.get("is_wired", False)),
         is_guest=bool(raw.get("is_guest", False)),
-        status="online" if raw.get("is_online") else "offline",
+        status="online" if _is_online(raw) else "offline",
         last_seen=_stringify_dt(raw.get("last_seen")),
         first_seen=_stringify_dt(raw.get("first_seen")),
         note=raw.get("note") or None,
@@ -154,7 +205,12 @@ class BlockedClient(BaseModel):
     )
     hostname: Optional[str] = Field(
         default=None,
-        description="Hostname or display name",
+        description="DHCP-reported hostname from the device itself",
+        json_schema_extra={"mutable": False},
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="User-assigned alias set in the UniFi console (preferred for display)",
         json_schema_extra={"mutable": False},
     )
     last_seen: Optional[str] = Field(
@@ -177,7 +233,8 @@ def blocked_client_from_controller(obj: Any) -> BlockedClient:
     """Build a BlockedClient from a controller API response."""
     return BlockedClient(
         mac=_get(obj, "mac"),
-        hostname=_get(obj, "hostname") or _get(obj, "name"),
+        hostname=_get(obj, "hostname") or None,
+        name=_get(obj, "name") or None,
         last_seen=_stringify_dt(_get(obj, "last_seen")),
         blocked=bool(_get(obj, "blocked", True)),
     )
@@ -203,7 +260,12 @@ class ClientLookup(BaseModel):
     )
     hostname: Optional[str] = Field(
         default=None,
-        description="Hostname or display name",
+        description="DHCP-reported hostname from the device itself",
+        json_schema_extra={"mutable": False},
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="User-assigned alias set in the UniFi console (preferred for display)",
         json_schema_extra={"mutable": False},
     )
     is_online: bool = Field(
@@ -230,7 +292,8 @@ def client_lookup_from_controller(obj: Any) -> ClientLookup:
     return ClientLookup(
         mac=_get(obj, "mac"),
         ip=_get(obj, "last_ip") or _get(obj, "ip"),
-        hostname=_get(obj, "hostname") or _get(obj, "name"),
-        is_online=bool(_get(obj, "is_online", False)),
+        hostname=_get(obj, "hostname") or None,
+        name=_get(obj, "name") or None,
+        is_online=_is_online_from(obj),
         last_seen=_stringify_dt(_get(obj, "last_seen")),
     )

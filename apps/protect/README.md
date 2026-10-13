@@ -5,7 +5,15 @@
   <img src="../../assets/hero-protect.svg" alt="UniFi Protect MCP Server" width="720">
 </p>
 
-MCP server exposing UniFi Protect tools for LLMs, agents, and automation platforms. Query cameras, events, smart detections, recordings, lights, sensors, chimes, Known Faces, and the Alarm Manager -- with safe-by-default permissions and preview-before-confirm for all mutations.
+MCP server exposing UniFi Protect tools for AI assistants and other MCP-capable
+clients. Query cameras, events, smart detections, Find Anything detection
+search, recordings, lights, sensors, chimes, Known Faces, license plates, and
+the Alarm Manager with safe-by-default permissions and preview-before-confirm
+for all mutations.
+
+Software integrating over HTTP, including automation services and MCP adapters,
+should use [`unifi-api-server`](../api/) for REST and GraphQL reads, actions,
+and SSE events.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/downloads/)
@@ -24,10 +32,12 @@ The plugin installs the MCP server, an agent skill for tool discovery, and a gui
 Then run the interactive setup to configure your controller connection:
 
 ```
-/unifi-protect:setup
+/unifi-protect:unifi-protect-setup
 ```
 
-This walks you through entering your controller host, credentials, and permission preferences — then writes everything to `.claude/settings.local.json` so it persists across sessions. If you already have the Network plugin configured on the same controller, the setup will detect and reuse those credentials. Restart Claude Code after setup to connect.
+This walks you through entering your controller host, credentials, and permission preferences. Credentials are given as a file or command provider, never typed into chat. Setup saves the result as the plugin's Claude Code options, which apply in every project; a password or API key entered as an option is stored in the system keychain. Start a new Claude Code session after setup to connect.
+
+Upgrading from a plugin version before 1.0.0, which kept settings in the project's `.claude/settings.local.json`? Follow the [plugin upgrade guide](../../docs/plugin-upgrade.md).
 
 ### Codex
 
@@ -37,7 +47,7 @@ Register the marketplace, then install `unifi-protect` from Codex's `/plugins` U
 codex plugin marketplace add sirkirby/unifi-mcp
 ```
 
-After installing, ask Codex to use the UniFi Protect setup skill. The setup flow registers the MCP server with `codex mcp add`, stores your controller environment values in Codex's MCP configuration, and prompts you to restart Codex.
+After installing, ask Codex to use the UniFi Protect setup skill. Setup saves a version-pinned MCP server entry with your controller settings in Codex's `config.toml` and prompts you to restart Codex. After each plugin upgrade, re-run setup with `--refresh`.
 
 ### PyPI / Docker
 
@@ -62,6 +72,8 @@ Once connected, just ask your AI agent in natural language:
 
 > "Show me smart detection events from the front door camera today — people and vehicles only"
 
+> "Find driveway detections for white vans this week"
+
 > "Which cameras have the most motion events this week? Any unusual patterns?"
 
 > "Are there any cameras offline or with degraded connections?"
@@ -74,7 +86,9 @@ All camera and event queries are read-only by default. Mutations (camera setting
 
 ## Configure
 
-Set these environment variables (or create a `.env` file). If you used `/unifi-protect:setup`, this is already done.
+Set these variables in the server's process environment. The plugin setup skill already does this for Codex and OpenClaw; in Claude Code the plugin maps its options onto these variables. The server does not automatically load `.env` or working-directory YAML files; load a trusted env file explicitly in your launcher (Docker `env_file:` is supported), or select custom YAML with an absolute `CONFIG_PATH`. See [configuration](docs/configuration.md) for migration examples.
+
+With no controller host configured, the server still starts in setup mode: it tells the client how to configure it, offers only the read-only `protect_setup_status` tool, and makes no controller connections.
 
 ```bash
 # Server-specific variables (recommended)
@@ -82,12 +96,45 @@ UNIFI_PROTECT_HOST=192.168.1.1      # Controller IP or hostname
 UNIFI_PROTECT_USERNAME=admin         # Local admin username
 UNIFI_PROTECT_PASSWORD=your-password # Admin password
 # Optional:
-# UNIFI_PROTECT_API_KEY=             # UniFi API key (experimental — read-only, subset of tools)
+# UNIFI_PROTECT_API_KEY=             # Required for camera HDR/mic volume and light power/brightness/PIR settings
 # UNIFI_PROTECT_PORT=443             # Controller HTTPS port
 # UNIFI_PROTECT_VERIFY_SSL=false     # SSL certificate verification
 ```
 
+Camera HDR and microphone volume, plus floodlight power, brightness, PIR sensitivity,
+and duration now use the Protect public Integration API with `uiprotect` 16.x.
+Set `UNIFI_PROTECT_API_KEY` (or the shared fallback `UNIFI_API_KEY`) and restart
+the server before using these settings. Session credentials remain required for
+other Protect operations. Missing keys or incompatible public device IDs fail
+before any settings in the request are written.
+
+Microphone volume updates accept **1–100**; zero is rejected by the public API.
+Existing HDR aliases are preserved: `true`/`on`/`normal` mean `auto`, `false`
+means `off`, and `always`/`superHdr` select public HDR `on`. Light brightness
+remains 1–6, sensitivity 0–100, and duration 15–900 seconds. `light_on` and
+`is_light_on` are equivalent inputs and control forced illumination; turning
+forced illumination off does not disable motion-triggered lighting.
+
+Settings updates retain preview/confirmation and policy gates. Requests are
+validated before writing; controller failures can still leave a partial update.
+Failed updates return an error with the settings that applied, so callers can
+inspect the current state before retrying.
+
 **Fallback:** The shared `UNIFI_*` variables (e.g., `UNIFI_HOST`) also work. The server checks for `UNIFI_PROTECT_*` first and falls back to `UNIFI_*` if the server-specific variable is not set. For single-controller setups, the shared variables are all you need.
+
+### MCP response size
+
+For tool results that already provide structured output, `adaptive` is the default response mode. It classifies each request by the canonical date-based `protocolVersion` advertised during MCP initialization, not by the client's product name or application version. Requests advertising MCP `2025-06-18` or later receive concise `content` plus the full result once in `structuredContent`; requests advertising an earlier revision (such as `2024-11-05` or `2025-03-26`), or whose revision metadata is missing or malformed, keep full compatibility JSON in `content`. Set `UNIFI_PROTECT_MCP_CONTENT_MODE` to `compat` to force the duplicated compatibility form, or to `compact` to force concise text plus full structured output outside a negotiated request. This server-specific variable overrides `UNIFI_MCP_CONTENT_MODE`; use `compat` for any client that consumes the full result only from `content`, regardless of its advertised revision.
+
+The lazy-loading meta-tools (`*_tool_index`, `*_execute`, `*_batch`, `*_batch_status`, and lazy-only `*_load_tools`) remain content-only; they are not the pre-`2025-06-18` protocol category described above. For structured inner results, `*_execute` and `*_batch_status` expose one normalized JSON payload in `content` rather than a nested transport pair; content-only execute results remain unchanged. Response modes do not convert these meta-tools to `structuredContent`.
+
+When Network is enabled alongside Protect, its largest source responses are independently bounded: `unifi_get_dashboard` defaults to `summary=true`, and `unifi_list_rogue_aps` defaults to a summarized page of at most 100 records; `summary=false` restores the full selected data.
+
+> **AI-powered alarms need SuperAdmin.** The alarm-rule tools (`protect_alarm_list_rules` / `protect_alarm_get_rule` / `protect_alarm_create_rule` / `protect_alarm_update_rule` / `protect_alarm_delete_rule`) transparently use the modern UniFi-OS Alarm Manager when the account is **SuperAdmin**, and fall back to the classic automations view otherwise. The modern path surfaces and manages AI-powered alarms (e.g. AI Natural Language); the legacy path cannot see those rules and responses include a standard MCP `_meta` notice when the view is limited. Grant the account SuperAdmin on the console hosting Protect to view/manage AI alarms. Blast radius: on a standalone UNVR this is contained to Protect; on a combined UDM console SuperAdmin also grants Network/UniFi-OS control.
+
+### Sensitive response fields
+
+Protect tools redact secret-bearing stream fields by default before returning data to MCP clients. This includes RTSP/RTSPS stream aliases and URLs from `protect_get_camera_streams`. Disable redaction for a trusted local administration process with `UNIFI_PROTECT_REDACT_SENSITIVE_FIELDS=false` or the global `UNIFI_REDACT_SENSITIVE_FIELDS=false` policy flag when raw stream values are required.
 
 ## Run
 
@@ -126,7 +173,7 @@ Add to `claude_desktop_config.json`:
 ## Features
 
 - **Cameras** -- list, inspect, snapshot, RTSP streams, PTZ control, settings, recording toggle, reboot
-- **Events** -- query historical events, smart detections (person/vehicle/animal/package), thumbnails
+- **Events** -- query historical events, smart detections (person/vehicle/animal/package), Find Anything detection search, thumbnails
 - **Real-time streaming** -- websocket event buffer with MCP resource subscriptions and polling
 - **Recordings** -- status, availability, clip export with timelapse support
 - **Known Faces** -- list, rename, merge, and remove face recognition groups
@@ -196,9 +243,9 @@ Compact mode is the recommended default when building summaries or feeding event
 
 - [Configuration](docs/configuration.md) -- Full env var reference, YAML config, Protect-specific options
 - [Permissions](docs/permissions.md) -- Permission system, category defaults, how to enable mutations
-- [Tool Catalog](docs/tools.md) -- All 43 tools organized by category
+- [Tool Catalog](docs/tools.md) -- All 63 tools organized by category
 - [Event Streaming](docs/events.md) -- Real-time event architecture, MCP resources, polling
-- [Troubleshooting](docs/troubleshooting.md) -- Connection issues, SSL, missing tools
+- [Troubleshooting and support bundles](docs/troubleshooting.md) -- Reviewed support evidence, connection issues, SSL, missing tools
 
 ## Development
 

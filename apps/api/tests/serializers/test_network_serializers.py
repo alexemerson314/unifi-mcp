@@ -1,5 +1,6 @@
 """Network serializer unit tests — one fixture per resource."""
 
+import pytest
 from unifi_api.serializers._registry import (
     discover_serializers,
     serializer_registry_singleton,
@@ -84,6 +85,64 @@ def test_network_serializer_shape() -> None:
     assert out["enabled"] is True
 
 
+def test_network_serializer_wan_dns_fields() -> None:
+    """WAN DNS fields round-trip through the Strawberry from_manager_output -> to_dict.
+    Guards against a typo in any raw.get() key (which would silently null the
+    GraphQL/REST field; cross-layer symmetry checks the field name, not the .get() key)."""
+    from unifi_api.graphql.types.network.network import Network
+
+    class FakeNetwork:
+        raw = {
+            "_id": "wan2",
+            "name": "Xfinity",
+            "purpose": "wan",
+            "enabled": True,
+            "ipv6_enabled": True,
+            "wan_type_v6": "disabled",
+            "ipv6_setting_preference": "manual",
+            "ipv6_wan_delegation_type": "none",
+            "wan_dhcpv6_pd_size": 64,
+            "wan_dhcpv6_pd_size_auto": False,
+            "wan_dns1": "1.1.1.1",
+            "wan_dns2": "8.8.8.8",
+            "wan_ipv6_dns_preference": "auto",
+            "wan_ipv6_dns1": "2001:4860:4860::8888",
+            "wan_ipv6_dns2": "2001:4860:4860::8844",
+        }
+
+    out = Network.from_manager_output(FakeNetwork()).to_dict()
+    assert out["ipv6_enabled"] is True
+    assert out["wan_type_v6"] == "disabled"
+    assert out["ipv6_setting_preference"] == "manual"
+    assert out["ipv6_wan_delegation_type"] == "none"
+    assert out["wan_dhcpv6_pd_size"] == 64
+    assert out["wan_dhcpv6_pd_size_auto"] is False
+    assert out["wan_dns1"] == "1.1.1.1"
+    assert out["wan_dns2"] == "8.8.8.8"
+    assert out["wan_ipv6_dns_preference"] == "auto"
+    assert out["wan_ipv6_dns1"] == "2001:4860:4860::8888"
+    assert out["wan_ipv6_dns2"] == "2001:4860:4860::8844"
+
+
+def test_network_serializer_firewall_zone_and_wan_monitor_fields() -> None:
+    from unifi_api.graphql.types.network.network import Network
+
+    raw = {
+        "_id": "wan1",
+        "name": "WAN",
+        "purpose": "wan",
+        "enabled": True,
+        "firewall_zone_id": "zone-v2-1",
+        "wan_sla": "sla-1",
+        "report_wan_event": False,
+    }
+
+    out = Network.from_manager_output(raw).to_dict()
+    assert out["firewall_zone_id"] == "zone-v2-1"
+    assert out["wan_sla"] == "sla-1"
+    assert out["report_wan_event"] is False
+
+
 def test_firewall_rule_serializer_shape() -> None:
     """Phase 6 PR2 Task 22 — projection moved to a Strawberry type. Same dict
     shape contract as the old serializer; verified via Type.to_dict()."""
@@ -122,3 +181,58 @@ def test_wlan_serializer_shape() -> None:
     assert out["name"] == "MyWiFi"
     assert out["security"] == "wpapsk"
     assert out["enabled"] is True
+
+
+def test_wlan_projection_redacts_passphrase() -> None:
+    from unifi_api.graphql.types.network.wlan import Wlan
+    from unifi_core.redaction import REDACTED
+
+    out = Wlan.from_manager_output(
+        {"_id": "wlan1", "name": "MyWiFi", "enabled": True, "x_passphrase": "wifi-secret"}
+    ).to_dict()
+
+    assert out["x_passphrase"] == REDACTED
+
+
+@pytest.mark.parametrize("setting_preference", ["auto", "manual"])
+def test_wlan_projection_maps_setting_preference(setting_preference: str) -> None:
+    from unifi_api.graphql.types.network.wlan import Wlan
+
+    out = Wlan.from_manager_output(
+        {
+            "_id": "wlan1",
+            "name": "MyWiFi",
+            "enabled": True,
+            "setting_preference": setting_preference,
+        }
+    ).to_dict()
+
+    assert out["setting_preference"] == setting_preference
+
+
+def test_wlan_projection_maps_roaming_fields() -> None:
+    """802.11k + per-band roaming assistant must survive the controller -> Strawberry
+    projection. The cross-layer symmetry test only proves the attributes exist; it would
+    not catch from_manager_output forgetting to read one out of the raw dict."""
+    from unifi_api.graphql.types.network.wlan import Wlan
+
+    out = Wlan.from_manager_output(
+        {
+            "_id": "wlan1",
+            "name": "MyWiFi",
+            "enabled": True,
+            # False and the negative RSSIs are deliberate: they catch a truthiness
+            # filter or a `or None` that would pass with True/positive values.
+            "rrm_enabled": False,
+            "roaming_assistant_na_enabled": True,
+            "roaming_assistant_na_rssi": -77,
+            "roaming_assistant_6e_enabled": True,
+            "roaming_assistant_6e_rssi": -88,
+        }
+    ).to_dict()
+
+    assert out["rrm_enabled"] is False, "rrm_enabled=False must not be dropped"
+    assert out["roaming_assistant_na_enabled"] is True
+    assert out["roaming_assistant_na_rssi"] == -77
+    assert out["roaming_assistant_6e_enabled"] is True
+    assert out["roaming_assistant_6e_rssi"] == -88

@@ -7,12 +7,13 @@ Generic version extracted from the network app. The ``base_package``
 parameter is required (no default) so any MCP app can reuse this.
 """
 
-import asyncio
 import importlib
 import logging
 import pkgutil
 from types import ModuleType
-from typing import List, Optional, Set
+from typing import Awaitable, List, Optional, Set
+
+from unifi_mcp_shared.meta_tools import is_meta_tool
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ def auto_load_tools(
     enabled_tools: Optional[List[str]] = None,
     server=None,
     meta_tools: Optional[Set[str]] = None,
-) -> None:
+) -> Awaitable[None] | None:
     """Dynamically import tool modules from *base_package*.
 
     Importing each module triggers the ``@server.tool`` decorators inside them,
@@ -36,8 +37,9 @@ def auto_load_tools(
         enabled_tools: If set, load all modules but remove tools not in this list
                       (requires *server* parameter).
         server: FastMCP server instance (required if *enabled_tools* is set).
-        meta_tools: Set of meta-tool names to always keep when filtering by
-                    *enabled_tools*. Defaults to the standard five UniFi meta-tools.
+        meta_tools: Additional exact tool names to keep when filtering by
+                    *enabled_tools*. Prefix-specific shared meta-tools are detected
+                    automatically with :func:`is_meta_tool`.
     """
     try:
         tools_pkg: ModuleType = importlib.import_module(base_package)
@@ -78,42 +80,33 @@ def auto_load_tools(
 
     logger.info("Loaded %d tool modules: %s", len(loaded_modules), loaded_modules)
 
-    # If enabled_tools is specified, remove any tools not in the list
+    # If enabled_tools is specified, return an awaitable that removes and then
+    # verifies disallowed tools. The startup caller must await it before
+    # exposing a transport so there is no temporarily unconfined tool surface.
     if enabled_tools and server:
         enabled_set = set(enabled_tools)
-        # Always keep meta-tools
-        if meta_tools is None:
-            meta_tools = {
-                "unifi_tool_index",
-                "unifi_execute",
-                "unifi_batch",
-                "unifi_batch_status",
-                "unifi_load_tools",
-            }
-        enabled_set.update(meta_tools)
+        enabled_set.update(meta_tools or set())
 
-        try:
+        async def filter_tools() -> None:
+            tools = await server.list_tools()
+            removed = []
+            for tool in tools:
+                if tool.name not in enabled_set and not is_meta_tool(tool.name):
+                    server.remove_tool(tool.name)
+                    removed.append(tool.name)
+            if removed:
+                logger.info("Removed %d tools not in enabled_tools list", len(removed))
+                logger.debug("Removed tools: %s", removed)
 
-            async def filter_tools():
-                tools = await server.list_tools()
-                removed = []
-                for tool in tools:
-                    if tool.name not in enabled_set:
-                        try:
-                            server.remove_tool(tool.name)
-                            removed.append(tool.name)
-                        except Exception as e:
-                            logger.warning("Failed to remove tool '%s': %s", tool.name, e)
-                if removed:
-                    logger.info("Removed %d tools not in enabled_tools list", len(removed))
-                    logger.debug("Removed tools: %s", removed)
+            remaining = await server.list_tools()
+            unexpected = [
+                tool.name for tool in remaining if tool.name not in enabled_set and not is_meta_tool(tool.name)
+            ]
+            if unexpected:
+                raise RuntimeError("enabled_tools filtering left non-allowlisted tools registered")
 
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(filter_tools())
-            else:
-                loop.run_until_complete(filter_tools())
-        except Exception as e:
-            logger.warning("Failed to filter tools by enabled_tools: %s", e)
+        logger.info("Finished auto-loading MCP tool modules; enabled_tools filtering pending")
+        return filter_tools()
 
     logger.info("Finished auto-loading MCP tool modules")
+    return None

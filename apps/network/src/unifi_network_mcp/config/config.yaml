@@ -9,7 +9,7 @@ unifi:
   api_key: ${oc.env:UNIFI_API_KEY,""}
 
 server:
-  host: ${oc.env:UNIFI_MCP_HOST,0.0.0.0}
+  host: ${oc.env:UNIFI_MCP_HOST,127.0.0.1}
   port: ${oc.env:UNIFI_MCP_PORT,3000}
   log_level: INFO
 
@@ -19,6 +19,8 @@ server:
   # - lazy: Register meta-tools, load others on-demand - RECOMMENDED for LLMs
   # - meta_only: Register only meta-tools, manual discovery - Maximum context savings
   tool_registration_mode: ${oc.env:UNIFI_TOOL_REGISTRATION_MODE,lazy}
+  defer_controller_init: ${oc.env:UNIFI_DEFER_CONTROLLER_INIT,false}
+  meta_tools_enabled: ${oc.env:UNIFI_META_TOOLS_ENABLED,true}
 
   # Tool filtering (optional, for eager mode)
   # Use these to limit which tools are registered for automation/n8n workflows
@@ -37,6 +39,7 @@ server:
   #     - oon            # OON policies (internet scheduling, app blocking, QoS, routing)
   #     - hotspot        # Vouchers for guest network
   #     - network        # Network/VLAN management
+  #     - nat            # V2 NAT rule reads
   #     - port_forwards  # Port forwarding rules
   #     - qos            # QoS/traffic shaping rules
   #     - routing        # Static routes (V1 API)
@@ -56,7 +59,7 @@ server:
   enabled_tools: ${oc.env:UNIFI_ENABLED_TOOLS,null}
 
   http:
-    enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,true}
+    enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,false}
     force: ${oc.env:UNIFI_MCP_HTTP_FORCE,false}
     transport: ${oc.env:UNIFI_MCP_HTTP_TRANSPORT,streamable-http}
   diagnostics:
@@ -64,6 +67,17 @@ server:
     log_tool_args: ${oc.env:UNIFI_MCP_DIAG_LOG_TOOL_ARGS,true}
     log_tool_result: ${oc.env:UNIFI_MCP_DIAG_LOG_TOOL_RESULT,true}
     max_payload_chars: ${oc.env:UNIFI_MCP_DIAG_MAX_PAYLOAD,2000}
+
+network:
+  events:
+    buffer_size: ${oc.env:UNIFI_NETWORK_EVENT_BUFFER_SIZE,100}
+    buffer_ttl_seconds: ${oc.env:UNIFI_NETWORK_EVENT_BUFFER_TTL,300}
+    websocket_enabled: ${oc.env:UNIFI_NETWORK_WEBSOCKET_ENABLED,true}
+
+policy:
+  response:
+    redact_sensitive_fields: ${oc.env:UNIFI_NETWORK_REDACT_SENSITIVE_FIELDS,true}
+    mcp_content_mode: ${oc.env:UNIFI_NETWORK_MCP_CONTENT_MODE,adaptive}
 
 # Permissions are controlled via environment variables:
 #   UNIFI_TOOL_PERMISSION_MODE=confirm|bypass (default: confirm)

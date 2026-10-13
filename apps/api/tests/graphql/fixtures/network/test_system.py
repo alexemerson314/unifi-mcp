@@ -3,7 +3,9 @@
 # tool: unifi_get_system_info
 # tool: unifi_get_site_settings
 # tool: unifi_get_snmp_settings
+# tool: unifi_get_mgmt_settings
 # tool: unifi_get_autobackup_settings
+# tool: unifi_get_gateway_settings
 # tool: unifi_list_backups
 # tool: unifi_get_event_types
 # tool: unifi_list_vouchers
@@ -107,7 +109,62 @@ async def test_snmp_settings(tmp_path, monkeypatch):
     assert body.get("errors") is None, body
     snmp = body["data"]["network"]["snmpSettings"]
     assert snmp["enabled"] is True
-    assert snmp["community"] == "public"
+    assert snmp["community"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_snmp_settings_v3_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="network")
+    stub_managers(
+        monkeypatch,
+        {
+            ("network", "system_manager", "get_settings"): [
+                {"enabled": False, "community": "public", "enabledV3": True, "username": "monitor", "x_password": "p"},
+            ],
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        network {{ snmpSettings(controller: "{cid}") {{
+            enabled enabledV3 username xPassword
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    snmp = body["data"]["network"]["snmpSettings"]
+    assert snmp["enabled"] is False
+    assert snmp["enabledV3"] is True
+    assert snmp["username"] == "monitor"
+    assert snmp["xPassword"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_snmp_settings_policy_disabled_returns_raw_community(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="network", redact_sensitive_fields=False)
+    stub_managers(
+        monkeypatch,
+        {
+            ("network", "system_manager", "get_settings"): [
+                {"enabled": True, "community": "public", "port": 161, "x_password": "p"},
+            ],
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        network {{ snmpSettings(controller: "{cid}") {{
+            enabled community port xPassword
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    assert body["data"]["network"]["snmpSettings"]["community"] == "public"
+    assert body["data"]["network"]["snmpSettings"]["xPassword"] == "p"
 
 
 @pytest.mark.asyncio
@@ -137,6 +194,42 @@ async def test_autobackup_settings(tmp_path, monkeypatch):
     ab = body["data"]["network"]["autobackupSettings"]
     assert ab["enabled"] is True
     assert ab["maxCount"] == 5
+
+
+@pytest.mark.asyncio
+async def test_gateway_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="network")
+    stub_managers(
+        monkeypatch,
+        {
+            ("network", "gateway_settings_manager", "get_gateway_settings"): {
+                "_id": "gw1",
+                "key": "usg",
+                "upnp_enabled": False,
+                "syn_cookies": True,
+                "dns_verification": {"primary_dns_server": "1.1.1.1"},
+                "tcp_established_timeout": 7440,
+            },
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        network {{ gatewaySettings(controller: "{cid}") {{
+            id key upnpEnabled synCookies dnsVerification tcpEstablishedTimeout
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    gw = body["data"]["network"]["gatewaySettings"]
+    assert gw["key"] == "usg"
+    assert gw["upnpEnabled"] is False
+    assert gw["synCookies"] is True
+    assert gw["tcpEstablishedTimeout"] == 7440
+    # nested JSON scalar projects through intact
+    assert gw["dnsVerification"]["primary_dns_server"] == "1.1.1.1"
 
 
 @pytest.mark.asyncio
@@ -175,9 +268,19 @@ async def test_event_types(tmp_path, monkeypatch):
     stub_managers(
         monkeypatch,
         {
-            ("network", "event_manager", "get_event_type_prefixes"): [
-                {"key": "EVT_AP", "label": "Access Point Events"},
-                {"key": "EVT_GW", "label": "Gateway Events"},
+            ("network", "event_manager", "get_event_types"): [
+                {
+                    "key": "CLIENT_CONNECTED_WIRELESS_2",
+                    "prefix": "CLIENT_CONNECTED_WIRELESS_2",
+                    "description": "Exact event key observed in the sample",
+                    "observed_count": 4,
+                },
+                {
+                    "key": "CLIENT_ROAMED_2",
+                    "prefix": "CLIENT_ROAMED_2",
+                    "description": "Exact event key observed in the sample",
+                    "observed_count": 9,
+                },
             ],
         },
     )
@@ -193,7 +296,20 @@ async def test_event_types(tmp_path, monkeypatch):
     assert body.get("errors") is None, body
     et = body["data"]["network"]["eventTypes"]
     assert et is not None
-    assert len(et["eventTypes"]) == 2
+    assert et["eventTypes"] == [
+        {
+            "key": "CLIENT_CONNECTED_WIRELESS_2",
+            "prefix": "CLIENT_CONNECTED_WIRELESS_2",
+            "description": "Exact event key observed in the sample",
+            "observed_count": 4,
+        },
+        {
+            "key": "CLIENT_ROAMED_2",
+            "prefix": "CLIENT_ROAMED_2",
+            "description": "Exact event key observed in the sample",
+            "observed_count": 9,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -251,3 +367,40 @@ async def test_voucher_detail(tmp_path, monkeypatch):
     assert body.get("errors") is None, body
     v = body["data"]["network"]["voucher"]
     assert v["code"] == "ABC-123"
+
+
+@pytest.mark.asyncio
+async def test_mgmt_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="network")
+    stub_managers(
+        monkeypatch,
+        {
+            ("network", "system_manager", "get_settings"): [
+                {
+                    "x_ssh_enabled": True,
+                    "x_ssh_username": "ubnt",
+                    "x_ssh_password": "clear",
+                    "x_mgmt_key": "k",
+                    "x_ssh_keys": [{"name": "laptop", "key": "AAAA"}],
+                },
+            ],
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        network {{ mgmtSettings(controller: "{cid}") {{
+            xSshEnabled xSshUsername sshPasswordSet mgmtKeySet sshKeysPresent sshKeysCount apiTokenSet
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    mgmt = body["data"]["network"]["mgmtSettings"]
+    assert mgmt["xSshEnabled"] is True
+    assert mgmt["xSshUsername"] == "ubnt"
+    assert mgmt["sshPasswordSet"] is True and mgmt["mgmtKeySet"] is True and mgmt["apiTokenSet"] is False
+    assert mgmt["sshKeysPresent"] is True and mgmt["sshKeysCount"] == 1
+    for secret in ("clear", "AAAA", "laptop"):
+        assert secret not in str(body)

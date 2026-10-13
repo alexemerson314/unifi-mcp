@@ -23,12 +23,16 @@ REGISTERED_PAIRS: list[tuple[str, str, str]] = [
     ("network", "client_group", "UserGroup"),
     ("network", "content_filter", "ContentFilter"),
     ("network", "dns", "DnsRecord"),
+    ("network", "dynamic_dns", "DynamicDns"),
     ("network", "firewall", "FirewallRule"),
     ("network", "firewall", "FirewallGroup"),
     ("network", "firewall", "FirewallZone"),
+    ("network", "firewall", "LegacyFirewallRule"),
+    ("network", "gateway_settings", "GatewaySettings"),
     ("network", "networks", "Network"),
     ("network", "oon", "OonPolicy"),
     ("network", "port_forwards", "PortForward"),
+    ("network", "nat", "NatRule"),
     ("network", "switch", "PortProfile"),
     ("network", "qos", "QosRule"),
     ("network", "traffic_routes", "TrafficRoute"),
@@ -40,6 +44,9 @@ REGISTERED_PAIRS: list[tuple[str, str, str]] = [
     ("network", "devices", "Device"),
     ("network", "devices", "DeviceRadio"),
     ("network", "system", "SnmpSettings"),
+    ("network", "mdns", "MdnsSettings"),
+    ("network", "threat_management", "ThreatManagementSettings"),
+    ("network", "system", "MgmtSettings"),
     ("network", "system", "AutoBackupSettings"),
     ("network", "system", "SystemInfo"),
     ("network", "system", "NetworkHealth"),
@@ -92,6 +99,13 @@ REGISTERED_PAIRS: list[tuple[str, str, str]] = [
     ("access", "system", "AccessSystemInfo"),
     ("access", "system", "AccessHealth"),
 ]
+
+
+def test_port_forward_destination_readback() -> None:
+    from unifi_api.graphql.types.network.port_forward import PortForward
+
+    rule = PortForward.from_manager_output({"_id": "pf-1", "destination_ip": "198.51.100.69"})
+    assert rule.to_dict()["destination_ip"] == "198.51.100.69"
 
 
 @pytest.mark.parametrize("server,domain,pydantic_name", REGISTERED_PAIRS)

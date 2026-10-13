@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Smoke test MCP standard surfaces over the real stdio transport.
 
-This validates the MCP protocol surface without invoking any UniFi tools:
-``initialize`` for server metadata and ``tools/list`` for tool metadata across
-the supported registration modes.
+This validates both current Discover negotiation and the legacy Initialize
+handshake without invoking controller operations: ``tools/list`` plus the
+read-only tool-index and lazy-loader meta-tools across the supported
+registration modes.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import anyio
-from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client import Client
+from mcp.client.stdio import StdioServerParameters
+from mcp.types import LATEST_PROTOCOL_VERSION
 from unifi_mcp_shared.metadata import PROJECT_WEBSITE_URL
 from unifi_mcp_shared.protocol import DEFAULT_MCP_PROTOCOL_REVISION
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REGISTRATION_MODES = ("lazy", "eager", "meta_only")
+CLIENT_MODES = ("auto", "legacy")
 
 
 class MetadataSmokeError(AssertionError):
@@ -71,13 +75,18 @@ SERVER_SPECS = {
 }
 
 EXPECTED_ICON_SIZES = [["48x48"], ["96x96"], ["192x192"]]
-OFFLINE_SERVER_NAMES = ("network", "protect")
+OFFLINE_SERVER_NAMES = ("network", "protect", "access")
 
 
 def _field(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
-    return getattr(obj, name, None)
+    value = getattr(obj, name, None)
+    if value is not None:
+        return value
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(by_alias=True).get(name)
+    return None
 
 
 def _tool_by_name(tools: list[Any]) -> dict[str, Any]:
@@ -109,21 +118,21 @@ def validate_icons(icons: list[Any] | None, *, label: str) -> None:
             raise MetadataSmokeError(f"{label}: icon src is not PNG data")
 
 
-def validate_initialize_result(spec: ServerSpec, init: Any) -> None:
-    """Validate initialize negotiation and server metadata."""
-    protocol_version = _field(init, "protocolVersion")
-    if protocol_version != DEFAULT_MCP_PROTOCOL_REVISION:
+def validate_connection(spec: ServerSpec, client: Client, *, client_mode: str) -> None:
+    """Validate negotiated protocol and server metadata for either handshake."""
+    expected_protocol = LATEST_PROTOCOL_VERSION if client_mode == "auto" else DEFAULT_MCP_PROTOCOL_REVISION
+    protocol_version = client.protocol_version
+    if protocol_version != expected_protocol:
         raise MetadataSmokeError(
-            f"{spec.expected_name}: expected protocolVersion {DEFAULT_MCP_PROTOCOL_REVISION!r}, "
-            f"got {protocol_version!r}"
+            f"{spec.expected_name}: expected protocolVersion {expected_protocol!r}, got {protocol_version!r}"
         )
 
-    capabilities = _field(init, "capabilities")
+    capabilities = client.server_capabilities
     tools_capability = _field(capabilities, "tools")
     if tools_capability is None:
-        raise MetadataSmokeError(f"{spec.expected_name}: initialize result did not advertise tools capability")
+        raise MetadataSmokeError(f"{spec.expected_name}: server did not advertise tools capability")
 
-    validate_server_metadata(spec, init.serverInfo)
+    validate_server_metadata(spec, client.server_info)
 
 
 def validate_server_metadata(spec: ServerSpec, server_info: Any) -> None:
@@ -159,7 +168,7 @@ def validate_tool_schema(tool: Any, *, label: str) -> None:
 
 
 def validate_meta_tool_surface(spec: ServerSpec, tools: list[Any]) -> None:
-    """Validate tools/list includes the expected compatibility meta-tools."""
+    """Validate tools/list includes the expected lazy-loading meta-tools."""
     by_name = _tool_by_name(tools)
     tool = by_name.get(spec.index_tool)
     if tool is None:
@@ -243,10 +252,64 @@ def validate_mode_tools(spec: ServerSpec, tools: list[Any], *, registration_mode
     raise MetadataSmokeError(f"Unknown registration mode: {registration_mode}")
 
 
+def parse_meta_tool_result(result: Any, *, label: str) -> dict[str, Any]:
+    """Decode the JSON object returned by a metadata meta-tool."""
+    if _field(result, "isError"):
+        raise MetadataSmokeError(f"{label}: meta-tool returned an error")
+    for block in _field(result, "content") or []:
+        if _field(block, "type") == "text":
+            try:
+                payload = json.loads(_field(block, "text"))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise MetadataSmokeError(f"{label}: invalid JSON response") from exc
+            if isinstance(payload, dict):
+                return payload
+    raise MetadataSmokeError(f"{label}: missing JSON text response")
+
+
+def validate_index_catalog(spec: ServerSpec, payload: dict[str, Any], *, registration_mode: str) -> None:
+    """Validate real tool-index membership, schemas, and annotations."""
+    indexed_tools = payload.get("tools")
+    if not isinstance(indexed_tools, list) or payload.get("count") != len(indexed_tools):
+        raise MetadataSmokeError(f"{spec.expected_name}: malformed {spec.index_tool} catalog")
+
+    by_name = _tool_by_name(indexed_tools)
+    representative = by_name.get(spec.representative_tool)
+    if registration_mode == "meta_only":
+        if representative is not None:
+            raise MetadataSmokeError(
+                f"{spec.expected_name}: meta_only index unexpectedly contains {spec.representative_tool}"
+            )
+        required_meta_tools = {
+            spec.index_tool,
+            f"{spec.prefix}_execute",
+            f"{spec.prefix}_batch",
+            f"{spec.prefix}_batch_status",
+        }
+        missing = sorted(required_meta_tools - set(by_name))
+        if missing:
+            raise MetadataSmokeError(f"{spec.expected_name}: meta_only index missing meta-tools: {missing}")
+        return
+
+    if representative is None:
+        raise MetadataSmokeError(f"{spec.expected_name}: {registration_mode} index missing {spec.representative_tool}")
+    schema = _field(representative, "schema")
+    if not isinstance(schema, dict) or not isinstance(schema.get("input"), dict):
+        raise MetadataSmokeError(f"{spec.expected_name}: indexed {spec.representative_tool} missing input schema")
+    annotations = _field(representative, "annotations")
+    if _field(annotations, "openWorldHint") is not False:
+        raise MetadataSmokeError(
+            f"{spec.expected_name}: indexed {spec.representative_tool} missing closed-world annotation"
+        )
+
+
 def smoke_env(*, registration_mode: str, use_current_env: bool = False) -> dict[str, str]:
     """Build the environment used by the metadata smoke server subprocesses."""
     env = os.environ.copy()
     if not use_current_env:
+        # Drop every inherited controller setting, including _FILE/_COMMAND
+        # indirections and ports, so offline servers only see the dummies below.
+        env = {name: value for name, value in env.items() if not name.startswith("UNIFI_")}
         env.update(
             {
                 "UNIFI_HOST": "127.0.0.1",
@@ -275,11 +338,6 @@ def smoke_env(*, registration_mode: str, use_current_env: bool = False) -> dict[
 def selected_server_names(*, server: str, use_current_env: bool) -> list[str]:
     """Return the servers that can be smoke-tested for this invocation."""
     if server != "all":
-        if server == "access" and not use_current_env:
-            raise MetadataSmokeError(
-                "access metadata smoke requires --use-current-env; the Access server exits when controller "
-                "initialization fails, so it cannot run against offline dummy credentials yet"
-            )
         return [server]
 
     if use_current_env:
@@ -287,34 +345,121 @@ def selected_server_names(*, server: str, use_current_env: bool) -> list[str]:
     return list(OFFLINE_SERVER_NAMES)
 
 
-async def smoke_server(spec: ServerSpec, *, registration_mode: str, use_current_env: bool = False) -> str:
+async def smoke_server(
+    spec: ServerSpec,
+    *,
+    registration_mode: str,
+    client_mode: str,
+    use_current_env: bool = False,
+) -> str:
     """Run the stdio MCP smoke for one server and return a one-line summary."""
     env = smoke_env(registration_mode=registration_mode, use_current_env=use_current_env)
 
     params = StdioServerParameters(
         command="uv",
-        args=["run", "--package", spec.package, spec.command],
+        args=["run", "--no-sync", "--package", spec.package, spec.command],
         cwd=REPO_ROOT,
         env=env,
     )
 
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            init = await session.initialize()
-            validate_initialize_result(spec, init)
+    async with Client(params, mode=client_mode) as client:
+        validate_connection(spec, client, client_mode=client_mode)
 
-            tools_result = await session.list_tools()
-            validate_meta_tool_surface(spec, tools_result.tools)
-            validate_mode_tools(spec, tools_result.tools, registration_mode=registration_mode)
+        tools_result = await client.list_tools()
+        validate_meta_tool_surface(spec, tools_result.tools)
+        validate_mode_tools(spec, tools_result.tools, registration_mode=registration_mode)
 
-            return (
-                f"{spec.expected_name} "
-                f"mode={registration_mode} "
-                f"{init.serverInfo.version} "
-                f"{spec.expected_index_title} "
-                f"tools={len(tools_result.tools)} "
-                f"icons={len(init.serverInfo.icons or [])}"
+        index_result = await client.call_tool(spec.index_tool, {"include_schemas": True})
+        index_payload = parse_meta_tool_result(
+            index_result,
+            label=f"{spec.expected_name}:{spec.index_tool}",
+        )
+        validate_index_catalog(spec, index_payload, registration_mode=registration_mode)
+
+        if registration_mode == "lazy":
+            load_tool_name = f"{spec.prefix}_load_tools"
+            load_result = await client.call_tool(load_tool_name, {"tools": [spec.representative_tool]})
+            if _field(load_result, "isError"):
+                raise MetadataSmokeError(
+                    f"{spec.expected_name}: failed to warm lazy catalog with {spec.representative_tool}"
+                )
+            warmed_tools = await client.list_tools(cache_mode="refresh")
+            warmed_by_name = _tool_by_name(warmed_tools.tools)
+            representative = warmed_by_name.get(spec.representative_tool)
+            if representative is None:
+                raise MetadataSmokeError(
+                    f"{spec.expected_name}: warmed lazy tools/list missing {spec.representative_tool}"
+                )
+            annotations = _field(representative, "annotations")
+            if _field(annotations, "openWorldHint") is not False:
+                raise MetadataSmokeError(
+                    f"{spec.expected_name}: warmed {spec.representative_tool} missing closed-world annotation"
+                )
+            warmed_index_result = await client.call_tool(spec.index_tool, {"include_schemas": True})
+            warmed_index_payload = parse_meta_tool_result(
+                warmed_index_result,
+                label=f"{spec.expected_name}:{spec.index_tool}:warmed",
             )
+            validate_index_catalog(spec, warmed_index_payload, registration_mode=registration_mode)
+            if warmed_index_payload.get("count") != index_payload.get("count"):
+                raise MetadataSmokeError(
+                    f"{spec.expected_name}: warmed lazy index changed catalog size "
+                    f"from {index_payload.get('count')} to {warmed_index_payload.get('count')}"
+                )
+
+        return (
+            f"{spec.expected_name} "
+            f"client={client_mode} "
+            f"protocol={client.protocol_version} "
+            f"mode={registration_mode} "
+            f"{client.server_info.version} "
+            f"{spec.expected_index_title} "
+            f"tools={len(tools_result.tools)} "
+            f"icons={len(client.server_info.icons or [])}"
+        )
+
+
+async def run_smoke_matrix(
+    server_names: list[str],
+    registration_modes: list[str],
+    client_modes: list[str],
+    *,
+    use_current_env: bool,
+) -> list[str]:
+    """Run smoke cases and return summaries in case order.
+
+    Offline cases run concurrently because they only target loopback. Live cases
+    stay serial to avoid an authentication burst against real controllers.
+    """
+    cases = [
+        (SERVER_SPECS[server_name], registration_mode, client_mode)
+        for server_name in server_names
+        for registration_mode in registration_modes
+        for client_mode in client_modes
+    ]
+    results: dict[int, str] = {}
+    concurrency = 1 if use_current_env else len(cases)
+    limiter = anyio.CapacityLimiter(concurrency)
+
+    async def run_case(index: int, spec: ServerSpec, registration_mode: str, client_mode: str) -> None:
+        async with limiter:
+            try:
+                results[index] = await smoke_server(
+                    spec,
+                    registration_mode=registration_mode,
+                    client_mode=client_mode,
+                    use_current_env=use_current_env,
+                )
+            except Exception as exc:
+                raise MetadataSmokeError(
+                    f"{spec.expected_name}: metadata smoke failed for mode={registration_mode} client={client_mode}"
+                ) from exc
+
+    async with anyio.create_task_group() as task_group:
+        for index, (spec, registration_mode, client_mode) in enumerate(cases):
+            task_group.start_soon(run_case, index, spec, registration_mode, client_mode)
+
+    return [results[index] for index in range(len(cases))]
 
 
 def parse_args() -> argparse.Namespace:
@@ -339,6 +484,12 @@ def parse_args() -> argparse.Namespace:
         default="lazy",
         help="Registration mode to smoke test. Use 'all' to cover lazy, eager, and meta_only.",
     )
+    parser.add_argument(
+        "--client-mode",
+        choices=[*CLIENT_MODES, "all"],
+        default="all",
+        help="Handshake mode to smoke test. Defaults to current auto negotiation and legacy Initialize.",
+    )
     return parser.parse_args()
 
 
@@ -346,15 +497,15 @@ async def main_async() -> None:
     args = parse_args()
     server_names = selected_server_names(server=args.server, use_current_env=args.use_current_env)
     registration_modes = list(REGISTRATION_MODES) if args.registration_mode == "all" else [args.registration_mode]
-    for server_name in server_names:
-        for registration_mode in registration_modes:
-            print(
-                await smoke_server(
-                    SERVER_SPECS[server_name],
-                    registration_mode=registration_mode,
-                    use_current_env=args.use_current_env,
-                )
-            )
+    client_modes = list(CLIENT_MODES) if args.client_mode == "all" else [args.client_mode]
+    summaries = await run_smoke_matrix(
+        server_names,
+        registration_modes,
+        client_modes,
+        use_current_env=args.use_current_env,
+    )
+    for summary in summaries:
+        print(summary)
 
 
 def main() -> None:

@@ -16,10 +16,12 @@ Cloudflare Worker  ────────────────────�
                                                                 |
                                               WebSocket (WSS) /ws  (relay_token)
                                                                 |
-                                                   unifi-mcp-relay (local network)
+                                                   Relay sidecar (local network)
                                                                 |
-                                                    UniFi MCP Server (stdio/HTTP)
+                                                MCP over HTTP to local servers
 ```
+
+The Relay sidecar connects to each configured local MCP server using MCP over HTTP only.
 
 The Durable Object persists location registrations in SQLite and maintains live WebSocket connections to one or more relay clients. When a tool call arrives from a cloud agent, the worker routes it to the appropriate relay client and streams the result back.
 
@@ -30,6 +32,8 @@ The Durable Object persists location registrations in SQLite and maintains live 
 ## Quick Start
 
 ### Install
+
+Node.js 22 or newer is required.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sirkirby/unifi-mcp/main/apps/worker/install.sh | bash
@@ -151,7 +155,7 @@ Response:
 }
 ```
 
-Store the `token` value securely — it is only returned once. Provide it to `unifi-mcp-relay` as `UNIFI_MCP_RELAY_TOKEN` (see [unifi-mcp](https://github.com/sirkirby/unifi-mcp) for relay client configuration).
+Store the `token` value securely — it is only returned once. Provide it to the Relay sidecar as `UNIFI_RELAY_TOKEN` (see the [Relay sidecar setup](https://github.com/sirkirby/unifi-mcp/tree/main/packages/unifi-mcp-relay)).
 
 ### List Registered Locations
 
@@ -172,13 +176,15 @@ Response includes `connected: true/false` indicating whether the relay client We
 
 ## Connecting Cloud Agents
 
-Point any MCP-compatible client at the worker URL:
+Use a client that supports MCP JSON-RPC over HTTP POST and a custom bearer authorization header:
 
 - **Endpoint:** `https://your-worker.workers.dev/mcp`
 - **Auth:** `Authorization: Bearer <agent-token>`
 - **Transport:** HTTP POST (standard MCP JSON-RPC)
 
-Compatible clients include Claude connectors, ChatGPT plugins, n8n MCP nodes, and any platform that supports the MCP protocol over HTTP.
+Configure the bearer header explicitly in your client. MCP support alone does not establish compatibility with this relay's authentication and transport.
+
+ChatGPT cannot connect to this authenticated relay as currently implemented: it requires OAuth for authenticated MCP servers and cannot send a custom API key. The Worker currently uses a static bearer token and does not implement OAuth. See [OpenAI's authentication requirements](https://developers.openai.com/plugins/build/auth) and [the relay OAuth tracking issue](https://github.com/sirkirby/unifi-mcp/issues/256).
 
 ### Multi-Location Writes
 

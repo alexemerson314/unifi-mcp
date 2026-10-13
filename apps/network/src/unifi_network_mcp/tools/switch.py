@@ -9,12 +9,12 @@ and device management commands.
 
 import json
 import logging
-from typing import Annotated, Any, Dict, List
+from typing import Annotated, Any, Dict, List, Optional
 
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
-from unifi_core.confirmation import create_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, update_preview
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.models._actions import (
     ConfigurePortAggregationInput,
@@ -23,11 +23,18 @@ from unifi_core.network.models._actions import (
     SetSwitchPortProfileInput,
 )
 from unifi_core.network.models.switch import (
+    MUTABLE_FIELDS as PP_MUTABLE_FIELDS,
+)
+from unifi_core.network.models.switch import (
+    build_create_payload as pp_build_create_payload,
+)
+from unifi_core.network.models.switch import (
     from_controller as pp_from_controller,
 )
 from unifi_core.network.models.switch import (
     to_controller_update as pp_to_update,
 )
+from unifi_core.write_verification import format_tool_payload
 from unifi_network_mcp.runtime import server, switch_manager
 
 logger = logging.getLogger(__name__)
@@ -89,43 +96,113 @@ async def get_port_profile_details(
 @server.tool(
     name="unifi_create_port_profile",
     description="Create a new port profile. forward values: 'native' (access port), 'all' (trunk), "
-    "'customize' (selective trunk), 'disabled'. Requires confirmation.",
+    "or 'customize' (selective trunk). Port State (Active/Disabled) is a separate controller setting "
+    "that these port-profile tools do not currently expose. "
+    "tagged_vlan_mgmt is the access-vs-trunk control ('auto'/'block_all'/'custom'): the controller "
+    "rewrites forward to agree with it, so an access port needs forward='native' with "
+    "tagged_vlan_mgmt='block_all'. Port Mode in the UI maps to stp_edge_state + "
+    "stp_bpdu_guard_enabled + stp_uplink (Edge = 'enabled'/true/false). Requires confirmation.",
     permission_category="switch",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
 )
 async def create_port_profile(
     name: Annotated[str, Field(description="Profile name")],
-    forward: Annotated[
-        str, Field(description="Forward mode: 'native' (access), 'all' (trunk), 'customize', or 'disabled'")
-    ],
+    forward: Annotated[str, Field(description="Forward mode: 'native' (access), 'all' (trunk), or 'customize'")],
     native_networkconf_id: Annotated[str, Field(description="Network/VLAN ID for native (untagged) traffic")] = "",
+    tagged_vlan_mgmt: Annotated[
+        str,
+        Field(
+            description="Tagged VLAN Management — the access-vs-trunk control: "
+            "'auto' (allow all), 'block_all' (access port), 'custom'. "
+            "An access port needs forward='native' with 'block_all'"
+        ),
+    ] = "",
+    tagged_networkconf_ids: Annotated[
+        Optional[List[str]],
+        Field(description="Network IDs carried tagged when tagged_vlan_mgmt is 'custom'"),
+    ] = None,
+    excluded_networkconf_ids: Annotated[
+        Optional[List[str]],
+        Field(description="Network IDs excluded when tagged_vlan_mgmt is 'custom'"),
+    ] = None,
     voice_networkconf_id: Annotated[str, Field(description="Network/VLAN ID for voice traffic")] = "",
     isolation: Annotated[bool, Field(description="Enable port isolation (block inter-client traffic)")] = False,
     poe_mode: Annotated[str, Field(description="PoE mode: 'auto' or 'off'")] = "auto",
     stp_port_mode: Annotated[bool, Field(description="Enable STP on this port")] = True,
+    stp_edge_state: Annotated[
+        str,
+        Field(
+            description="STP edge state: 'enabled' for end-device (Edge) ports, 'disabled' for uplinks. "
+            "The UI's Port Mode control sets this with stp_bpdu_guard_enabled and stp_uplink"
+        ),
+    ] = "",
+    stp_bpdu_guard_enabled: Annotated[
+        Optional[bool],
+        Field(description="Shut the port if it receives a BPDU (Edge ports)"),
+    ] = None,
+    stp_uplink: Annotated[
+        Optional[bool],
+        Field(description="Treat the port as an STP uplink (Infrastructure ports)"),
+    ] = None,
     dot1x_ctrl: Annotated[
         str, Field(description="802.1X control: 'force_authorized', 'auto', 'force_unauthorized'")
     ] = "",
+    stormctrl_bcast_enabled: Annotated[
+        Optional[bool],
+        Field(description="Enable broadcast storm control on ports using this profile"),
+    ] = None,
+    stormctrl_bcast_rate: Annotated[
+        Optional[int],
+        Field(description="Broadcast storm-control rate limit in packets per second (0-14,880,000)"),
+    ] = None,
+    stormctrl_mcast_enabled: Annotated[
+        Optional[bool],
+        Field(description="Enable multicast storm control on ports using this profile"),
+    ] = None,
+    stormctrl_mcast_rate: Annotated[
+        Optional[int],
+        Field(description="Multicast storm-control rate limit in packets per second (0-14,880,000)"),
+    ] = None,
+    stormctrl_ucast_enabled: Annotated[
+        Optional[bool],
+        Field(description="Enable unknown-unicast storm control on ports using this profile"),
+    ] = None,
+    stormctrl_ucast_rate: Annotated[
+        Optional[int],
+        Field(description="Unknown-unicast storm-control rate limit in packets per second (0-14,880,000)"),
+    ] = None,
     confirm: Annotated[
         bool,
         Field(description="When true, creates the profile. When false (default), returns a preview"),
     ] = False,
 ) -> Dict[str, Any]:
     """Creates a new port profile."""
-    profile_data: Dict[str, Any] = {"name": name, "forward": forward}
-    if native_networkconf_id:
-        profile_data["native_networkconf_id"] = native_networkconf_id
-    if voice_networkconf_id:
-        profile_data["voice_networkconf_id"] = voice_networkconf_id
-    if isolation:
-        profile_data["isolation"] = isolation
-    if poe_mode != "auto":
-        profile_data["poe_mode"] = poe_mode
-    if not stp_port_mode:
-        profile_data["stp_port_mode"] = stp_port_mode
-    if dot1x_ctrl:
-        profile_data["dot1x_ctrl"] = dot1x_ctrl
+    try:
+        profile_data = pp_build_create_payload(
+            name=name,
+            forward=forward,
+            native_networkconf_id=native_networkconf_id,
+            tagged_vlan_mgmt=tagged_vlan_mgmt,
+            tagged_networkconf_ids=tagged_networkconf_ids,
+            excluded_networkconf_ids=excluded_networkconf_ids,
+            voice_networkconf_id=voice_networkconf_id,
+            isolation=isolation,
+            poe_mode=poe_mode,
+            stp_port_mode=stp_port_mode,
+            stp_edge_state=stp_edge_state,
+            stp_bpdu_guard_enabled=stp_bpdu_guard_enabled,
+            stp_uplink=stp_uplink,
+            dot1x_ctrl=dot1x_ctrl,
+            stormctrl_bcast_enabled=stormctrl_bcast_enabled,
+            stormctrl_bcast_rate=stormctrl_bcast_rate,
+            stormctrl_mcast_enabled=stormctrl_mcast_enabled,
+            stormctrl_mcast_rate=stormctrl_mcast_rate,
+            stormctrl_ucast_enabled=stormctrl_ucast_enabled,
+            stormctrl_ucast_rate=stormctrl_ucast_rate,
+        )
+    except ValueError as e:
+        return {"success": False, "error": f"Invalid port profile data: {e}"}
 
     if not confirm:
         return create_preview(
@@ -135,14 +212,12 @@ async def create_port_profile(
         )
 
     try:
-        result = await switch_manager.create_port_profile(profile_data)
-        if result:
-            return {
-                "success": True,
-                "message": f"Port profile '{name}' created successfully.",
-                "profile": json.loads(json.dumps(result, default=str)),
-            }
-        return {"success": False, "error": f"Failed to create port profile '{name}'."}
+        write_result = await switch_manager.create_port_profile(profile_data)
+        return format_tool_payload(
+            write_result,
+            site=switch_manager._connection.site,
+            success_message=f"Port profile '{name}' created successfully.",
+        )
     except Exception as e:
         logger.error("Error creating port profile: %s", e, exc_info=True)
         return {"success": False, "error": f"Failed to create port profile: {e}"}
@@ -164,10 +239,18 @@ async def update_port_profile(
         Field(
             description="Dictionary of fields to update. Pass only the fields you want to change — "
             "current values are automatically preserved. "
-            "Allowed keys: name, forward ('all'/'native'/'customize'/'disabled'), "
-            "native_networkconf_id, voice_networkconf_id, isolation (bool), "
+            "Allowed keys: name, forward ('all'/'native'/'customize'), "
+            "tagged_vlan_mgmt ('auto'/'block_all'/'custom'), native_networkconf_id, "
+            "tagged_networkconf_ids (list), excluded_networkconf_ids (list), "
+            "voice_networkconf_id, isolation (bool), "
             "poe_mode ('auto'/'off'/'pasv24'/'passthrough'), stp_port_mode (bool), "
-            "dot1x_ctrl ('force_authorized'/'auto'/'force_unauthorized'/'mac_based'/'multi_host')"
+            "stp_edge_state ('enabled'/'disabled'), stp_bpdu_guard_enabled (bool), stp_uplink (bool), "
+            "dot1x_ctrl ('force_authorized'/'auto'/'force_unauthorized'/'mac_based'/'multi_host'), "
+            "stormctrl_bcast_enabled (bool), stormctrl_bcast_rate (int packets/sec, 0-14,880,000), "
+            "stormctrl_mcast_enabled (bool), stormctrl_mcast_rate (int packets/sec, 0-14,880,000), "
+            "stormctrl_ucast_enabled (bool), stormctrl_ucast_rate (int packets/sec, 0-14,880,000). "
+            "The controller rewrites forward to agree with tagged_vlan_mgmt, so change them together. "
+            "Port State (Active/Disabled) is a separate controller setting that this tool does not expose"
         ),
     ],
     confirm: Annotated[
@@ -181,8 +264,25 @@ async def update_port_profile(
     if not profile_data:
         return {"success": False, "error": "profile_data cannot be empty"}
 
-    validated_data = pp_to_update(profile_data)
+    try:
+        validated_data = pp_to_update(profile_data)
+    except ValueError as e:
+        return {"success": False, "error": f"Invalid port profile update data: {e}"}
+    # unifi_get_port_profile_details returns the controller's full raw object, so
+    # callers routinely round-trip keys this tool cannot write. Name them rather
+    # than dropping them silently.
+    ignored_fields = sorted(k for k in profile_data if k not in PP_MUTABLE_FIELDS)
     if not validated_data:
+        if ignored_fields:
+            return {
+                "success": False,
+                "error": (
+                    f"The following fields are not supported by unifi_update_port_profile: "
+                    f"{', '.join(ignored_fields)}. "
+                    "unifi_get_port_profile_details returns the controller's full raw object, "
+                    "which includes fields this tool cannot write."
+                ),
+            }
         return {"success": False, "error": "No valid mutable fields provided for update."}
 
     if not confirm:
@@ -192,14 +292,28 @@ async def update_port_profile(
             resource_name=profile_id,
             current_state={},
             updates=validated_data,
+            warnings=(
+                [
+                    "The following fields are not writable through this tool and will be ignored: "
+                    + ", ".join(ignored_fields)
+                    + "."
+                ]
+                if ignored_fields
+                else None
+            ),
         )
 
     try:
-        merged = await switch_manager.update_port_profile(profile_id, validated_data)
-        return {
-            "success": True,
-            "message": f"Port profile '{merged.get('name', profile_id)}' updated successfully.",
-        }
+        write_result = await switch_manager.update_port_profile(profile_id, validated_data)
+        result = format_tool_payload(
+            write_result,
+            site=switch_manager._connection.site,
+            success_message=f"Port profile '{profile_id}' updated successfully.",
+        )
+        result["profile_id"] = profile_id
+        if ignored_fields:
+            result["ignored_fields"] = ignored_fields
+        return result
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
@@ -224,8 +338,9 @@ async def delete_port_profile(
 ) -> Dict[str, Any]:
     """Deletes a port profile."""
     if not confirm:
-        return create_preview(
+        return delete_preview(
             resource_type="port_profile",
+            resource_id=profile_id,
             resource_data={"profile_id": profile_id},
             resource_name=profile_id,
             warnings=["Switch ports using this profile will revert to defaults."],
@@ -251,25 +366,25 @@ async def delete_port_profile(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_switch_ports(
-    device_mac: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
 ) -> Dict[str, Any]:
     """Gets port override assignments for a switch."""
     try:
-        if not device_mac:
-            return {"success": False, "error": "device_mac is required"}
+        if not mac_address:
+            return {"success": False, "error": "mac_address is required"}
 
-        result = await switch_manager.get_switch_ports(device_mac)
+        result = await switch_manager.get_switch_ports(mac_address)
         if not result:
-            return {"success": False, "error": f"Switch '{device_mac}' not found or has no port data."}
+            return {"success": False, "error": f"Switch '{mac_address}' not found or has no port data."}
 
         return {
             "success": True,
-            "device_mac": device_mac,
+            "device_mac": mac_address,
             "details": json.loads(json.dumps(result, default=str)),
         }
     except Exception as e:
-        logger.error("Error getting switch ports for %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to get switch ports for {device_mac}: {e}"}
+        logger.error("Error getting switch ports: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get switch ports: {type(e).__name__}"}
 
 
 @server.tool(
@@ -280,25 +395,25 @@ async def get_switch_ports(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_port_stats(
-    device_mac: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
 ) -> Dict[str, Any]:
     """Gets live port table statistics for a switch."""
     try:
-        if not device_mac:
-            return {"success": False, "error": "device_mac is required"}
+        if not mac_address:
+            return {"success": False, "error": "mac_address is required"}
 
-        result = await switch_manager.get_port_stats(device_mac)
+        result = await switch_manager.get_port_stats(mac_address)
         if not result:
-            return {"success": False, "error": f"Switch '{device_mac}' not found or has no port data."}
+            return {"success": False, "error": f"Switch '{mac_address}' not found or has no port data."}
 
         return {
             "success": True,
-            "device_mac": device_mac,
+            "device_mac": mac_address,
             "details": json.loads(json.dumps(result, default=str)),
         }
     except Exception as e:
-        logger.error("Error getting port stats for %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to get port stats for {device_mac}: {e}"}
+        logger.error("Error getting port stats: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get port stats: {type(e).__name__}"}
 
 
 @server.tool(
@@ -309,25 +424,25 @@ async def get_port_stats(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_lldp_neighbors(
-    device_mac: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
 ) -> Dict[str, Any]:
     """Gets LLDP neighbor table for a switch."""
     try:
-        if not device_mac:
-            return {"success": False, "error": "device_mac is required"}
+        if not mac_address:
+            return {"success": False, "error": "mac_address is required"}
 
-        result = await switch_manager.get_lldp_neighbors(device_mac)
+        result = await switch_manager.get_lldp_neighbors(mac_address)
         if not result:
-            return {"success": False, "error": f"Switch '{device_mac}' not found or has no LLDP data."}
+            return {"success": False, "error": f"Switch '{mac_address}' not found or has no LLDP data."}
 
         return {
             "success": True,
-            "device_mac": device_mac,
+            "device_mac": mac_address,
             "details": json.loads(json.dumps(result, default=str)),
         }
     except Exception as e:
-        logger.error("Error getting LLDP neighbors for %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to get LLDP neighbors for {device_mac}: {e}"}
+        logger.error("Error getting LLDP neighbors: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get LLDP neighbors: {type(e).__name__}"}
 
 
 @server.tool(
@@ -338,25 +453,25 @@ async def get_lldp_neighbors(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_switch_capabilities(
-    device_mac: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch (from unifi_list_devices)")],
 ) -> Dict[str, Any]:
     """Gets switch hardware capabilities."""
     try:
-        if not device_mac:
-            return {"success": False, "error": "device_mac is required"}
+        if not mac_address:
+            return {"success": False, "error": "mac_address is required"}
 
-        result = await switch_manager.get_switch_capabilities(device_mac)
+        result = await switch_manager.get_switch_capabilities(mac_address)
         if not result:
-            return {"success": False, "error": f"Switch '{device_mac}' not found or has no capability data."}
+            return {"success": False, "error": f"Switch '{mac_address}' not found or has no capability data."}
 
         return {
             "success": True,
-            "device_mac": device_mac,
+            "device_mac": mac_address,
             "details": json.loads(json.dumps(result, default=str)),
         }
     except Exception as e:
-        logger.error("Error getting switch capabilities for %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to get switch capabilities for {device_mac}: {e}"}
+        logger.error("Error getting switch capabilities: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get switch capabilities: {type(e).__name__}"}
 
 
 # ---- Switch Port Write Operations ----
@@ -373,7 +488,7 @@ async def get_switch_capabilities(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def set_switch_port_profile(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     port_overrides: Annotated[
         List[Dict],
         Field(
@@ -389,25 +504,25 @@ async def set_switch_port_profile(
 ) -> Dict[str, Any]:
     """Sets port overrides for a switch."""
     try:
-        SetSwitchPortProfileInput(device_mac=device_mac, port_overrides=port_overrides)
+        SetSwitchPortProfileInput(device_mac=mac_address, port_overrides=port_overrides)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
     if not confirm:
         return create_preview(
             resource_type="switch_port_assignment",
-            resource_data={"device_mac": device_mac, "port_overrides": port_overrides},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, "port_overrides": port_overrides},
+            resource_name=mac_address,
         )
 
     try:
-        success = await switch_manager.set_port_overrides(device_mac, port_overrides)
+        success = await switch_manager.set_port_overrides(mac_address, port_overrides)
         if success:
-            return {"success": True, "message": f"Port overrides updated for switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to set port overrides for '{device_mac}'."}
+            return {"success": True, "message": f"Port overrides updated for switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to set port overrides for '{mac_address}'."}
     except Exception as e:
-        logger.error("Error setting port overrides for %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to set port overrides for {device_mac}: {e}"}
+        logger.error("Error setting port overrides: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to set port overrides: {type(e).__name__}"}
 
 
 @server.tool(
@@ -419,7 +534,7 @@ async def set_switch_port_profile(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
 )
 async def power_cycle_port(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     port_idx: Annotated[int, Field(description="1-based port number to power cycle")],
     confirm: Annotated[
         bool,
@@ -430,19 +545,19 @@ async def power_cycle_port(
     if not confirm:
         return create_preview(
             resource_type="poe_power_cycle",
-            resource_data={"device_mac": device_mac, "port_idx": port_idx},
-            resource_name=f"{device_mac}:port{port_idx}",
+            resource_data={"mac_address": mac_address, "port_idx": port_idx},
+            resource_name=f"{mac_address}:port{port_idx}",
             warnings=[f"This will briefly cut PoE power to port {port_idx}, rebooting any connected PoE device."],
         )
 
     try:
-        success = await switch_manager.power_cycle_port(device_mac, port_idx)
+        success = await switch_manager.power_cycle_port(mac_address, port_idx)
         if success:
-            return {"success": True, "message": f"Power cycled port {port_idx} on switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to power cycle port {port_idx} on '{device_mac}'."}
+            return {"success": True, "message": f"Power cycled port {port_idx} on switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to power cycle port {port_idx} on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error power cycling port %s on %s: %s", port_idx, device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to power cycle port {port_idx} on {device_mac}: {e}"}
+        logger.error("Error power cycling port: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to power cycle port: {type(e).__name__}"}
 
 
 # ---- Advanced Switch Configuration ----
@@ -459,7 +574,7 @@ async def power_cycle_port(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def configure_port_mirror(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     port_overrides: Annotated[
         List[Dict],
         Field(
@@ -474,25 +589,25 @@ async def configure_port_mirror(
 ) -> Dict[str, Any]:
     """Configures port mirroring."""
     try:
-        ConfigurePortMirrorInput(device_mac=device_mac, port_overrides=port_overrides)
+        ConfigurePortMirrorInput(device_mac=mac_address, port_overrides=port_overrides)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
     if not confirm:
         return create_preview(
             resource_type="port_mirror",
-            resource_data={"device_mac": device_mac, "port_overrides": port_overrides},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, "port_overrides": port_overrides},
+            resource_name=mac_address,
         )
 
     try:
-        success = await switch_manager.set_port_overrides(device_mac, port_overrides)
+        success = await switch_manager.set_port_overrides(mac_address, port_overrides)
         if success:
-            return {"success": True, "message": f"Port mirror configured on switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to configure port mirror on '{device_mac}'."}
+            return {"success": True, "message": f"Port mirror configured on switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to configure port mirror on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error configuring port mirror on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to configure port mirror on {device_mac}: {e}"}
+        logger.error("Error configuring port mirror: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to configure port mirror: {type(e).__name__}"}
 
 
 @server.tool(
@@ -508,7 +623,7 @@ async def configure_port_mirror(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def configure_port_aggregation(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     port_overrides: Annotated[
         List[Dict],
         Field(
@@ -524,25 +639,25 @@ async def configure_port_aggregation(
 ) -> Dict[str, Any]:
     """Configures link aggregation."""
     try:
-        ConfigurePortAggregationInput(device_mac=device_mac, port_overrides=port_overrides)
+        ConfigurePortAggregationInput(device_mac=mac_address, port_overrides=port_overrides)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
     if not confirm:
         return create_preview(
             resource_type="port_aggregation",
-            resource_data={"device_mac": device_mac, "port_overrides": port_overrides},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, "port_overrides": port_overrides},
+            resource_name=mac_address,
         )
 
     try:
-        success = await switch_manager.set_port_overrides(device_mac, port_overrides)
+        success = await switch_manager.set_port_overrides(mac_address, port_overrides)
         if success:
-            return {"success": True, "message": f"Link aggregation configured on switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to configure aggregation on '{device_mac}'."}
+            return {"success": True, "message": f"Link aggregation configured on switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to configure aggregation on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error configuring port aggregation on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to configure port aggregation on {device_mac}: {e}"}
+        logger.error("Error configuring port aggregation: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to configure port aggregation: {type(e).__name__}"}
 
 
 @server.tool(
@@ -555,7 +670,7 @@ async def configure_port_aggregation(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def update_switch_stp(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     stp_priority: Annotated[
         int,
         Field(description="STP bridge priority (4096-61440 in steps of 4096, default 32768)"),
@@ -575,18 +690,18 @@ async def update_switch_stp(
     if not confirm:
         return create_preview(
             resource_type="switch_stp",
-            resource_data={"device_mac": device_mac, **config},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, **config},
+            resource_name=mac_address,
         )
 
     try:
-        success = await switch_manager.update_device_config(device_mac, config)
+        success = await switch_manager.update_device_config(mac_address, config)
         if success:
-            return {"success": True, "message": f"STP config updated on switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to update STP config on '{device_mac}'."}
+            return {"success": True, "message": f"STP config updated on switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to update STP config on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error updating STP on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to update STP on {device_mac}: {e}"}
+        logger.error("Error updating STP: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to update STP: {type(e).__name__}"}
 
 
 @server.tool(
@@ -600,7 +715,7 @@ async def update_switch_stp(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def set_jumbo_frames(
-    device_mac: Annotated[str, Field(description="MAC address of the switch")],
+    mac_address: Annotated[str, Field(description="MAC address of the switch")],
     enabled: Annotated[bool, Field(description="True to enable jumbo frames, False to disable")],
     confirm: Annotated[
         bool,
@@ -609,23 +724,23 @@ async def set_jumbo_frames(
 ) -> Dict[str, Any]:
     """Enables or disables jumbo frames on a switch."""
     try:
-        SetJumboFramesInput(device_mac=device_mac, enabled=enabled)
+        SetJumboFramesInput(device_mac=mac_address, enabled=enabled)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
     if not confirm:
         return create_preview(
             resource_type="jumbo_frames",
-            resource_data={"device_mac": device_mac, "jumboframe_enabled": enabled},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, "jumboframe_enabled": enabled},
+            resource_name=mac_address,
         )
 
     try:
-        success = await switch_manager.update_device_config(device_mac, {"jumboframe_enabled": enabled})
+        success = await switch_manager.update_device_config(mac_address, {"jumboframe_enabled": enabled})
         if success:
             state = "enabled" if enabled else "disabled"
-            return {"success": True, "message": f"Jumbo frames {state} on switch '{device_mac}'."}
-        return {"success": False, "error": f"Failed to set jumbo frames on '{device_mac}'."}
+            return {"success": True, "message": f"Jumbo frames {state} on switch '{mac_address}'."}
+        return {"success": False, "error": f"Failed to set jumbo frames on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error setting jumbo frames on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to set jumbo frames on {device_mac}: {e}"}
+        logger.error("Error setting jumbo frames: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to set jumbo frames: {type(e).__name__}"}

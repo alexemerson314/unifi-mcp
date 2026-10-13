@@ -14,9 +14,16 @@ servers are loaded simultaneously:
 """
 
 import logging
-from typing import TYPE_CHECKING, Callable, List
+import time
+import uuid
+from typing import TYPE_CHECKING, Callable, List, Literal
 
+from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
+from pydantic import SkipValidation
+
+from unifi_mcp_shared.response_serialization import normalize_call_tool_result
+from unifi_mcp_shared.tool_index import normalize_tool_annotations
 
 if TYPE_CHECKING:
     from unifi_mcp_shared.lazy_tools import LazyToolLoader
@@ -29,6 +36,7 @@ META_TOOL_SUFFIXES: tuple[str, ...] = (
     "_batch",
     "_batch_status",
     "_load_tools",
+    "_get_support_bundle",
 )
 
 
@@ -45,6 +53,16 @@ _DEFAULT_DOMAIN_HINTS = {
 }
 
 
+def _duration_bucket(duration_ms: float) -> str:
+    if duration_ms < 100:
+        return "under_100ms"
+    if duration_ms < 1_000:
+        return "100ms_1s"
+    if duration_ms < 5_000:
+        return "1s_5s"
+    return "over_5s"
+
+
 def register_meta_tools(
     server,
     tool_decorator: Callable,
@@ -55,6 +73,8 @@ def register_meta_tools(
     prefix: str = "unifi",
     server_label: str = "UniFi Network",
     domain_hint: str | None = None,
+    *,
+    support_bundle_handler: Callable | None = None,
 ) -> None:
     """Register meta-tools with the MCP server.
 
@@ -63,6 +83,7 @@ def register_meta_tools(
     - {prefix}_execute: Execute a single tool (returns result directly)
     - {prefix}_batch: Execute multiple tools in parallel (returns job IDs)
     - {prefix}_batch_status: Check batch job progress
+    - {prefix}_get_support_bundle: Generate privacy-bounded support evidence
 
     Args:
         server: FastMCP server instance (for call_tool access)
@@ -71,6 +92,8 @@ def register_meta_tools(
         start_async_tool: Function to start async jobs
         get_job_status: Function to get job status
         register_tool: Function to register in tool index
+        support_bundle_handler: Optional runtime callback. Omit for legacy apps
+            that do not expose support bundles.
         prefix: Tool name prefix (e.g. "unifi", "protect", "access").
         server_label: Human-readable server name for descriptions
                       (e.g. "UniFi Network", "UniFi Protect").
@@ -81,12 +104,108 @@ def register_meta_tools(
     exec_name = f"{prefix}_execute"
     batch_name = f"{prefix}_batch"
     status_name = f"{prefix}_batch_status"
+    support_name = f"{prefix}_get_support_bundle"
 
     hint = domain_hint or _DEFAULT_DOMAIN_HINTS.get(prefix, "controller management")
     idx_title = f"{server_label} Tool Index"
     exec_title = f"{server_label} Execute Tool"
     batch_title = f"{server_label} Batch Execute"
     status_title = f"{server_label} Batch Status"
+    support_title = f"{server_label} Support Bundle"
+    read_annotations = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+    action_annotations = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+
+    # =========================================================================
+    # SUPPORT: {prefix}_get_support_bundle
+    # This uses the original server decorator and a dedicated safe audit line;
+    # it must never pass through ordinary diagnostic argument/result logging.
+    # =========================================================================
+    if support_bundle_handler is not None:
+
+        @tool_decorator(
+            name=support_name,
+            title=support_title,
+            description=(
+                f"Generate a sanitized, reviewable {server_label} support bundle. "
+                "The default summary is local/cache-only. Live connectivity or resource-shape probes "
+                "are bounded and may be unavailable for this product. The result excludes raw logs, "
+                "credentials, controller payload values, and arbitrary exception text. Review the "
+                "bundle before sharing it publicly."
+            ),
+            annotations=read_annotations,
+        )
+        async def _support_bundle_wrapper(
+            probe: SkipValidation[Literal["summary", "connectivity", "resource_shape"]] = "summary",
+            resource: SkipValidation[str | None] = None,
+        ) -> dict:
+            # Preserve the advertised schema, but validate only inside the service's
+            # privacy boundary: Pydantic errors otherwise echo rejected input values.
+            try:
+                correlation_id = uuid.uuid4().hex
+                started = time.monotonic()
+                result = await support_bundle_handler(probe=probe, resource=resource)
+                if not isinstance(result, dict):
+                    result = {"success": False, "error": "Failed to generate support bundle."}
+                outcome = "success" if result.get("success") is True else "failed"
+                duration_bucket = _duration_bucket((time.monotonic() - started) * 1000)
+            except Exception:
+                result = {"success": False, "error": "Failed to generate support bundle."}
+                correlation_id = uuid.uuid4().hex
+                outcome = "failed"
+                duration_bucket = "unknown"
+            safe_probe = (
+                probe
+                if isinstance(probe, str) and probe in {"summary", "connectivity", "resource_shape"}
+                else "invalid"
+            )
+            logger.info(
+                "Support bundle audit correlation_id=%s probe=%s outcome=%s duration=%s",
+                correlation_id,
+                safe_probe,
+                outcome,
+                duration_bucket,
+            )
+            return result
+
+        register_tool(
+            name=support_name,
+            title=support_title,
+            description=(
+                f"Generate sanitized {server_label} support evidence for user review. "
+                "Summary is local/cache-only; live probes are bounded and explicitly allowlisted."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "probe": {
+                        "type": "string",
+                        "enum": ["summary", "connectivity", "resource_shape"],
+                        "default": "summary",
+                    },
+                    "resource": {"type": ["string", "null"], "default": None},
+                },
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "data": {"type": "object"},
+                    "error": {"type": "string"},
+                },
+                "required": ["success"],
+            },
+            annotations=normalize_tool_annotations(read_annotations),
+        )
 
     # =========================================================================
     # DISCOVERY: {prefix}_tool_index
@@ -98,25 +217,25 @@ def register_meta_tools(
             f"Model-friendly discovery extension for {server_label} tools. "
             f"This server manages {hint}. "
             "Standard MCP clients should use tools/list first; this compact index is an "
-            "optional UniFi extension for filtered discovery in lazy/meta-only workflows. "
+            "optional UniFi extension for filtered discovery. In meta_only mode, it "
+            "starts with only meta-tools; domain entries appear after their module has "
+            "been executed. "
             f"Returns names and descriptions by default. "
             f"Use 'category' to filter by area (e.g. clients, firewall, devices), "
-            f"'search' for keyword matching, or 'include_schemas' for full parameter schemas. "
+            f"'search' for keyword matching, 'name' for exact lookup, or 'include_schemas' for full schemas. "
             f"After finding the right tool, use {exec_name} to run it."
         ),
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
-        ),
+        annotations=read_annotations,
     )
     async def _tool_index_wrapper(
         category: str | None = None,
         search: str | None = None,
         include_schemas: bool = False,
+        name: str | None = None,
     ) -> dict:
         args = {}
+        if name is not None:
+            args["name"] = name
         if category is not None:
             args["category"] = category
         if search is not None:
@@ -129,12 +248,21 @@ def register_meta_tools(
         name=idx_name,
         title=idx_title,
         description=(
-            f"Discover {server_label} tools ({hint}) through the UniFi compatibility index. "
+            f"Discover {server_label} tools ({hint}) through the compact tool index. "
+            "The catalog is manifest-backed in lazy mode; in meta-only mode it starts with "
+            "registered meta-tools and expands after domain modules execute. "
             "Standard MCP clients should prefer tools/list when it exposes the needed tools."
         ),
         input_schema={
             "type": "object",
             "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Exact, case-sensitive tool name. Cannot be combined with category or search. "
+                        "Unknown names return an empty index."
+                    ),
+                },
                 "category": {
                     "type": "string",
                     "description": (
@@ -143,13 +271,19 @@ def register_meta_tools(
                 },
                 "search": {
                     "type": "string",
-                    "description": "Case-insensitive substring match against tool name and description.",
+                    "description": (
+                        "Case-insensitive token search over tool names and descriptions. "
+                        "Ignores common words and one-character terms; multi-word queries require at least half "
+                        "of usable terms (minimum two). Terms of four or more characters also match token prefixes. "
+                        "Results are ranked by exact phrase and name matches, with at most 20 returned. "
+                        "An empty string applies no filter; a non-empty query with no usable terms returns no tools."
+                    ),
                 },
                 "include_schemas": {
                     "type": "boolean",
                     "description": (
                         "Include full input/output schemas per tool. "
-                        "Defaults to false — set true with a category or search filter "
+                        "Defaults to false — set true with a name, category or search filter "
                         "to get parameter details for specific tools."
                     ),
                     "default": False,
@@ -169,9 +303,10 @@ def register_meta_tools(
                     "items": {"type": "string"},
                     "description": "All available category names (use as values for the category filter)",
                 },
-                "filtered": {"type": "boolean", "description": "True when category or search filter was applied"},
+                "filtered": {"type": "boolean", "description": "True when name, category or search filter was applied"},
             },
         },
+        annotations=normalize_tool_annotations(read_annotations),
     )
 
     # =========================================================================
@@ -181,27 +316,24 @@ def register_meta_tools(
         name=exec_name,
         title=exec_title,
         description=(
-            f"Execute a {server_label} tool discovered via {idx_name}. "
+            f"Execute a named {server_label} tool. "
             f"This server manages {hint}. "
-            "This is a UniFi compatibility execution wrapper for lazy/meta-only workflows; "
+            f"In lazy mode, use {idx_name} to discover domain tool names. In meta_only "
+            "mode, the domain tool name must already be known. "
+            "This is an indirect execution wrapper for lazy/meta-only workflows; "
             "standard MCP clients may call directly registered tools with tools/call. "
             f"For bulk/parallel operations, use {batch_name} instead."
         ),
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            idempotentHint=False,
-            openWorldHint=False,
-        ),
+        annotations=action_annotations,
     )
-    async def execute_handler(tool: str, arguments: dict = None) -> dict:
+    async def execute_handler(tool: str, arguments: dict | None = None, ctx: Context | None = None) -> dict:
         """Execute a tool synchronously."""
         if arguments is None:
             arguments = {}
 
         try:
-            result = await server.call_tool(tool, arguments)
-            return result
+            result = await server.call_tool(tool, arguments, context=ctx)
+            return normalize_call_tool_result(result)
         except Exception as e:
             logger.error("Error executing tool '%s': %s", tool, e, exc_info=True)
             return {"error": f"Failed to execute tool: {str(e)}"}
@@ -209,18 +341,20 @@ def register_meta_tools(
     register_tool(
         name=exec_name,
         title=exec_title,
-        description=(f"Execute a {server_label} tool ({hint}) by name for lazy/meta-only compatibility workflows."),
+        description=(f"Execute a {server_label} tool ({hint}) by name for lazy/meta-only workflows."),
         input_schema={
             "type": "object",
             "required": ["tool"],
             "properties": {
                 "tool": {
                     "type": "string",
-                    "description": f"Tool name from {idx_name} (e.g. '{prefix}_list_*')",
+                    "description": (
+                        f"Domain tool name (e.g. '{prefix}_list_*'); discover it through {idx_name} in lazy mode"
+                    ),
                 },
                 "arguments": {
-                    "type": "object",
-                    "description": "Tool parameters matching the schema from the tool index",
+                    "type": ["object", "null"],
+                    "description": "Tool parameters matching the domain tool's input schema",
                 },
             },
         },
@@ -228,6 +362,7 @@ def register_meta_tools(
             "type": "object",
             "description": f"Result from the executed {server_label} tool",
         },
+        annotations=normalize_tool_annotations(action_annotations),
     )
 
     # =========================================================================
@@ -237,19 +372,14 @@ def register_meta_tools(
         name=batch_name,
         title=batch_title,
         description=(
-            f"Execute multiple {server_label} tools in parallel through a UniFi compatibility wrapper. "
-            f"Use {idx_name} to discover tool names when they are not directly registered. "
+            f"Execute multiple {server_label} tools in parallel through an indirect execution wrapper. "
+            f"Use {idx_name} to discover tool names in lazy mode when they are not directly registered. "
             f"Returns job IDs for each operation. Use {status_name} to check progress and get results. "
             f"For single operations, use {exec_name} instead (returns result directly)."
         ),
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            idempotentHint=False,
-            openWorldHint=False,
-        ),
+        annotations=action_annotations,
     )
-    async def batch_handler(operations: List[dict]) -> dict:
+    async def batch_handler(operations: List[dict], ctx: Context | None = None) -> dict:
         """Execute multiple operations in parallel."""
         if not operations:
             return {"error": "No operations specified", "jobs": []}
@@ -269,7 +399,8 @@ def register_meta_tools(
                 # Create a closure that captures the current tool and arguments
                 async def _make_executor(t, a):
                     async def _execute():
-                        return await server.call_tool(t, a)
+                        result = await server.call_tool(t, a, context=ctx)
+                        return normalize_call_tool_result(result)
 
                     return _execute
 
@@ -297,7 +428,7 @@ def register_meta_tools(
         name=batch_name,
         title=batch_title,
         description=(
-            f"Execute multiple {server_label} tools in parallel through the UniFi compatibility wrapper. "
+            f"Execute multiple {server_label} tools in parallel through the indirect execution wrapper. "
             f"Returns job IDs; use {status_name} to check progress."
         ),
         input_schema={
@@ -312,15 +443,21 @@ def register_meta_tools(
                         "properties": {
                             "tool": {
                                 "type": "string",
-                                "description": f"Tool name from {idx_name}",
+                                "description": (
+                                    f"Tool name from {idx_name} in lazy mode, or a known domain tool name "
+                                    "in meta-only mode"
+                                ),
                             },
                             "arguments": {
                                 "type": "object",
-                                "description": "Tool parameters matching the schema from the tool index",
+                                "description": "Tool parameters matching the domain tool's input schema",
                             },
                         },
                     },
-                    "description": f"Array of {{tool, arguments}} objects using tool names from {idx_name}",
+                    "description": (
+                        f"Array of {{tool, arguments}} objects using names from {idx_name} in lazy mode, "
+                        "or known domain tool names in meta-only mode"
+                    ),
                 },
             },
         },
@@ -346,6 +483,7 @@ def register_meta_tools(
                 "message": {"type": "string"},
             },
         },
+        annotations=normalize_tool_annotations(action_annotations),
     )
 
     # =========================================================================
@@ -359,12 +497,7 @@ def register_meta_tools(
             f"Returns status ('running', 'done', 'error'), result (if done), or error (if failed). "
             f"Can check multiple jobs at once by passing an array of job IDs."
         ),
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
-        ),
+        annotations=read_annotations,
     )
     async def batch_status_handler(jobId: str = None, jobIds: List[str] = None) -> dict:
         """Check status of one or more jobs."""
@@ -423,9 +556,13 @@ def register_meta_tools(
                 },
             },
         },
+        annotations=normalize_tool_annotations(read_annotations),
     )
 
-    logger.info("Registered meta-tools: %s, %s, %s, %s", idx_name, exec_name, batch_name, status_name)
+    names = [idx_name, exec_name, batch_name, status_name]
+    if support_bundle_handler is not None:
+        names.append(support_name)
+    logger.info("Registered meta-tools: %s", ", ".join(names))
 
 
 def register_load_tools(
@@ -454,12 +591,16 @@ def register_load_tools(
         server_label: Human-readable server name for descriptions.
         domain_hint: Short description of the tool domain for LLM context.
     """
-    from mcp.server.fastmcp import Context
-
     load_name = f"{prefix}_load_tools"
     exec_name = f"{prefix}_execute"
     hint = domain_hint or _DEFAULT_DOMAIN_HINTS.get(prefix, "controller management")
     load_title = f"{server_label} Load Tools"
+    load_annotations = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
 
     @tool_decorator(
         name=load_name,
@@ -470,12 +611,7 @@ def register_load_tools(
             "notifications/tools/list_changed. "
             f"Clients that do not refresh tool lists should use {exec_name} instead."
         ),
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
-        ),
+        annotations=load_annotations,
     )
     async def load_tools_handler(tools: List[str], ctx: Context) -> dict:
         """Load specific tools and notify the client."""
@@ -502,7 +638,7 @@ def register_load_tools(
 
         if loaded:
             try:
-                await ctx.session.send_tool_list_changed()
+                await ctx.notify_tools_changed()
                 logger.info("Sent notifications/tools/list_changed after loading: %s", loaded)
             except Exception as e:
                 logger.warning("Failed to send tool_list_changed notification: %s", e)
@@ -546,6 +682,7 @@ def register_load_tools(
                 "message": {"type": "string", "description": "Summary message"},
             },
         },
+        annotations=normalize_tool_annotations(load_annotations),
     )
 
     logger.info("Registered %s meta-tool for dynamic tool loading", load_name)

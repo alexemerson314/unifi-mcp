@@ -6,8 +6,9 @@ endpoint with deep_merge.
 """
 
 import copy
+import logging
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -43,11 +44,25 @@ def _make_mock_connection(routes: list | None = None):
     conn = MagicMock()
     conn.ensure_connected = AsyncMock(return_value=True)
     conn.request = AsyncMock(return_value={})
+    conn.host = "127.0.0.1"
+    conn.port = 443
     conn.site = "default"
     conn.get_cached = MagicMock(return_value=None)
     conn._update_cache = MagicMock()
     conn._invalidate_cache = MagicMock()
     return conn
+
+
+def _seed_both_traffic_route_caches(mock_connection):
+    """Populate the distinct guarded and legacy route cache representations."""
+    cache = {
+        "traffic_routes_default": [{"_id": "guarded-route"}],
+        "legacy_traffic_routes_default": ["legacy-route-wrapper"],
+    }
+    mock_connection._invalidate_cache.side_effect = lambda prefix: [
+        cache.pop(key) for key in list(cache) if key.startswith(prefix)
+    ]
+    return cache
 
 
 @pytest.fixture
@@ -62,34 +77,52 @@ def firewall_manager(mock_connection):
     return FirewallManager(mock_connection)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["source", "destination"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [{"ports": ["445"]}, {"port_matching_type": "SPECIFIC"}, {"port_matching_type": "SPECIFIC", "port": 445}],
+)
+async def test_create_policy_rejects_invalid_ports_before_connection(
+    firewall_manager, mock_connection, direction, endpoint
+):
+    with pytest.raises(ValueError, match=rf"{direction}\.port"):
+        await firewall_manager.create_firewall_policy({direction: endpoint})
+    mock_connection.ensure_connected.assert_not_awaited()
+    mock_connection.request.assert_not_awaited()
+
+
 class TestUpdateTrafficRouteMutationSafety:
     """Ensure update_traffic_route does not mutate the cached TrafficRoute.raw."""
 
     @pytest.mark.asyncio
     async def test_does_not_mutate_cached_route(self, firewall_manager, mock_connection):
-        """The cached TrafficRoute.raw must be unchanged after update_traffic_route."""
+        """The guarded path bypasses cached data and leaves it untouched."""
         route = _make_traffic_route()
         original_raw = copy.deepcopy(route.raw)
+        fresh_raw = {**copy.deepcopy(route.raw), "description": "Fresh route"}
+        mock_connection.get_cached.return_value = [route]
+        mock_connection.request = AsyncMock(side_effect=[{"data": [fresh_raw]}, {}])
 
-        with patch.object(firewall_manager, "get_traffic_routes", new_callable=AsyncMock, return_value=[route]):
-            await firewall_manager.update_traffic_route("route001", {"description": "Changed", "enabled": False})
+        await firewall_manager.update_traffic_route("route001", {"description": "Changed", "enabled": False})
 
         assert route.raw == original_raw
+        mock_connection.get_cached.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_happy_path_sends_merged_payload(self, firewall_manager, mock_connection):
         """The API request should contain original fields merged with updates."""
         route = _make_traffic_route()
         updates = {"description": "Updated route", "kill_switch_enabled": True}
+        mock_connection.request = AsyncMock(side_effect=[{"data": [route.raw]}, {}])
 
-        with patch.object(firewall_manager, "get_traffic_routes", new_callable=AsyncMock, return_value=[route]):
-            result = await firewall_manager.update_traffic_route("route001", updates)
+        result = await firewall_manager.update_traffic_route("route001", updates)
 
         assert result is True
-        mock_connection.request.assert_called_once()
+        assert mock_connection.request.await_count == 2
 
-        call_args = mock_connection.request.call_args
-        api_request = call_args[0][0]
+        get_request, api_request = [call.args[0] for call in mock_connection.request.await_args_list]
+        assert get_request.method == "get"
         payload = api_request.data
 
         # Original fields preserved
@@ -106,17 +139,209 @@ class TestUpdateTrafficRouteMutationSafety:
         route = _make_traffic_route()
         original_raw = copy.deepcopy(route.raw)
 
-        mock_connection.request = AsyncMock(side_effect=Exception("API error"))
+        mock_connection.request = AsyncMock(side_effect=[{"data": [route.raw]}, Exception("API error")])
 
-        with patch.object(firewall_manager, "get_traffic_routes", new_callable=AsyncMock, return_value=[route]):
-            with pytest.raises(Exception, match="API error"):
-                await firewall_manager.update_traffic_route("route001", {"description": "Should not persist"})
+        with pytest.raises(Exception, match="API error"):
+            await firewall_manager.update_traffic_route("route001", {"description": "Should not persist"})
 
         assert route.raw == original_raw
 
 
+class TestLegacyTrafficRouteSafety:
+    """Legacy FirewallManager route mutations must use the guarded Core path."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_enabling_unsafe_internet_route(self, firewall_manager, mock_connection):
+        unsafe_route = {
+            "_id": "route-unsafe",
+            "matching_target": "INTERNET",
+            "enabled": False,
+            "network_id": "vpn-target",
+            "target_devices": [{"type": "ALL_CLIENTS"}],
+        }
+        mock_connection.request = AsyncMock(return_value={"data": [unsafe_route]})
+
+        with pytest.raises(ValueError, match="exactly one explicit CLIENT"):
+            await firewall_manager.update_traffic_route("route-unsafe", {"enabled": True})
+
+        assert mock_connection.request.await_count == 1
+        assert mock_connection.request.await_args_list[0].args[0].method == "get"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["list", "delete"])
+    async def test_failure_logs_no_identifiers_or_exception_text(
+        self, firewall_manager, mock_connection, caplog, operation
+    ):
+        route_id = "private-route-id"
+        private = f"{route_id} mac-address-placeholder controller-secret-value"
+        mock_connection.request = AsyncMock(side_effect=RuntimeError(private))
+
+        invoke = (
+            firewall_manager.get_traffic_routes()
+            if operation == "list"
+            else firewall_manager.delete_traffic_route(route_id)
+        )
+        with caplog.at_level(logging.DEBUG, logger="unifi-network-mcp"):
+            with pytest.raises(RuntimeError):
+                await invoke
+
+        for value in (route_id, "mac-address-placeholder", "controller-secret-value"):
+            assert value not in caplog.text
+            assert all(value not in repr(record.args) for record in caplog.records)
+        assert all(record.exc_info is None for record in caplog.records)
+        assert "RuntimeError" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_successful_delete_logs_no_route_identifier(self, firewall_manager, mock_connection, caplog):
+        route_id = "private-route-id"
+
+        with caplog.at_level(logging.DEBUG, logger="unifi-network-mcp"):
+            assert await firewall_manager.delete_traffic_route(route_id) is True
+
+        assert route_id not in caplog.text
+        assert all(route_id not in repr(record.args) for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_delete_invalidates_both_route_cache_representations(self, firewall_manager, mock_connection):
+        cache = _seed_both_traffic_route_caches(mock_connection)
+
+        assert await firewall_manager.delete_traffic_route("route-delete") is True
+
+        assert cache == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_invalidates_route_caches_when_response_is_lost(self, firewall_manager, mock_connection):
+        cache = _seed_both_traffic_route_caches(mock_connection)
+        mock_connection.request = AsyncMock(side_effect=RuntimeError("response lost"))
+
+        with pytest.raises(RuntimeError, match="response lost"):
+            await firewall_manager.delete_traffic_route("route-delete")
+
+        assert cache == {}
+
+    @pytest.mark.asyncio
+    async def test_create_invalidates_both_route_cache_representations(self, firewall_manager, mock_connection):
+        cache = _seed_both_traffic_route_caches(mock_connection)
+        mock_connection.request = AsyncMock(return_value={"data": {"_id": "route-create"}})
+
+        assert await firewall_manager.create_traffic_route(
+            {
+                "description": "Domain route",
+                "matching_target": "DOMAIN",
+                "network_id": "vpn-target",
+                "domains": [{"domain": "example.com"}],
+            }
+        ) == {
+            "success": True,
+            "route_id": "route-create",
+        }
+
+        assert cache == {}
+
+    @pytest.mark.asyncio
+    async def test_create_uses_injected_manager_and_preserves_failure_envelope(self, mock_connection):
+        from unifi_core.network.managers.firewall_manager import FirewallManager
+
+        traffic_route_manager = MagicMock()
+        traffic_route_manager.create_traffic_route = AsyncMock(return_value={"_id": "route-injected"})
+        firewall_manager = FirewallManager(mock_connection, traffic_route_manager=traffic_route_manager)
+
+        assert await firewall_manager.create_traffic_route({"matching_target": "DOMAIN"}) == {
+            "success": True,
+            "route_id": "route-injected",
+        }
+        traffic_route_manager.create_traffic_route.assert_awaited_once_with({"matching_target": "DOMAIN"})
+
+        traffic_route_manager.create_traffic_route = AsyncMock(side_effect=RuntimeError("controller failed"))
+        assert await firewall_manager.create_traffic_route({"matching_target": "DOMAIN"}) == {
+            "success": False,
+            "error": "Failed to create traffic route; it may have been created. List routes before retrying.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_preflight_rejection_does_not_claim_an_uncertain_write(
+        self, firewall_manager, mock_connection
+    ):
+        result = await firewall_manager.create_traffic_route(
+            {
+                "description": "Internet route",
+                "matching_target": "INTERNET",
+                "network_id": "wan-target",
+                "target_devices": [{"type": "ALL_CLIENTS"}],
+            }
+        )
+
+        assert result["success"] is False
+        assert "exactly one explicit CLIENT" in result["error"]
+        assert "may have been created" not in result["error"]
+        mock_connection.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_wan_lookup_failure_does_not_claim_an_uncertain_write(self, firewall_manager, mock_connection):
+        firewall_manager._traffic_route_manager._network_manager.get_network_details = AsyncMock(
+            side_effect=RuntimeError("controller response with sensitive text")
+        )
+
+        result = await firewall_manager.create_traffic_route(
+            {
+                "description": "Internet route",
+                "matching_target": "INTERNET",
+                "network_id": "wan-target",
+                "target_devices": [{"type": "CLIENT", "client_mac": "02:11:22:33:44:55"}],
+            }
+        )
+
+        assert result["success"] is False
+        assert "Could not verify the target WAN network" in result["error"]
+        assert "may have been created" not in result["error"]
+        assert "sensitive text" not in result["error"]
+        mock_connection.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_invalidates_both_route_cache_representations(self, firewall_manager, mock_connection):
+        cache = _seed_both_traffic_route_caches(mock_connection)
+        route = {"_id": "route-update", "matching_target": "DOMAIN", "enabled": True}
+        mock_connection.request = AsyncMock(side_effect=[{"data": [route]}, {}])
+
+        assert await firewall_manager.update_traffic_route("route-update", {"description": "Updated"}) is True
+
+        assert cache == {}
+
+    @pytest.mark.asyncio
+    async def test_toggle_invalidates_both_route_cache_representations(self, firewall_manager, mock_connection):
+        cache = _seed_both_traffic_route_caches(mock_connection)
+        route = {"_id": "route-toggle", "matching_target": "DOMAIN", "enabled": True}
+        mock_connection.request = AsyncMock(side_effect=[{"data": [route]}, {"data": [route]}, {}])
+
+        assert await firewall_manager.toggle_traffic_route("route-toggle") is True
+
+        assert cache == {}
+
+    @pytest.mark.asyncio
+    async def test_legacy_listing_does_not_poison_guarded_route_lookup(self, firewall_manager, mock_connection):
+        """Legacy wrappers and guarded dictionaries must never share a cache entry."""
+        cache = {}
+        route = copy.deepcopy(SAMPLE_ROUTE_RAW)
+        mock_connection.get_cached.side_effect = lambda key: cache.get(key)
+        mock_connection._update_cache.side_effect = lambda key, value: cache.__setitem__(key, value)
+        mock_connection.request = AsyncMock(side_effect=[{"data": [route]}, {"data": [route]}])
+
+        legacy_routes = await firewall_manager.get_traffic_routes()
+        guarded_route = await firewall_manager._traffic_route_manager.get_traffic_route_details("route001")
+
+        assert legacy_routes[0].raw == route
+        assert guarded_route == route
+        assert mock_connection.request.await_count == 2
+
+
+def test_runtime_reuses_cached_traffic_route_manager_for_firewall_compatibility() -> None:
+    from unifi_network_mcp import runtime
+
+    assert runtime.firewall_manager._traffic_route_manager is runtime.traffic_route_manager
+
+
 # ---------------------------------------------------------------------------
-# update_firewall_policy — endpoint and merge tests (issue #124)
+# update_firewall_policy — endpoint and merge tests
 # ---------------------------------------------------------------------------
 
 SAMPLE_POLICY_RAW = {
@@ -197,6 +422,24 @@ class TestUpdateFirewallPolicyEndpoint:
         assert payload["source"]["network_ids"] == ["net001"]
 
     @pytest.mark.asyncio
+    async def test_none_inside_an_endpoint_removes_the_key_from_the_payload(self, firewall_manager, mock_connection):
+        """A retired selector (value None) must not be sent as null; the controller stores selectors only
+        under their activating enum, so the key is dropped from the merged endpoint."""
+        raw = copy.deepcopy(SAMPLE_POLICY_RAW)
+        raw["destination"].update({"port_matching_type": "SPECIFIC", "port": "53"})
+        policy = _make_firewall_policy(raw)
+
+        with patch.object(firewall_manager, "get_firewall_policies", new_callable=AsyncMock, return_value=[policy]):
+            await firewall_manager.update_firewall_policy(
+                "pol001", {"destination": {"port_matching_type": "ANY", "port": None}}
+            )
+
+        payload = mock_connection.request.call_args[0][0].data
+        assert payload["destination"]["port_matching_type"] == "ANY"
+        assert "port" not in payload["destination"]
+        assert payload["destination"]["zone_id"] == "zone-external"
+
+    @pytest.mark.asyncio
     async def test_does_not_mutate_cached_policy(self, firewall_manager, mock_connection):
         """The cached FirewallPolicy.raw must be unchanged after update."""
         policy = _make_firewall_policy()
@@ -267,7 +510,279 @@ class TestToggleFirewallPolicyPayload:
 
 
 # ---------------------------------------------------------------------------
-# ID-lookup iteration robustness — issue #151
+# firewall policy ordering — official integration API support
+# ---------------------------------------------------------------------------
+
+
+class TestFirewallPolicyOrdering:
+    """Ordering is managed through the official integration API, not index PUTs."""
+
+    class _ResponseContext:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Response:
+        def __init__(self, status=200, json_body=None, json_error=None, text_body=""):
+            self.status = status
+            self._json_body = json_body
+            self._json_error = json_error
+            self._text_body = text_body
+
+        async def json(self, content_type=None):
+            if self._json_error is not None:
+                raise self._json_error
+            return self._json_body
+
+        async def text(self):
+            return self._text_body
+
+    class _Session:
+        def __init__(self, response):
+            self.response = response
+            self.closed = False
+            self.calls = []
+
+        def request(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return TestFirewallPolicyOrdering._ResponseContext(self.response)
+
+        async def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _manager_with_integration_response(mock_connection, response):
+        from unifi_core.network.managers.firewall_manager import FirewallManager
+
+        session = TestFirewallPolicyOrdering._Session(response)
+        auth = MagicMock()
+        auth.has_api_key = True
+        auth.get_api_key_session = AsyncMock(return_value=session)
+        return FirewallManager(mock_connection, auth), session
+
+    @pytest.mark.asyncio
+    async def test_ordering_requires_api_key(self, firewall_manager):
+        with pytest.raises(RuntimeError, match="requires a UniFi API key"):
+            await firewall_manager._request_integration_api("get", "/v1/sites")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("verify_ssl", [True, False])
+    async def test_integration_api_binds_key_to_controller_without_redirects(self, mock_connection, verify_ssl):
+        mock_connection.verify_ssl = verify_ssl
+        response = self._Response(status=200, json_body={"data": []})
+        manager, session = self._manager_with_integration_response(mock_connection, response)
+
+        await manager._request_integration_api("get", "/v1/sites")
+
+        manager._auth.get_api_key_session.assert_awaited_once_with("https://127.0.0.1:443")
+        (_method, url), kwargs = session.calls[0]
+        assert url == "https://127.0.0.1:443/proxy/network/integration/v1/sites"
+        assert kwargs["ssl"] is verify_ssl
+        assert kwargs["allow_redirects"] is False
+
+    @pytest.mark.asyncio
+    async def test_integration_api_treats_redirect_as_error(self, mock_connection):
+        response = self._Response(status=302, json_error=ValueError("not json"), text_body="")
+        manager, session = self._manager_with_integration_response(mock_connection, response)
+
+        with pytest.raises(RuntimeError, match="Integration API returned 302"):
+            await manager._request_integration_api("get", "/v1/sites")
+
+        assert session.closed is True
+
+    @pytest.mark.asyncio
+    async def test_integration_api_reports_non_json_error_body(self, mock_connection):
+        response = self._Response(status=502, json_error=ValueError("not json"), text_body="<html>bad gateway</html>")
+        manager, session = self._manager_with_integration_response(mock_connection, response)
+
+        with pytest.raises(RuntimeError, match="Integration API returned 502.*bad gateway"):
+            await manager._request_integration_api("get", "/v1/sites")
+
+        assert session.closed is True
+
+    @pytest.mark.asyncio
+    async def test_integration_api_reports_empty_error_body(self, mock_connection):
+        response = self._Response(status=500, json_error=ValueError("not json"), text_body="")
+        manager, _session = self._manager_with_integration_response(mock_connection, response)
+
+        with pytest.raises(RuntimeError, match="Integration API returned 500.*<empty body>"):
+            await manager._request_integration_api("get", "/v1/sites")
+
+    @pytest.mark.asyncio
+    async def test_integration_api_reports_non_json_success_body(self, mock_connection):
+        response = self._Response(status=200, json_error=ValueError("not json"), text_body="OK")
+        manager, _session = self._manager_with_integration_response(mock_connection, response)
+
+        with pytest.raises(RuntimeError, match="Integration API returned non-JSON response.*OK"):
+            await manager._request_integration_api("get", "/v1/sites")
+
+    @pytest.mark.asyncio
+    async def test_get_policy_ordering_uses_integration_endpoint(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock(
+            side_effect=[
+                {"data": [{"id": "site-uuid", "name": "default"}]},
+                {"data": [{"id": "zone-src", "name": "Internal"}, {"id": "zone-dst", "name": "External"}]},
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}},
+            ]
+        )
+
+        result = await firewall_manager.get_firewall_policy_ordering("zone-src", "zone-dst")
+
+        assert result["orderedFirewallPolicyIds"]["beforeSystemDefined"] == ["allow"]
+        call = firewall_manager._request_integration_api.call_args_list[1]
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/zones"
+        call = firewall_manager._request_integration_api.call_args_list[2]
+        assert call.args[0] == "get"
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/policies/ordering"
+        assert call.kwargs["params"] == {
+            "sourceFirewallZoneId": "zone-src",
+            "destinationFirewallZoneId": "zone-dst",
+        }
+
+    @pytest.mark.asyncio
+    async def test_reorder_policy_ordering_sends_complete_payload(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock(
+            side_effect=[
+                {"data": [{"id": "site-uuid", "name": "default"}]},
+                {"data": [{"id": "zone-src", "name": "Internal"}, {"id": "zone-dst", "name": "External"}]},
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}},
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}},
+            ]
+        )
+        ordering = {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}
+
+        result = await firewall_manager.reorder_firewall_policies("zone-src", "zone-dst", ordering)
+
+        assert result["orderedFirewallPolicyIds"] == ordering
+        call = firewall_manager._request_integration_api.call_args_list[1]
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/zones"
+        call = firewall_manager._request_integration_api.call_args_list[2]
+        assert call.args[0] == "get"
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/policies/ordering"
+        call = firewall_manager._request_integration_api.call_args_list[3]
+        assert call.args[0] == "put"
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/policies/ordering"
+        assert call.kwargs["data"] == {"orderedFirewallPolicyIds": ordering}
+        firewall_manager._connection._invalidate_cache.assert_any_call(
+            "firewall_policy_ordering_zone-src_zone-dst_default"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reorder_policy_ordering_ignores_cached_ordering_for_validation(self, firewall_manager):
+        stale_ordering = {
+            "orderedFirewallPolicyIds": {
+                "beforeSystemDefined": ["stale-allow"],
+                "afterSystemDefined": ["stale-block"],
+            }
+        }
+
+        def fake_get_cached(key):
+            if key == "firewall_policy_ordering_zone-src_zone-dst_default":
+                return stale_ordering
+            return None
+
+        firewall_manager._connection.get_cached.side_effect = fake_get_cached
+        firewall_manager._request_integration_api = AsyncMock(
+            side_effect=[
+                {"data": [{"id": "site-uuid", "name": "default"}]},
+                {"data": [{"id": "zone-src", "name": "Internal"}, {"id": "zone-dst", "name": "External"}]},
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}},
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}},
+            ]
+        )
+        ordering = {"beforeSystemDefined": ["allow"], "afterSystemDefined": ["block"]}
+
+        result = await firewall_manager.reorder_firewall_policies("zone-src", "zone-dst", ordering)
+
+        assert result["orderedFirewallPolicyIds"] == ordering
+        calls = firewall_manager._request_integration_api.call_args_list
+        assert calls[2].args[0] == "get"
+        assert calls[2].args[1] == "/v1/sites/site-uuid/firewall/policies/ordering"
+        assert calls[3].args[0] == "put"
+
+    @pytest.mark.asyncio
+    async def test_reorder_rejects_duplicate_policy_ids_before_api_call(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock()
+        ordering = {"beforeSystemDefined": ["allow", "allow"], "afterSystemDefined": ["block"]}
+
+        with pytest.raises(ValueError, match="duplicate policy IDs: allow"):
+            await firewall_manager.reorder_firewall_policies("zone-src", "zone-dst", ordering)
+
+        firewall_manager._request_integration_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reorder_rejects_non_string_policy_ids_before_api_call(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock()
+        ordering = {"beforeSystemDefined": ["allow", None], "afterSystemDefined": ["block"]}
+
+        with pytest.raises(ValueError, match="non-empty policy ID strings"):
+            await firewall_manager.reorder_firewall_policies("zone-src", "zone-dst", ordering)
+
+        firewall_manager._request_integration_api.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reorder_rejects_payload_that_drops_current_policy(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock(
+            side_effect=[
+                {"data": [{"id": "site-uuid", "name": "default"}]},
+                {"data": [{"id": "zone-src", "name": "Internal"}, {"id": "zone-dst", "name": "External"}]},
+                {
+                    "orderedFirewallPolicyIds": {
+                        "beforeSystemDefined": ["allow-1", "allow-2"],
+                        "afterSystemDefined": ["block-1"],
+                    }
+                },
+            ]
+        )
+        ordering = {"beforeSystemDefined": ["allow-1"], "afterSystemDefined": ["block-1"]}
+
+        with pytest.raises(ValueError, match="Missing: allow-2; unexpected: none"):
+            await firewall_manager.reorder_firewall_policies("zone-src", "zone-dst", ordering)
+
+        assert firewall_manager._request_integration_api.call_count == 3
+        assert firewall_manager._request_integration_api.call_args_list[-1].args[0] == "get"
+
+    @pytest.mark.asyncio
+    async def test_policy_ordering_translates_v2_zone_ids_to_integration_ids(self, firewall_manager):
+        firewall_manager._request_integration_api = AsyncMock(
+            side_effect=[
+                {"data": [{"id": "site-uuid", "name": "default"}]},
+                {
+                    "data": [
+                        {"id": "integration-internal", "name": "Internal"},
+                        {"id": "integration-external", "name": "External"},
+                    ]
+                },
+                {"orderedFirewallPolicyIds": {"beforeSystemDefined": [], "afterSystemDefined": []}},
+            ]
+        )
+
+        with patch.object(
+            firewall_manager,
+            "get_firewall_zones",
+            new_callable=AsyncMock,
+            return_value=[
+                {"_id": "v2-internal", "name": "Internal", "zone_key": "internal"},
+                {"_id": "v2-external", "name": "External", "zone_key": "external"},
+            ],
+        ):
+            await firewall_manager.get_firewall_policy_ordering("v2-internal", "v2-external")
+
+        call = firewall_manager._request_integration_api.call_args_list[2]
+        assert call.args[1] == "/v1/sites/site-uuid/firewall/policies/ordering"
+        assert call.kwargs["params"] == {
+            "sourceFirewallZoneId": "integration-internal",
+            "destinationFirewallZoneId": "integration-external",
+        }
+
+
+# ---------------------------------------------------------------------------
+# ID-lookup iteration robustness
 #
 # `next((x for x in items if x.id == target), None)` over aiounifi item
 # objects raises KeyError when any item in the list has a `raw` dict missing
@@ -279,7 +794,6 @@ class TestToggleFirewallPolicyPayload:
 # ---------------------------------------------------------------------------
 
 from aiounifi.models.port_forward import PortForward  # noqa: E402
-from aiounifi.models.traffic_route import TrafficRoute  # noqa: E402
 
 
 class TestPortForwardLookupRobustness:
@@ -310,27 +824,23 @@ class TestPortForwardLookupRobustness:
 
 
 class TestTrafficRouteLookupRobustness:
-    """update_/toggle_ traffic_route must not be poisoned by a malformed sibling route."""
+    """Guarded traffic-route updates tolerate malformed controller siblings."""
 
     @pytest.mark.asyncio
     async def test_update_finds_route_after_malformed_entry(self, firewall_manager, mock_connection):
-        good_target = TrafficRoute(copy.deepcopy(SAMPLE_ROUTE_RAW))
-        malformed = TrafficRoute({"description": "broken-no-id", "enabled": True})
+        good_target = copy.deepcopy(SAMPLE_ROUTE_RAW)
+        malformed = {"description": "broken-no-id", "enabled": True}
+        mock_connection.request = AsyncMock(side_effect=[{"data": [malformed, good_target]}, {}])
 
-        with patch.object(
-            firewall_manager,
-            "get_traffic_routes",
-            new_callable=AsyncMock,
-            return_value=[malformed, good_target],
-        ):
-            result = await firewall_manager.update_traffic_route("route001", {"description": "Updated"})
+        result = await firewall_manager.update_traffic_route("route001", {"description": "Updated"})
 
         assert result is True
-        mock_connection.request.assert_called_once()
+        assert mock_connection.request.await_count == 2
+        assert mock_connection.request.await_args_list[0].args[0].method == "get"
 
 
 # ---------------------------------------------------------------------------
-# get_firewall_zones — Network 10.2+ /firewall/zone-matrix support (issue #154)
+# get_firewall_zones — Network 10.2+ /firewall/zone-matrix support
 #
 # - Primary path /firewall/zone-matrix succeeds → returns zone metadata with
 #   the inter-zone policy-count `data` matrix stripped.
@@ -366,6 +876,81 @@ SAMPLE_LEGACY_ZONES_RESPONSE = [
     {"_id": "zone-internal", "name": "Internal", "zone_key": "internal"},
     {"_id": "zone-external", "name": "External", "zone_key": "external"},
 ]
+
+
+# ---------------------------------------------------------------------------
+# get_legacy_firewall_rules — legacy v1 REST support
+# ---------------------------------------------------------------------------
+
+
+class TestGetLegacyFirewallRules:
+    """Cover retrieval and caching of legacy firewall rules."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_rules_and_updates_cache(
+        self,
+        firewall_manager,
+        mock_connection,
+    ):
+        """Rules are fetched from /rest/firewallrule and cached for the site."""
+        expected_rules = [
+            {
+                "_id": "rule-001",
+                "name": "Allow established traffic",
+                "ruleset": "LAN_IN",
+                "rule_index": 2000,
+                "action": "accept",
+                "enabled": True,
+            },
+            {
+                "_id": "rule-002",
+                "name": "Block guest access",
+                "ruleset": "GUEST_IN",
+                "rule_index": 2010,
+                "action": "drop",
+                "enabled": True,
+            },
+        ]
+        mock_connection.request = AsyncMock(return_value=expected_rules)
+
+        result = await firewall_manager.get_legacy_firewall_rules()
+
+        assert result == expected_rules
+        mock_connection.ensure_connected.assert_awaited_once()
+        mock_connection.request.assert_awaited_once()
+
+        api_request = mock_connection.request.call_args.args[0]
+        assert api_request.method == "get"
+        assert api_request.path == "/rest/firewallrule"
+
+        mock_connection._update_cache.assert_called_once_with(
+            "legacy_firewall_rules_default",
+            expected_rules,
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_cached_rules_without_controller_request(
+        self,
+        firewall_manager,
+        mock_connection,
+    ):
+        """A cached result bypasses connection and controller requests."""
+        cached_rules = [
+            {
+                "_id": "rule-cached",
+                "name": "Cached legacy rule",
+                "ruleset": "LAN_LOCAL",
+                "action": "accept",
+            }
+        ]
+        mock_connection.get_cached.return_value = cached_rules
+
+        result = await firewall_manager.get_legacy_firewall_rules()
+
+        assert result == cached_rules
+        mock_connection.ensure_connected.assert_not_awaited()
+        mock_connection.request.assert_not_awaited()
+        mock_connection._update_cache.assert_not_called()
 
 
 class TestGetFirewallZones:
@@ -432,11 +1017,11 @@ class TestGetFirewallZones:
 
 
 # ---------------------------------------------------------------------------
-# create_port_forward — V1 POST response shape handling (issue #207)
+# create_port_forward — V1 POST response shape handling
 #
 # UDM-SE 8.4.x returns a bare list `[{...}]` from POST /rest/portforward
 # while older firmware returns the wrapped shape `{"data": [{...}]}`. The
-# manager must extract the created rule from both shapes — see #207.
+# manager must extract the created rule from both shapes.
 # ---------------------------------------------------------------------------
 
 
@@ -445,12 +1030,12 @@ SAMPLE_CREATED_PORT_FORWARD = {
     "name": "test",
     "dst_port": "80",
     "fwd_port": "80",
-    "fwd_ip": "10.0.0.1",
+    "fwd": "10.0.0.1",
 }
 
 
 class TestCreatePortForwardResponseShapes:
-    """Issue #207 — create_port_forward must accept both wrapped and bare-list responses."""
+    """create_port_forward must accept both wrapped and bare-list responses."""
 
     @pytest.mark.asyncio
     async def test_create_port_forward_handles_wrapped_response_shape(self, firewall_manager, mock_connection):
@@ -458,7 +1043,7 @@ class TestCreatePortForwardResponseShapes:
         mock_connection.request = AsyncMock(return_value={"data": [copy.deepcopy(SAMPLE_CREATED_PORT_FORWARD)]})
 
         result = await firewall_manager.create_port_forward(
-            {"name": "test", "dst_port": "80", "fwd_port": "80", "fwd_ip": "10.0.0.1"}
+            {"name": "test", "dst_port": "80", "fwd_port": "80", "fwd": "10.0.0.1"}
         )
 
         assert result is not None
@@ -467,13 +1052,711 @@ class TestCreatePortForwardResponseShapes:
 
     @pytest.mark.asyncio
     async def test_create_port_forward_handles_bare_list_response_shape(self, firewall_manager, mock_connection):
-        """UDM-SE 8.4.x returns [{...}] — manager must extract the rule (regression test for #207)."""
+        """UDM-SE 8.4.x returns [{...}] and the manager extracts the rule."""
         mock_connection.request = AsyncMock(return_value=[copy.deepcopy(SAMPLE_CREATED_PORT_FORWARD)])
 
         result = await firewall_manager.create_port_forward(
-            {"name": "test", "dst_port": "80", "fwd_port": "80", "fwd_ip": "10.0.0.1"}
+            {"name": "test", "dst_port": "80", "fwd_port": "80", "fwd": "10.0.0.1"}
         )
 
         assert result is not None
         assert result["_id"] == "abc123"
         assert result["name"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_requires_controller_forward_field(self, firewall_manager, mock_connection):
+        result = await firewall_manager.create_port_forward(
+            {"name": "test", "dst_port": "80", "fwd_port": "80", "fwd_ip": "10.0.0.1"}
+        )
+
+        assert result is None
+        mock_connection.request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# update_port_forward — full-object merge and persistence verification
+# ---------------------------------------------------------------------------
+
+
+class TestUpdatePortForward:
+    @pytest.mark.asyncio
+    async def test_preserves_unmentioned_fields_and_verifies_persistence(self, firewall_manager, mock_connection):
+        before_raw = {
+            "_id": "pf_001",
+            "name": "Web Server",
+            "enabled": True,
+            "fwd": "192.168.1.10",
+            "fwd_port": "443",
+        }
+        after_raw = {**before_raw, "fwd": "192.168.1.20"}
+        before = MagicMock(raw=copy.deepcopy(before_raw))
+        after = MagicMock(raw=after_raw)
+        events = []
+
+        async def get_rule(_rule_id):
+            events.append("lookup")
+            return before if len(events) == 1 else after
+
+        mock_connection._invalidate_cache.side_effect = lambda _key: events.append("invalidate")
+
+        with patch.object(
+            firewall_manager,
+            "get_port_forward_by_id",
+            new=AsyncMock(side_effect=get_rule),
+        ):
+            result = await firewall_manager.update_port_forward("pf_001", {"fwd": "192.168.1.20"})
+
+        assert result is True
+        request = mock_connection.request.call_args[0][0]
+        assert request.path == "/rest/portforward/pf_001"
+        assert request.data["fwd"] == "192.168.1.20"
+        assert request.data["fwd_port"] == "443"
+        assert before.raw == before_raw
+        assert events == ["lookup", "invalidate", "lookup"]
+        mock_connection._invalidate_cache.assert_called_once_with("port_forwards_default")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_controller_does_not_persist_update(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        before_raw = {"_id": "pf_001", "name": "Web Server", "fwd": "192.168.1.10"}
+        before = MagicMock(raw=copy.deepcopy(before_raw))
+        unchanged = MagicMock(raw=copy.deepcopy(before_raw))
+
+        with patch.object(
+            firewall_manager,
+            "get_port_forward_by_id",
+            new_callable=AsyncMock,
+            side_effect=[before, unchanged],
+        ):
+            with pytest.raises(UniFiOperationError, match="did not persist field.*fwd"):
+                await firewall_manager.update_port_forward("pf_001", {"fwd": "192.168.1.20"})
+
+    @pytest.mark.asyncio
+    async def test_raises_when_refetched_rule_is_malformed(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        before = MagicMock(raw={"_id": "pf_001", "fwd": "192.168.1.10"})
+        malformed = MagicMock(raw=None)
+
+        with patch.object(
+            firewall_manager,
+            "get_port_forward_by_id",
+            new_callable=AsyncMock,
+            side_effect=[before, malformed],
+        ):
+            with pytest.raises(UniFiOperationError, match="Could not verify port forward"):
+                await firewall_manager.update_port_forward("pf_001", {"fwd": "192.168.1.20"})
+
+
+# ---------------------------------------------------------------------------
+# delete_port_forward — V1 DELETE endpoint + guards
+# ---------------------------------------------------------------------------
+
+
+class TestDeletePortForward:
+    """Direct manager coverage for delete_port_forward (issued the V1 DELETE and invalidates cache)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_port_forward_success(self, firewall_manager, mock_connection):
+        """Happy path: issues DELETE /rest/portforward/<id>, invalidates cache, returns True."""
+        mock_connection.request = AsyncMock(return_value={})
+
+        result = await firewall_manager.delete_port_forward("pf_001")
+
+        assert result is True
+        api_request = mock_connection.request.call_args[0][0]
+        assert api_request.method == "delete"
+        assert api_request.path == "/rest/portforward/pf_001"
+        mock_connection._invalidate_cache.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_port_forward_not_connected_raises(self, firewall_manager, mock_connection):
+        """When the connection can't be established, raise ConnectionError before any request."""
+        mock_connection.ensure_connected = AsyncMock(return_value=False)
+
+        with pytest.raises(ConnectionError):
+            await firewall_manager.delete_port_forward("pf_001")
+
+        mock_connection.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_port_forward_reraises_request_error(self, firewall_manager, mock_connection):
+        """A controller/request error propagates (the manager re-raises)."""
+        mock_connection.request = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await firewall_manager.delete_port_forward("pf_001")
+
+
+class TestFirewallZoneCrud:
+    """Zone writes go through the integration API with a V2 _id ↔ UUID bridge."""
+
+    @pytest.fixture(autouse=True)
+    def _api_key_auth(self, firewall_manager):
+        firewall_manager._auth = MagicMock(has_api_key=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["create", "update", "delete"])
+    async def test_mutations_require_api_key_before_controller_io(self, firewall_manager, operation):
+        firewall_manager._auth = None
+        if operation == "create":
+            call = firewall_manager.create_firewall_zone("IoT")
+        elif operation == "update":
+            call = firewall_manager.update_firewall_zone("z1", "Devices")
+        else:
+            call = firewall_manager.delete_firewall_zone("z1")
+
+        with pytest.raises(RuntimeError, match="requires a UniFi API key"):
+            await call
+
+        firewall_manager._connection.ensure_connected.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_ids_do_not_match_literal_none(self, firewall_manager):
+        from unifi_core.exceptions import UniFiNotFoundError
+
+        with patch.object(
+            firewall_manager,
+            "_get_v2_zones_full",
+            new_callable=AsyncMock,
+            return_value=[{"name": "Missing IDs"}, {"_id": "real-zone", "name": "Real"}],
+        ):
+            with pytest.raises(UniFiNotFoundError):
+                await firewall_manager.get_firewall_zone_by_id("None")
+
+    @pytest.mark.asyncio
+    async def test_integration_zone_listing_fetches_all_pages(self, firewall_manager):
+        with patch.object(
+            firewall_manager,
+            "_request_integration_api",
+            new_callable=AsyncMock,
+            side_effect=[
+                {"data": [{"id": "uuid-1"}], "totalCount": 2},
+                {"data": [{"id": "uuid-2"}], "totalCount": 2},
+            ],
+        ) as request:
+            zones = await firewall_manager._get_integration_firewall_zones("sid")
+
+        assert zones == [{"id": "uuid-1"}, {"id": "uuid-2"}]
+        assert request.await_args_list == [
+            call(
+                "get",
+                "/v1/sites/sid/firewall/zones",
+                params={"limit": "200", "offset": "0"},
+            ),
+            call(
+                "get",
+                "/v1/sites/sid/firewall/zones",
+                params={"limit": "200", "offset": "1"},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_refuses_system_zone(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        with patch.object(
+            firewall_manager,
+            "_get_v2_zones_full",
+            new_callable=AsyncMock,
+            return_value=[{"_id": "z1", "name": "Internal", "external_id": "uuid-1", "default_zone": True}],
+        ):
+            with pytest.raises(UniFiOperationError):
+                await firewall_manager.delete_firewall_zone("z1")
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_system_zone(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        with patch.object(
+            firewall_manager,
+            "_get_v2_zones_full",
+            new_callable=AsyncMock,
+            return_value=[{"_id": "z1", "name": "Internal", "external_id": "uuid-1", "default_zone": True}],
+        ):
+            with pytest.raises(UniFiOperationError):
+                await firewall_manager.update_firewall_zone("z1", "Renamed")
+
+    @pytest.mark.asyncio
+    async def test_delete_happy_path(self, firewall_manager):
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                side_effect=[
+                    [{"_id": "z1", "name": "IoT", "external_id": "uuid-1", "default_zone": False}],
+                    [],
+                ],
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_integration_firewall_zones",
+                new_callable=AsyncMock,
+                side_effect=[
+                    [{"id": "uuid-1", "name": "IoT", "networkIds": []}],
+                    [],
+                ],
+            ),
+            patch.object(
+                firewall_manager,
+                "_request_integration_api",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as request,
+        ):
+            result = await firewall_manager.delete_firewall_zone("z1")
+
+        assert result is True
+        request.assert_awaited_once_with("delete", "/v1/sites/sid/firewall/zones/uuid-1")
+        firewall_manager._connection._invalidate_cache.assert_any_call("integration_firewall_zones_sid")
+        firewall_manager._connection._invalidate_cache.assert_any_call("firewall_policy_ordering")
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_integration_api_network_ids(self, firewall_manager):
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                side_effect=[
+                    [
+                        {
+                            "_id": "v2-zone",
+                            "name": "IoT",
+                            "external_id": "integration-zone",
+                            # This is deliberately a V2 identifier and must not be written.
+                            "network_ids": ["v2-network-id"],
+                        }
+                    ],
+                    [
+                        {
+                            "_id": "v2-zone",
+                            "name": "Devices",
+                            "external_id": "integration-zone",
+                            "network_ids": ["v2-network-id"],
+                        }
+                    ],
+                ],
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_integration_firewall_zones",
+                new_callable=AsyncMock,
+                side_effect=[
+                    [
+                        {
+                            "id": "integration-zone",
+                            "name": "IoT",
+                            "networkIds": ["integration-network-uuid"],
+                        }
+                    ],
+                    [
+                        {
+                            "id": "integration-zone",
+                            "name": "Devices",
+                            "networkIds": ["integration-network-uuid"],
+                        }
+                    ],
+                ],
+            ),
+            patch.object(
+                firewall_manager,
+                "_request_integration_api",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as request,
+        ):
+            result = await firewall_manager.update_firewall_zone("v2-zone", "Devices")
+
+        assert result is True
+        request.assert_awaited_once_with(
+            "put",
+            "/v1/sites/sid/firewall/zones/integration-zone",
+            data={"name": "Devices", "networkIds": ["integration-network-uuid"]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_aborts_when_integration_membership_is_missing(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                return_value=[{"_id": "v2-zone", "name": "IoT", "external_id": "integration-zone"}],
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_integration_firewall_zones",
+                new_callable=AsyncMock,
+                return_value=[{"id": "integration-zone", "name": "IoT"}],
+            ),
+            patch.object(firewall_manager, "_request_integration_api", new_callable=AsyncMock) as request,
+        ):
+            with pytest.raises(UniFiOperationError, match="did not include networkIds"):
+                await firewall_manager.update_firewall_zone("v2-zone", "Devices")
+
+        request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_controller_noop(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        v2_zone = {"_id": "v2-zone", "name": "IoT", "external_id": "integration-zone"}
+        integration_zone = {
+            "id": "integration-zone",
+            "name": "IoT",
+            "networkIds": ["integration-network-uuid"],
+        }
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                return_value=[v2_zone],
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_integration_firewall_zones",
+                new_callable=AsyncMock,
+                return_value=[integration_zone],
+            ),
+            patch.object(firewall_manager, "_request_integration_api", new_callable=AsyncMock, return_value={}),
+            patch(
+                "unifi_core.network.managers.firewall_manager.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with pytest.raises(UniFiOperationError, match="did not persist firewall zone rename"):
+                await firewall_manager.update_firewall_zone("v2-zone", "Devices")
+
+    @pytest.mark.asyncio
+    async def test_delete_rejects_controller_noop(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        v2_zone = {
+            "_id": "v2-zone",
+            "name": "IoT",
+            "external_id": "integration-zone",
+            "default_zone": False,
+        }
+        integration_zone = {"id": "integration-zone", "name": "IoT", "networkIds": []}
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                return_value=[v2_zone],
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_integration_firewall_zones",
+                new_callable=AsyncMock,
+                return_value=[integration_zone],
+            ),
+            patch.object(firewall_manager, "_request_integration_api", new_callable=AsyncMock, return_value={}),
+            patch(
+                "unifi_core.network.managers.firewall_manager.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with pytest.raises(UniFiOperationError, match="is still present"):
+                await firewall_manager.delete_firewall_zone("v2-zone")
+
+    def test_zone_bridge_fails_closed_instead_of_using_v2_id(self, firewall_manager):
+        from unifi_core.exceptions import UniFiOperationError
+
+        with pytest.raises(UniFiOperationError, match="Could not map V2 firewall zone"):
+            firewall_manager._resolve_integration_zone_record(
+                {"_id": "v2-zone", "name": "IoT"},
+                [{"id": "different-integration-zone", "name": "Guest", "networkIds": []}],
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_reads_back_v2_id(self, firewall_manager):
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_request_integration_api",
+                new_callable=AsyncMock,
+                return_value={"id": "uuid-new", "name": "IoT"},
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                return_value=[{"_id": "znew", "name": "IoT", "external_id": "uuid-new", "default_zone": False}],
+            ),
+        ):
+            zone = await firewall_manager.create_firewall_zone("IoT")
+
+        assert zone["_id"] == "znew"
+        firewall_manager._connection._invalidate_cache.assert_any_call("integration_firewall_zones_sid")
+        firewall_manager._connection._invalidate_cache.assert_any_call("firewall_policy_ordering")
+
+    @pytest.mark.asyncio
+    async def test_create_missing_v2_readback_raises(self, firewall_manager):
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_request_integration_api",
+                new_callable=AsyncMock,
+                return_value={"id": "uuid-new"},
+            ),
+            patch.object(firewall_manager, "_get_v2_zones_full", new_callable=AsyncMock, return_value=[]),
+        ):
+            from unifi_core.exceptions import UniFiOperationError
+
+            with pytest.raises(UniFiOperationError):
+                await firewall_manager.create_firewall_zone("IoT")
+
+    @pytest.mark.asyncio
+    async def test_create_retries_delayed_v2_readback(self, firewall_manager):
+        with (
+            patch.object(firewall_manager, "_get_integration_site_id", new_callable=AsyncMock, return_value="sid"),
+            patch.object(
+                firewall_manager,
+                "_request_integration_api",
+                new_callable=AsyncMock,
+                return_value={"id": "uuid-new"},
+            ),
+            patch.object(
+                firewall_manager,
+                "_get_v2_zones_full",
+                new_callable=AsyncMock,
+                side_effect=[[], [{"_id": "znew", "name": "IoT", "external_id": "uuid-new"}]],
+            ),
+            patch(
+                "unifi_core.network.managers.firewall_manager.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            zone = await firewall_manager.create_firewall_zone("IoT")
+
+        assert zone["_id"] == "znew"
+        sleep.assert_awaited_once()
+
+
+class TestUpdateFirewallPolicySelectorPath:
+    """Selector retirement and merged-state validation live in the manager, so every
+    caller (MCP wrapper, API dispatcher, direct Core use) gets the same behaviour."""
+
+    @staticmethod
+    def _stored(destination: dict) -> dict:
+        return {
+            "_id": "pol_zone_001",
+            "name": "disposable",
+            "enabled": False,
+            "action": "BLOCK",
+            "predefined": False,
+            "source": {"zone_id": "z1", "matching_target": "ANY"},
+            "destination": {"zone_id": "z1", "matching_target": "ANY", **destination},
+        }
+
+    @staticmethod
+    def _wire(mock_connection, stored: dict) -> list:
+        sent: list = []
+
+        async def request(api_request, *args, **kwargs):
+            if api_request.method == "get":
+                return [stored]
+            sent.append((api_request.method, api_request.data))
+            return {}
+
+        mock_connection.request = AsyncMock(side_effect=request)
+        return sent
+
+    @pytest.mark.asyncio
+    async def test_activation_change_retires_the_stored_port_in_the_put_body(self, firewall_manager, mock_connection):
+        stored = self._stored({"port_matching_type": "SPECIFIC", "port": "53"})
+        sent = self._wire(mock_connection, stored)
+
+        assert await firewall_manager.update_firewall_policy(
+            "pol_zone_001", {"destination": {"port_matching_type": "ANY"}}
+        )
+
+        assert [method for method, _ in sent] == ["put"]
+        body = sent[0][1]
+        assert body["destination"]["port_matching_type"] == "ANY"
+        assert "port" not in body["destination"]
+        assert body["source"] == stored["source"]
+        assert body["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_targeting_error_never_reaches_the_log(self, firewall_manager, mock_connection, caplog):
+        """The error goes back to the caller and, on the API, into a durable audit row.
+        It names the offending position, never the address (AGENTS.md privacy rule)."""
+        stored = self._stored({})
+        stored["source"] = {"zone_id": "z1", "matching_target": "CLIENT", "client_macs": ["aa:bb:cc:dd:ee:ff"]}
+        sent = self._wire(mock_connection, stored)
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ValueError) as excinfo:
+                await firewall_manager.update_firewall_policy(
+                    "pol_zone_001", {"source": {"client_macs": ["11:22:33:44:55:66", "not-a-mac"]}}
+                )
+
+        assert sent == []
+        for mac in ("11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"):
+            assert mac not in caplog.text
+            assert mac not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_update_is_not_an_operator_facing_error(self, firewall_manager, mock_connection, caplog):
+        """A mistyped selector is caller input, not a controller failure. create_firewall_policy
+        validates outside its try and logs nothing; the update path must match."""
+        stored = self._stored({"port_matching_type": "OBJECT", "port_group_id": "g1"})
+        self._wire(mock_connection, stored)
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ValueError):
+                await firewall_manager.update_firewall_policy(
+                    "pol_zone_001", {"destination": {"port_matching_type": "SPECIFIC"}}
+                )
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert not any(r.exc_info for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_caller_supplied_null_outside_the_selectors_still_reaches_the_controller(
+        self, firewall_manager, mock_connection
+    ):
+        """Retirement removes the three selector keys and nothing else. Dropping any other
+        null would turn a request the controller rejects into silent data loss."""
+        stored = self._stored({"port_matching_type": "SPECIFIC", "port": "53"})
+        sent = self._wire(mock_connection, stored)
+
+        assert await firewall_manager.update_firewall_policy(
+            "pol_zone_001", {"destination": {"port_matching_type": "ANY", "zone_id": None}}
+        )
+
+        body = sent[0][1]
+        assert "port" not in body["destination"]
+        assert body["destination"]["zone_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_untouched_side_is_not_stripped(self, firewall_manager, mock_connection):
+        stored = self._stored({})
+        stored["source"] = {"zone_id": "z1", "matching_target": "ANY", "client_macs": None}
+        sent = self._wire(mock_connection, stored)
+
+        assert await firewall_manager.update_firewall_policy("pol_zone_001", {"enabled": True})
+
+        assert sent[0][1]["source"] == stored["source"]
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_log_client_macs(self, firewall_manager, mock_connection, caplog):
+        mock_connection.request = AsyncMock(return_value={"_id": "new-policy"})
+
+        with caplog.at_level(logging.DEBUG):
+            await firewall_manager.create_firewall_policy(
+                {
+                    "name": "Admin workstations",
+                    "action": "ALLOW",
+                    "source": {"zone_id": "z1", "matching_target": "CLIENT", "client_macs": ["AA:BB:CC:DD:EE:FF"]},
+                    "destination": {"zone_id": "z2", "matching_target": "ANY"},
+                }
+            )
+
+        assert "aa:bb:cc:dd:ee:ff" not in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_create_sends_client_macs_in_the_canonical_colon_form(self, firewall_manager, mock_connection):
+        """Validation accepts dashed and bare-hex spellings; the controller reports colons."""
+        mock_connection.request = AsyncMock(return_value={"_id": "new-policy"})
+
+        await firewall_manager.create_firewall_policy(
+            {
+                "name": "Admin workstations",
+                "action": "ALLOW",
+                "source": {
+                    "zone_id": "z1",
+                    "matching_target": "CLIENT",
+                    "client_macs": ["AA-BB-CC-DD-EE-FF", "AABBCCDDEEFF"],
+                },
+            }
+        )
+
+        sent = mock_connection.request.call_args[0][0].data
+        assert sent["source"]["client_macs"] == ["aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:ff"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("endpoint", "expected"),
+        [
+            ({"matching_target": "any", "port_matching_type": "object"}, "port_group_id"),
+            # Only this one depends on the normalization: the selector table compares
+            # case-insensitively, validate_policy_port_targeting compares exactly.
+            ({"matching_target": "any", "port_matching_type": "specific"}, "destination.port"),
+            ({"matching_target": "client", "client_macs": []}, "client_macs"),
+        ],
+    )
+    async def test_create_validates_a_lower_case_endpoint_enum(
+        self, firewall_manager, mock_connection, endpoint, expected
+    ):
+        """The MCP tool normalizes before validating; every other caller of this manager
+        did not, and a lower-case enum used to skip the checks entirely."""
+        mock_connection.request = AsyncMock(return_value={"_id": "new-policy"})
+
+        with pytest.raises(ValueError, match=expected):
+            await firewall_manager.create_firewall_policy(
+                {"name": "x", "action": "ALLOW", "destination": {"zone_id": "z2", **endpoint}}
+            )
+
+        mock_connection.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_create_response_is_not_quoted_back(self, firewall_manager, mock_connection, caplog):
+        """A V2 create response echoes the policy document, client_macs included; it
+        reaches the tool's error field and the API audit row."""
+        mock_connection.request = AsyncMock(
+            return_value={"meta": {"rc": "error"}, "data": [{"client_macs": ["aa:bb:cc:dd:ee:ff"]}]}
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(RuntimeError) as excinfo:
+                await firewall_manager.create_firewall_policy(
+                    {
+                        "name": "Admin only",
+                        "action": "ALLOW",
+                        "source": {"zone_id": "z1", "matching_target": "CLIENT", "client_macs": ["aa:bb:cc:dd:ee:ff"]},
+                    }
+                )
+
+        assert "aa:bb:cc:dd:ee:ff" not in str(excinfo.value)
+        assert "aa:bb:cc:dd:ee:ff" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_stored_controller_null_survives_an_unrelated_update(self, firewall_manager, mock_connection):
+        """The PUT is a full document: only the keys this update retired are removed."""
+        stored = self._stored({"port_matching_type": "ANY", "port": None, "ips": None})
+        sent = self._wire(mock_connection, stored)
+
+        assert await firewall_manager.update_firewall_policy("pol_zone_001", {"destination": {"zone_id": "z9"}})
+
+        body = sent[0][1]["destination"]
+        assert body["zone_id"] == "z9"
+        assert body["port"] is None
+        assert body["ips"] is None
+
+    @pytest.mark.asyncio
+    async def test_selector_only_update_on_inactive_enum_is_rejected_before_any_put(
+        self, firewall_manager, mock_connection
+    ):
+        stored = self._stored({"port_matching_type": "ANY"})
+        sent = self._wire(mock_connection, stored)
+
+        with pytest.raises(ValueError, match="port_matching_type"):
+            await firewall_manager.update_firewall_policy("pol_zone_001", {"destination": {"port": "53"}})
+
+        assert sent == []

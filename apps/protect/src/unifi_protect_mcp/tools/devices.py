@@ -19,6 +19,9 @@ from unifi_core.protect.models.chimes import (
 from unifi_core.protect.models.chimes import (
     to_controller_update as chime_to_controller_update,
 )
+from unifi_core.protect.models.chimes import (
+    to_ring_setting_update as chime_to_ring_setting_update,
+)
 from unifi_core.protect.models.lights import (
     from_controller as light_from_controller,
 )
@@ -26,6 +29,7 @@ from unifi_core.protect.models.lights import (
     to_controller_update as light_to_controller_update,
 )
 from unifi_core.protect.models.sensors import from_controller as sensor_from_controller
+from unifi_core.protect.models.sensors import to_public_update as sensor_to_public_update
 from unifi_protect_mcp.runtime import chime_manager, light_manager, sensor_manager, server
 
 logger = logging.getLogger(__name__)
@@ -63,9 +67,10 @@ async def protect_list_lights() -> Dict[str, Any]:
         "Updates light settings such as on/off state, LED brightness level (1-6), "
         "PIR motion sensitivity (0-100), motion-triggered duration (15-900 seconds), "
         "status indicator light, and device name. Requires confirm=True to apply. "
-        "Supported keys: light_on, led_level, sensitivity, duration_seconds, status_light, name."
+        "Power, brightness, sensitivity and duration require UNIFI_PROTECT_API_KEY or UNIFI_API_KEY. "
+        "Supported keys: light_on (alias is_light_on), led_level, sensitivity, duration_seconds, status_light, name."
     ),
-    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     permission_category="light",
     permission_action="update",
 )
@@ -114,6 +119,12 @@ async def protect_update_light(
 
         # Apply the changes
         result = await light_manager.apply_light_settings(light_id, filtered)
+        if result.get("errors"):
+            return {
+                "success": False,
+                "error": "Failed to update light settings: " + "; ".join(result["errors"]),
+                "data": result,
+            }
         return {"success": True, "data": result}
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}
@@ -149,6 +160,64 @@ async def protect_list_sensors() -> Dict[str, Any]:
         return {"success": False, "error": f"Failed to list sensors: {e}"}
 
 
+@server.tool(
+    name="protect_update_sensor_settings",
+    auth="both",
+    description=(
+        "Updates UniFi Protect sensor settings. Get sensor_id values from protect_list_sensors. "
+        "Requires a Protect public API key configured on the server via UNIFI_PROTECT_API_KEY or UNIFI_API_KEY. "
+        "Requires confirm=True to apply. Supported keys: name, light_settings, humidity_settings, "
+        "temperature_settings, motion_settings, glass_break_settings, alarm_settings, schedule_mode, "
+        "arm_profile_ids, has_custom_sensitivity_when_armed. Use snake_case inside nested settings, for example "
+        "motion_settings.sensitivity_when_armed or light_settings.low_threshold."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    permission_category="sensor",
+    permission_action="update",
+)
+async def protect_update_sensor_settings(
+    sensor_id: Annotated[str, Field(description="Sensor device UUID from protect_list_sensors")],
+    settings: Annotated[
+        dict,
+        Field(
+            description=(
+                "Dictionary of sensor settings to update. Supported keys: name, light_settings, "
+                "humidity_settings, temperature_settings, motion_settings, glass_break_settings, "
+                "alarm_settings, schedule_mode, arm_profile_ids, has_custom_sensitivity_when_armed. "
+                "Nested setting dictionaries use snake_case keys."
+            )
+        ),
+    ],
+    confirm: Annotated[
+        bool,
+        Field(description="When true, executes the mutation. When false (default), returns a preview of the changes."),
+    ] = False,
+) -> Dict[str, Any]:
+    """Update sensor settings with preview/confirm."""
+    logger.info("protect_update_sensor_settings tool called for %s (confirm=%s)", sensor_id, confirm)
+    try:
+        filtered = sensor_to_public_update(settings)
+
+        if not confirm:
+            preview_data = await sensor_manager.update_sensor_settings(sensor_id, filtered)
+            return preview_response(
+                action="update",
+                resource_type="sensor_settings",
+                resource_id=sensor_id,
+                current_state=preview_data["current_state"],
+                proposed_changes=preview_data["proposed_changes"],
+                resource_name=preview_data["sensor_name"],
+            )
+
+        result = await sensor_manager.apply_sensor_settings(sensor_id, filtered)
+        return {"success": True, "data": result}
+    except (UniFiNotFoundError, ValueError) as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error("Error updating sensor settings for %s: %s", sensor_id, e, exc_info=True)
+        return {"success": False, "error": f"Failed to update sensor settings: {e}"}
+
+
 # ===========================================================================
 # Chime tools
 # ===========================================================================
@@ -178,11 +247,14 @@ async def protect_list_chimes() -> Dict[str, Any]:
 @server.tool(
     name="protect_update_chime",
     description=(
-        "Updates chime settings such as speaker volume (0-100), repeat times (1-6), "
-        "and device name. Requires confirm=True to apply. "
-        "Supported keys: volume, repeat_times, name."
+        "Updates chime settings. Without camera_id, updates global speaker volume (0-100), "
+        "repeat times (1-6), or device name. With camera_id, updates that camera's ring "
+        "volume or repeat_times while preserving other camera ring settings. Per-camera "
+        "ring settings require a Protect API key configured via UNIFI_PROTECT_API_KEY or "
+        "UNIFI_API_KEY. Requires confirm=True to apply. Supported global keys: volume, "
+        "repeat_times, name. Supported per-camera keys: camera_id, volume, repeat_times."
     ),
-    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     permission_category="chime",
     permission_action="update",
 )
@@ -193,9 +265,11 @@ async def protect_update_chime(
         Field(
             description=(
                 "Dictionary of settings to update. Supported keys: "
-                "volume (0-100 - speaker volume), "
+                "volume (0-100 - speaker volume or per-camera ring volume), "
                 "repeat_times (1-6 - number of times to repeat the chime tone), "
-                "name (string - device display name)."
+                "name (string - device display name; global updates only), "
+                "camera_id (camera UUID from protect_list_chimes ring settings; when supplied, "
+                "volume/repeat_times apply only to that camera's ring setting)."
             )
         ),
     ],
@@ -210,7 +284,10 @@ async def protect_update_chime(
         if not settings:
             return {"success": False, "error": "No settings provided. Specify at least one setting to update."}
 
-        filtered = chime_to_controller_update(settings)
+        if "camera_id" in settings:
+            filtered = chime_to_ring_setting_update(settings)
+        else:
+            filtered = chime_to_controller_update(settings)
         if not filtered:
             return {"success": False, "error": "No supported settings provided."}
 
@@ -241,7 +318,8 @@ async def protect_update_chime(
     description=(
         "Plays the chime tone on a specific chime device. Optionally override "
         "volume (0-100) and repeat times (1-6) for this playback only. "
-        "The chime's default settings are used if not specified."
+        "The chime's default settings are used if not specified. Requires "
+        "confirm=True to play the chime; otherwise returns a preview."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False),
     permission_category="chime",
@@ -261,14 +339,37 @@ async def protect_trigger_chime(
             description="Override repeat count for this playback only (1-6). Omit to use the chime's configured repeat setting."
         ),
     ] = None,
+    confirm: Annotated[
+        bool,
+        Field(description="When true, plays the chime. When false (default), returns a preview."),
+    ] = False,
 ) -> Dict[str, Any]:
     """Trigger a chime to play its tone."""
-    logger.info("protect_trigger_chime tool called for %s (volume=%s, repeat=%s)", chime_id, volume, repeat_times)
+    logger.info(
+        "protect_trigger_chime tool called for %s (volume=%s, repeat=%s, confirm=%s)",
+        chime_id,
+        volume,
+        repeat_times,
+        confirm,
+    )
     try:
         try:
             TriggerChimeInput(chime_id=chime_id, volume=volume, repeat_times=repeat_times)
         except ValidationError as e:
             return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
+        if not confirm:
+            proposed_changes: Dict[str, Any] = {"triggered": True}
+            if volume is not None:
+                proposed_changes["volume"] = volume
+            if repeat_times is not None:
+                proposed_changes["repeat_times"] = repeat_times
+            return preview_response(
+                action="trigger",
+                resource_type="chime",
+                resource_id=chime_id,
+                current_state={},
+                proposed_changes=proposed_changes,
+            )
         result = await chime_manager.trigger_chime(
             chime_id=chime_id,
             volume=volume,
@@ -284,5 +385,6 @@ async def protect_trigger_chime(
 
 logger.info(
     "Device tools registered: protect_list_lights, protect_update_light, "
-    "protect_list_sensors, protect_list_chimes, protect_update_chime, protect_trigger_chime"
+    "protect_list_sensors, protect_update_sensor_settings, protect_list_chimes, "
+    "protect_update_chime, protect_trigger_chime"
 )

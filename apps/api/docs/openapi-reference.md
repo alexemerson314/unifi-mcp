@@ -59,6 +59,18 @@
 
 **Returns:** `object`
 
+### `GET /v1/sites/{site_id}/access-devices/{device_id}/configs` — Get Device Configs
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `device_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `object`
+
 
 ## access/doors
 
@@ -142,6 +154,7 @@ DoorManager.get_door_status raises UniFiNotFoundError on miss → 404.
 - `site_id` (path) (required)
 - `limit` (query)
 - `cursor` (query)
+- `topic` (query)
 - `controller` (query)
 
 
@@ -288,6 +301,9 @@ Fetch a user by listing then filtering — no native get_user method.
 ### `GET /v1/sites/{site_id}/visitors` — List Visitors
 
 
+List UniFi Access Developer API visitors. Returned UUIDs are scoped to the Access Developer API visitor family and must not be passed to other Access user or credential operations.
+
+
 **Parameters:**
 
 - `site_id` (path) (required)
@@ -299,6 +315,9 @@ Fetch a user by listing then filtering — no native get_user method.
 **Returns:** `object`
 
 ### `GET /v1/sites/{site_id}/visitors/{visitor_id}` — Get Visitor
+
+
+Get a UniFi Access Developer API visitor by a UUID returned from the visitor family. Do not pass IDs from other Access user or credential operations.
 
 
 **Parameters:**
@@ -457,6 +476,34 @@ Fetch a user by listing then filtering — no native get_user method.
 **Returns:** `Detail_DnsRecordModel_`
 
 
+## network/dynamic_dns
+
+### `GET /v1/sites/{site_id}/dynamic-dns` — List Dynamic Dns
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `limit` (query)
+- `cursor` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_DynamicDnsModel_`
+
+### `GET /v1/sites/{site_id}/dynamic-dns/{entry_id}` — Get Dynamic Dns Entry Details
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `entry_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_DynamicDnsModel_`
+
+
 ## network/firewall
 
 ### `GET /v1/sites/{site_id}/acl-rules` — List Acl Rules
@@ -509,6 +556,35 @@ Fetch a user by listing then filtering — no native get_user method.
 
 **Returns:** `Detail_FirewallGroupModel_`
 
+### `GET /v1/sites/{site_id}/firewall/legacy-rules` — List Legacy Firewall Rules
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `limit` (query)
+- `cursor` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_LegacyFirewallRuleModel_`
+
+### `GET /v1/sites/{site_id}/firewall/policy-ordering` — Get firewall policy ordering for a zone pair (integration API)
+
+
+Returns the user-defined firewall policy ordering for a source/destination zone pair, sourced from the UniFi public integration API. Policy IDs in the response are integration-API UUIDs scoped to the ordering tool family — use them only with the matching reorder action; they do NOT correspond to the policy IDs returned by /firewall/rules or other controller-API endpoints. Requires a UniFi API key (UNIFI_API_KEY).
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `source_firewall_zone_id` (query) (required)
+- `destination_firewall_zone_id` (query) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_FirewallPolicyOrderingModel_`
+
 ### `GET /v1/sites/{site_id}/firewall/rules` — List Firewall Rules
 
 
@@ -546,6 +622,20 @@ Fetch a user by listing then filtering — no native get_user method.
 
 
 **Returns:** `Page_FirewallZoneModel_`
+
+
+## network/gateway_settings
+
+### `GET /v1/sites/{site_id}/gateway-settings` — Get Gateway Settings
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_GatewaySettingsModel_`
 
 
 ## network/groups
@@ -626,6 +716,35 @@ Fetch a user by listing then filtering — no native get_user method.
 **Returns:** `Detail_UserGroupModel_`
 
 
+## network/incident_evidence
+
+### `GET /v1/sites/{site_id}/incident-evidence/network` — Get Network Incident Evidence
+
+
+Collect bounded, read-only Network event evidence for one incident window. Returns a unifi-incident-evidence-view by default: every source's coverage, failures and budget usage plus bounded record citations, with omitted records counted; detail=full returns the whole unifi-incident-evidence document. The read stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear.
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `start` (query) (required)
+- `end` (query) (required)
+- `device_macs` (query)
+- `location_id` (query)
+- `max_window_seconds` (query)
+- `max_events` (query)
+- `max_calls` (query)
+- `max_elapsed_ms` (query)
+- `mappings` (query)
+- `detail` (query)
+- `max_records_returned` (query)
+- `resume_after` (query)
+- `controller` (query)
+
+
+**Returns:** `Detail_dict_`
+
+
 ## network/lldp
 
 ### `GET /v1/sites/{site_id}/lldp-neighbors` — List Lldp Neighbors
@@ -656,6 +775,68 @@ Fetch a user by listing then filtering — no native get_user method.
 
 
 **Returns:** `object`
+
+
+## network/mdns
+
+### `GET /v1/sites/{site_id}/mdns-settings` — Get Mdns Settings
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_MdnsSettingsModel_`
+
+
+## network/mgmt
+
+### `GET /v1/sites/{site_id}/mgmt-settings` — Get Mgmt Settings
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `object`
+
+
+## network/nat
+
+### `GET /v1/sites/{site_id}/nat-rules` — List Nat Rules
+
+
+List V2 NAT rules in descending controller ID order. These IDs are scoped to the V2 NAT tool family — do not pass them to port-forward or Integration API tools.
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `limit` (query)
+- `cursor` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_NatRuleModel_`
+
+### `GET /v1/sites/{site_id}/nat-rules/{rule_id}` — Get Nat Rule
+
+
+Get a NAT rule by its V2 NAT-family ID; port-forward and Integration API IDs are not portable.
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `rule_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_NatRuleModel_`
 
 
 ## network/networks
@@ -1188,7 +1369,7 @@ DETAIL kind currently; manager method is stats_manager.get_dpi_stats.
 ### `GET /v1/sites/{site_id}/event-types` — Get Event Types
 
 
-DETAIL — event_manager.get_event_type_prefixes (sync method, returns list).
+DETAIL — event_manager.get_event_types (async method, returns list).
 
 
 **Parameters:**
@@ -1249,6 +1430,71 @@ LIST kind per Phase 4A — manager returns multi-element list of subsystems.
 
 
 **Returns:** `object`
+
+
+## network/threat_management
+
+### `GET /v1/sites/{site_id}/threat-management-settings` — Get Threat Management Settings
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `Detail_ThreatManagementSettingsModel_`
+
+
+## network/threat_posture
+
+### `GET /v1/sites/{site_id}/threat-posture` — Get Threat Posture
+
+
+Read CyberSecure posture. Gateway device IDs belong to the legacy Network device family.
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `period` (query)
+- `controller` (query)
+
+
+**Returns:** `Detail_ThreatPostureModel_`
+
+
+## network/traffic-flows
+
+### `GET /v1/sites/{site_id}/traffic-flow-statistics` — Get Traffic Flow Statistics
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `period` (query)
+- `top` (query)
+- `controller` (query)
+
+
+**Returns:** `Detail_TrafficFlowStatisticsModel_`
+
+### `GET /v1/sites/{site_id}/traffic-flows` — Get Traffic Flows
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `within_hours` (query)
+- `time_from` (query)
+- `time_to` (query)
+- `search_text` (query)
+- `page_size` (query)
+- `cursor` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_TrafficFlowModel_`
 
 
 ## network/vouchers
@@ -1615,6 +1861,35 @@ raises 404 via UniFiNotFoundError if the camera is unknown.
 **Returns:** `object`
 
 
+## protect/incident_evidence
+
+### `GET /v1/sites/{site_id}/incident-evidence/protect` — Get Protect Incident Evidence
+
+
+Collect bounded, read-only Protect event evidence for one incident window. Returns a unifi-incident-evidence-view by default: every source's coverage, failures and budget usage plus bounded record citations, with omitted records counted; detail=full returns the whole unifi-incident-evidence document. Each camera ID is its own source. The read stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear.
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `start` (query) (required)
+- `end` (query) (required)
+- `camera_ids` (query)
+- `location_id` (query)
+- `max_window_seconds` (query)
+- `max_events` (query)
+- `max_calls` (query)
+- `max_elapsed_ms` (query)
+- `mappings` (query)
+- `detail` (query)
+- `max_records_returned` (query)
+- `resume_after` (query)
+- `controller` (query)
+
+
+**Returns:** `Detail_dict_`
+
+
 ## protect/lights
 
 ### `GET /v1/sites/{site_id}/lights` — List Lights
@@ -1684,6 +1959,35 @@ No native ``protect_get_liveview`` tool — filter from LIST.
 
 ## protect/recognition
 
+### `GET /v1/sites/{site_id}/detection-search` — Search Detections
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `labels` (query) (required)
+- `search_limit` (query)
+- `order` (query)
+- `exclude_motion` (query)
+- `min_confidence` (query)
+- `limit` (query)
+- `cursor` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_SmartDetectionModel_`
+
+### `GET /v1/sites/{site_id}/detection-search-labels` — Detection Search Labels
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `controller` (query)
+
+
+**Returns:** `DetectionSearchLabelsModel`
+
 ### `GET /v1/sites/{site_id}/known-faces` — List Known Faces
 
 
@@ -1701,6 +2005,24 @@ No native ``protect_get_liveview`` tool — filter from LIST.
 
 
 **Returns:** `Page_KnownFaceModel_`
+
+### `GET /v1/sites/{site_id}/known-license-plates` — List Known License Plates
+
+
+**Parameters:**
+
+- `site_id` (path) (required)
+- `limit` (query)
+- `cursor` (query)
+- `min_confidence` (query)
+- `include_interest` (query)
+- `group_types` (query)
+- `order_by` (query)
+- `order_direction` (query)
+- `controller` (query)
+
+
+**Returns:** `Page_KnownLicensePlateModel_`
 
 
 ## protect/sensors
@@ -1737,6 +2059,9 @@ No native ``protect_get_sensor`` tool exists — filter from LIST.
 ## protect/system
 
 ### `GET /v1/sites/{site_id}/alarm-profiles` — Alarm List Profiles
+
+
+List configured alarm profiles, including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.
 
 
 **Parameters:**
@@ -1809,7 +2134,10 @@ No native ``protect_get_sensor`` tool exists — filter from LIST.
 
 ## untagged
 
-### `POST /v1/actions/{tool_name}` — Post Action
+### `POST /v1/actions/{tool_name}` — Preview or execute a catalog action
+
+
+Read actions execute immediately. Mutations with `confirm=false` validate the request and return a non-mutating partial request preview with `requires_confirmation=true`; no mutation manager is invoked. It does not show freshly merged controller state. Send the same request with `confirm=true` to execute it; Manager-level validation runs during execution. Capability and argument checks apply to both paths.
 
 
 **Parameters:**

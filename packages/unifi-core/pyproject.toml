@@ -5,7 +5,10 @@ description = "UniFi controller connectivity: auth, detection, retry, exceptions
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.14.3",
-    "pydantic>=2.10.0",
+    # Published wheels do not consume uv.lock; keep aiohttp's advisory-safe
+    # multidict floor explicit so upgrades cannot retain a vulnerable install.
+    "multidict>=6.9.1",
+    "pydantic>=2.13.5",
     "pyyaml>=6.0",
 ]
 
@@ -15,15 +18,24 @@ dependencies = [
 # they need and can't accidentally forget to install one — that failure
 # mode hit prod historically. Versions floor at the lowest tested.
 [project.optional-dependencies]
-network = ["aiounifi>=88"]
-protect = ["uiprotect>=10.5.0"]
-access = ["py-unifi-access>=1.1.1"]
+network = ["aiounifi>=92"]
+protect = [
+    # Camera/light public setters require a Protect API key; see the Protect README.
+    "uiprotect>=16.16.1,<17",
+    # uiprotect permits older PyJWT releases; published Core wheels must enforce
+    # the advisory-safe floor even when installed over an existing environment.
+    "PyJWT>=2.15.0",
+]
+access = ["py-unifi-access>=1.6.1"]
 
 [dependency-groups]
 dev = [
+    "omegaconf>=2.3.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.21.0",
-    "aioresponses>=0.7.0",
+    "aioresponses>=0.7.9",
+    # Validates the committed incident-evidence JSON Schema and its golden corpus.
+    "jsonschema>=4.26.0",
 ]
 
 [build-system]

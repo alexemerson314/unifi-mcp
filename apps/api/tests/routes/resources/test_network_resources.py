@@ -6,22 +6,24 @@ from datetime import datetime, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 from unifi_api.auth.api_key import generate_key, hash_key
-from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig
+from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig, PolicyConfig, ResponsePolicyConfig
 from unifi_api.db.crypto import ColumnCipher, derive_key
 from unifi_api.db.models import ApiKey, Base, Controller
 from unifi_api.server import create_app
+from unifi_core.redaction import REDACTED
 
 
-def _cfg(tmp_path):
+def _cfg(tmp_path, *, redact_sensitive_fields: bool = True):
     return ApiConfig(
         http=HttpConfig(host="127.0.0.1", port=8080, cors_origins=()),
         logging=LoggingConfig(level="WARNING"),
         db=DbConfig(path=str(tmp_path / "state.db")),
+        policy=PolicyConfig(response=ResponsePolicyConfig(redact_sensitive_fields=redact_sensitive_fields)),
     )
 
 
-async def _bootstrap(tmp_path, products="network"):
-    app = create_app(_cfg(tmp_path))
+async def _bootstrap(tmp_path, products="network", *, redact_sensitive_fields: bool = True):
+    app = create_app(_cfg(tmp_path, redact_sensitive_fields=redact_sensitive_fields))
     async with app.state.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     sm = app.state.sessionmaker
@@ -71,7 +73,7 @@ class _FakeCM:
 
 def _stub_connection(app, cid: str) -> _FakeCM:
     fake = _FakeCM()
-    app.state.manager_factory._connection_cache[(cid, "network")] = fake
+    app.state.manager_factory._connection_cache[(cid, "network", "default")] = fake
     return fake
 
 
@@ -137,6 +139,39 @@ async def test_list_clients_capability_mismatch(tmp_path, monkeypatch) -> None:
     body = r.json()
     assert body["detail"]["kind"] == "capability_mismatch"
     assert body["detail"]["missing_product"] == "network"
+
+
+@pytest.mark.asyncio
+async def test_get_client_detail_maps_manager_errors(tmp_path, monkeypatch) -> None:
+    """Not-found is 404; an undetermined lookup (the per-MAC endpoint failed)
+    is a 502, never a 404 and never an unhandled 500."""
+    from unifi_core.exceptions import UniFiNotFoundError, UniFiOperationError
+    from unifi_core.network.managers.client_manager import ClientManager
+
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    async def fake_details(self, mac):
+        if mac == "aa:bb:cc:dd:ee:01":
+            raise UniFiNotFoundError("client", mac)
+        raise UniFiOperationError("existence could not be determined")
+
+    monkeypatch.setattr(ClientManager, "get_client_details", fake_details)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        missing = await c.get(
+            f"/v1/sites/default/clients/aa:bb:cc:dd:ee:01?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        undetermined = await c.get(
+            f"/v1/sites/default/clients/aa:bb:cc:dd:ee:02?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+
+    assert missing.status_code == 404
+    assert undetermined.status_code == 502
+    assert "could not be determined" in undetermined.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -245,7 +280,16 @@ async def test_list_wlans_happy_path(tmp_path, monkeypatch) -> None:
     _stub_connection(app, cid)
 
     fake_wlans = [
-        _FakeRaw({"_id": f"w-{i}", "name": f"ssid-{i}", "enabled": True, "security": "wpapsk"}) for i in range(2)
+        _FakeRaw(
+            {
+                "_id": f"w-{i}",
+                "name": f"ssid-{i}",
+                "enabled": True,
+                "security": "wpapsk",
+                "x_passphrase": f"wifi-secret-{i}",
+            }
+        )
+        for i in range(2)
     ]
 
     async def fake_get_wlans(self, *a, **kw):
@@ -263,7 +307,132 @@ async def test_list_wlans_happy_path(tmp_path, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["items"]) == 2
+    assert all(item["x_passphrase"] == REDACTED for item in body["items"])
     assert body["render_hint"]["kind"] == "list"
+
+
+@pytest.mark.asyncio
+async def test_list_wlans_policy_disabled_returns_raw_passphrases(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+    _stub_connection(app, cid)
+
+    fake_wlans = [
+        _FakeRaw(
+            {
+                "_id": "w-1",
+                "name": "ssid",
+                "enabled": True,
+                "security": "wpapsk",
+                "x_passphrase": "wifi-secret",
+            }
+        )
+    ]
+
+    async def fake_get_wlans(self, *a, **kw):
+        return fake_wlans
+
+    from unifi_core.network.managers.network_manager import NetworkManager
+
+    monkeypatch.setattr(NetworkManager, "get_wlans", fake_get_wlans)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/wlans?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["x_passphrase"] == "wifi-secret"
+
+
+@pytest.mark.asyncio
+async def test_list_dynamic_dns_redacts_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    async def fake_list(self, *a, **kw):
+        return [{"_id": "ddns-1", "host_name": "home.example.com", "service": "dyndns", "x_password": "ddns-secret"}]
+
+    from unifi_core.network.managers.dynamic_dns_manager import DynamicDnsManager
+
+    monkeypatch.setattr(DynamicDnsManager, "list_dynamic_dns", fake_list)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/dynamic-dns?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["x_password"] == REDACTED
+
+
+@pytest.mark.asyncio
+async def test_list_dynamic_dns_policy_disabled_returns_raw_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+    _stub_connection(app, cid)
+
+    async def fake_list(self, *a, **kw):
+        return [{"_id": "ddns-1", "host_name": "home.example.com", "service": "dyndns", "x_password": "ddns-secret"}]
+
+    from unifi_core.network.managers.dynamic_dns_manager import DynamicDnsManager
+
+    monkeypatch.setattr(DynamicDnsManager, "list_dynamic_dns", fake_list)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/dynamic-dns?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["x_password"] == "ddns-secret"
+
+
+@pytest.mark.asyncio
+async def test_get_dynamic_dns_detail_redacts_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    async def fake_get(self, entry_id, *a, **kw):
+        assert entry_id == "ddns-1"
+        return {"_id": "ddns-1", "host_name": "home.example.com", "service": "dyndns", "x_password": "ddns-secret"}
+
+    from unifi_core.network.managers.dynamic_dns_manager import DynamicDnsManager
+
+    monkeypatch.setattr(DynamicDnsManager, "get_dynamic_dns", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/dynamic-dns/ddns-1?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["x_password"] == REDACTED
+
+
+@pytest.mark.asyncio
+async def test_get_dynamic_dns_detail_policy_disabled_returns_raw_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+    _stub_connection(app, cid)
+
+    async def fake_get(self, entry_id, *a, **kw):
+        assert entry_id == "ddns-1"
+        return {"_id": "ddns-1", "host_name": "home.example.com", "service": "dyndns", "x_password": "ddns-secret"}
+
+    from unifi_core.network.managers.dynamic_dns_manager import DynamicDnsManager
+
+    monkeypatch.setattr(DynamicDnsManager, "get_dynamic_dns", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/dynamic-dns/ddns-1?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["x_password"] == "ddns-secret"
 
 
 @pytest.mark.asyncio

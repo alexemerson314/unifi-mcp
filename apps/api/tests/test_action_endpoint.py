@@ -1,30 +1,40 @@
 """Action endpoint tests (with mocked dispatcher)."""
 
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from unifi_api.auth.api_key import generate_key, hash_key
-from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig
+from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig, PolicyConfig, ResponsePolicyConfig
 from unifi_api.db.crypto import ColumnCipher, derive_key
 from unifi_api.db.models import ApiKey, AuditLog, Base, Controller
 from unifi_api.server import create_app
+from unifi_api.services.manifest import ManifestRegistry
 
 
-def _cfg(tmp_path: Path) -> ApiConfig:
+def _cfg(tmp_path: Path, *, redact_sensitive_fields: bool = True) -> ApiConfig:
     return ApiConfig(
         http=HttpConfig(host="127.0.0.1", port=8080, cors_origins=()),
         logging=LoggingConfig(level="WARNING"),
         db=DbConfig(path=str(tmp_path / "state.db")),
+        policy=PolicyConfig(response=ResponsePolicyConfig(redact_sensitive_fields=redact_sensitive_fields)),
     )
 
 
-async def _bootstrap(tmp_path: Path):
-    app = create_app(_cfg(tmp_path))
+async def _bootstrap(
+    tmp_path: Path,
+    *,
+    redact_sensitive_fields: bool = True,
+    product_kinds: str = "network",
+    scopes: str = "write",
+):
+    config = _cfg(tmp_path, redact_sensitive_fields=redact_sensitive_fields)
+    app = create_app(config)
     async with app.state.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     sm = app.state.sessionmaker
@@ -38,7 +48,7 @@ async def _bootstrap(tmp_path: Path):
                 id=str(uuid.uuid4()),
                 prefix=material.prefix,
                 hash=hash_key(material.plaintext),
-                scopes="write",
+                scopes=scopes,
                 name="t",
                 created_at=datetime.now(timezone.utc),
             )
@@ -48,7 +58,7 @@ async def _bootstrap(tmp_path: Path):
                 id=cid,
                 name="N",
                 base_url="https://x",
-                product_kinds="network",
+                product_kinds=product_kinds,
                 credentials_blob=creds,
                 verify_tls=False,
                 is_default=True,
@@ -65,6 +75,262 @@ class _FakeClient:
 
     def __init__(self, raw: dict) -> None:
         self.raw = raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redact", [True, False])
+@pytest.mark.parametrize("domain", ["device", "network"])
+async def test_action_endpoint_redacts_controller_private_keys(tmp_path, monkeypatch, redact, domain):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=redact)
+    raw = {
+        "mac": "aa:bb:cc:00:00:10",
+        "_id": "vpn",
+        "name": "fixture",
+        "x_authkey": "synthetic-device-key",
+        "x_ca_key": "synthetic-vpn-key",
+        "nested": [{"syslog_key": "synthetic-syslog-key"}],
+        "x_ca_crt": "public",
+    }
+    manager = MagicMock()
+    manager._connection.site = "default"
+    manager.get_device_details = AsyncMock(return_value=_FakeClient(raw))
+    manager.get_network_details = AsyncMock(return_value=raw)
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+    args = {"mac_address": raw["mac"]} if domain == "device" else {"network_id": "vpn"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/actions/unifi_get_{domain}_details",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": args, "confirm": False},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["data"]["x_authkey"] == ("***REDACTED***" if redact else raw["x_authkey"])
+    assert body["data"]["x_ca_key"] == ("***REDACTED***" if redact else raw["x_ca_key"])
+    assert body["data"]["nested"][0]["syslog_key"] == ("***REDACTED***" if redact else raw["nested"][0]["syslog_key"])
+    assert body["data"]["x_ca_crt"] == "public"
+    assert raw["x_authkey"] == "synthetic-device-key"
+    await app.state.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_enforces_confirmation_before_manager_interaction(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds="access")
+
+    manager = MagicMock()
+    manager.list_doors = AsyncMock(return_value=[])
+    manager.apply_unlock_door = AsyncMock(return_value=True)
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        read_response = await client.post(
+            "/v1/actions/access_list_doors",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+        assert read_response.status_code == 200
+        assert read_response.json()["success"] is True
+        manager.list_doors.assert_awaited_once_with()
+
+        factory.get_domain_manager.reset_mock()
+        unconfirmed_response = await client.post(
+            "/v1/actions/access_unlock_door",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"door_id": "door-1", "duration": 2},
+                "confirm": False,
+            },
+        )
+        assert unconfirmed_response.status_code == 200
+        preview = unconfirmed_response.json()
+        assert preview["success"] is True
+        assert preview["requires_confirmation"] is True
+        assert preview["tool"] == "access_unlock_door"
+        assert preview["product"] == "access"
+        assert preview["action"] == "update"
+        assert preview["resource_id"] == "door-1"
+        assert preview["preview"]["proposed"] == {"door_id": "door-1", "duration": 2}
+        factory.get_domain_manager.assert_not_awaited()
+        manager.apply_unlock_door.assert_not_awaited()
+
+        confirmed_response = await client.post(
+            "/v1/actions/access_unlock_door",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"door_id": "door-1", "duration": 2},
+                "confirm": True,
+            },
+        )
+        assert confirmed_response.status_code == 200
+        assert confirmed_response.json()["success"] is True
+        manager.apply_unlock_door.assert_awaited_once_with(door_id="door-1", duration=2)
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_unwraps_alarm_profile_facade_tuple(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds="protect", scopes="admin")
+
+    manager = MagicMock()
+    manager.list_profiles = AsyncMock(
+        return_value=(
+            [
+                {
+                    "id": "01a06cca-1111-4222-8333-444444444444",
+                    "name": "Away",
+                    "state": "armed",
+                    "state_set_at": "2026-09-04T12:00:00Z",
+                    "id_family": "alarm_manager_v2",
+                    "arm_compatible": False,
+                }
+            ],
+            True,
+        )
+    )
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/protect_alarm_list_profiles",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["data"] == {
+        "profiles": [
+            {
+                "id": "01a06cca-1111-4222-8333-444444444444",
+                "name": "Away",
+                "state": "armed",
+                "state_set_at": "2026-09-04T12:00:00Z",
+                "id_family": "alarm_manager_v2",
+                "arm_compatible": False,
+            }
+        ],
+        "count": 1,
+    }
+    assert "result" not in body["data"]
+    manager.list_profiles.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_preserves_incomplete_alarm_profile_coverage(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds="protect", scopes="admin")
+
+    manager = MagicMock()
+    manager.list_profiles = AsyncMock(return_value=([], False))
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/protect_alarm_list_profiles",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["profiles"] == []
+    assert data["count"] == 0
+    assert data["_meta"]["com.github.sirkirby.unifi-mcp/alarm-coverage"]["complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("product", "tool_name", "args", "manager_method"),
+    [
+        ("network", "unifi_reboot_device", {"mac_address": "aa:bb:cc:dd:ee:ff"}, "reboot_device"),
+        ("protect", "protect_reboot_camera", {"camera_id": "camera-1"}, "apply_reboot_camera"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_action_endpoint_previews_network_and_protect_without_manager_interaction(
+    tmp_path,
+    monkeypatch,
+    product,
+    tool_name,
+    args,
+    manager_method,
+) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds=product)
+    manager = MagicMock()
+    setattr(manager, manager_method, AsyncMock(return_value=True))
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/actions/{tool_name}",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": args, "confirm": False},
+        )
+
+    assert response.status_code == 200
+    preview = response.json()
+    assert preview["success"] is True
+    assert preview["requires_confirmation"] is True
+    assert preview["tool"] == tool_name
+    assert preview["product"] == product
+    assert preview["preview"]["proposed"] == args
+    if product == "network":
+        assert preview["resource_id"] == args["mac_address"]
+    factory.get_domain_manager.assert_not_awaited()
+    getattr(manager, manager_method).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_redacts_sensitive_preview_fields(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock()
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/unifi_create_wlan",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {
+                    "wlan_data": {
+                        "name": "Preview only",
+                        "security": "wpa2-psk",
+                        "x_passphrase": "do-not-return-this",
+                    }
+                },
+                "confirm": False,
+            },
+        )
+
+    assert response.status_code == 200
+    preview = response.json()
+    assert preview["success"] is True
+    assert preview["requires_confirmation"] is True
+    assert preview["preview"]["will_create"]["wlan_data"]["x_passphrase"] == "***REDACTED***"
+    assert "do-not-return-this" not in response.text
+    factory.get_domain_manager.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -96,6 +362,7 @@ async def test_action_endpoint_dispatches_and_audits(tmp_path, monkeypatch) -> N
             "mac": "aa:bb",
             "ip": None,
             "hostname": None,
+            "name": None,
             "is_wired": False,
             "is_guest": False,
             "status": "online",
@@ -117,6 +384,100 @@ async def test_action_endpoint_dispatches_and_audits(tmp_path, monkeypatch) -> N
         action_rows = [r for r in rows if r.target == "unifi_list_clients"]
         assert len(action_rows) == 1
         assert action_rows[0].outcome == "success"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_preserves_shared_read_view_metadata(tmp_path, monkeypatch) -> None:
+    """Shared read views keep the typed action envelope and expose their metadata."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+    from unifi_api.services.action_results import ShapedReadResult
+
+    shaped = ShapedReadResult(
+        payload={
+            "success": True,
+            "site": "default",
+            "filter_type": "wired",
+            "fields": "mac,connection_type",
+            "total_count": 2,
+            "returned_count": 1,
+            "limit": 1,
+            "clients": [{"mac": "aa:bb", "connection_type": "Wired"}],
+        },
+        data_key="clients",
+        render_hint={
+            "primary_key": "mac",
+            "display_columns": ["name", "connection_type"],
+            "sort_default": "name:asc",
+        },
+    )
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=shaped))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/unifi_list_clients",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"filter_type": "wired", "limit": 1, "fields": "mac,connection_type"},
+                "confirm": False,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is True
+    assert body["data"] == [{"mac": "aa:bb", "connection_type": "Wired"}]
+    assert body["render_hint"] == {
+        "kind": "list",
+        "primary_key": "mac",
+        "display_columns": ["connection_type"],
+    }
+    assert body["meta"] == {
+        "site": "default",
+        "filter_type": "wired",
+        "fields": "mac,connection_type",
+        "total_count": 2,
+        "returned_count": 1,
+        "limit": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_rejects_malformed_shared_read_shape(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+    from unifi_api.services.action_results import ShapedReadResult
+
+    monkeypatch.setattr(
+        actions_svc,
+        "dispatch_action",
+        AsyncMock(
+            return_value=ShapedReadResult(
+                payload={"success": True, "clients": {"mac": "aa:bb"}},
+                data_key="clients",
+                render_hint={"primary_key": "mac"},
+            )
+        ),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/unifi_list_clients",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["kind"] == "serializer_contract_error"
+    assert response.json()["detail"]["detail"] == (
+        "Failed to serialize action result. Contact the server administrator."
+    )
 
 
 @pytest.mark.asyncio
@@ -151,6 +512,288 @@ async def test_action_endpoint_serializer_contract_error(tmp_path, monkeypatch) 
         assert len(action_rows) == 1
         assert action_rows[0].outcome == "error"
         assert action_rows[0].error_kind == "serializer_contract"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_update_ack_tuple_success(tmp_path, monkeypatch) -> None:
+    """Fetch-merge-put update managers return a (ok, error) ack tuple. A success
+    tuple must surface as a clean {"success": true} envelope (not a stringified
+    tuple) and audit as success."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=(True, None)))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post(
+            "/v1/actions/unifi_update_network",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"network_id": "n1"}, "confirm": True},
+        )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {"success": True}
+
+    sm = app.state.sessionmaker
+    async with sm() as session:
+        rows = (await session.execute(select(AuditLog))).scalars().all()
+        action_rows = [row for row in rows if row.target == "unifi_update_network"]
+        assert len(action_rows) == 1
+        assert action_rows[0].outcome == "success"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_snmp_update_accepts_v3_fields_without_enabled(tmp_path, monkeypatch) -> None:
+    """The regenerated catalog no longer requires ``enabled`` and knows the v3 fields."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=(True, None)))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post(
+            "/v1/actions/unifi_update_snmp_settings",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"enabled_v3": True, "username": "monitor", "x_password": "p"},
+                "confirm": True,
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_update_ack_tuple_failure(tmp_path, monkeypatch) -> None:
+    """Regression: a FAILED update ack tuple must report success=false with the
+    error message — not top-level success=true with the failure stringified into
+    data.result — and must audit as error."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    err = "Controller accepted the request but did not persist field(s): upnp_enabled."
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=(False, err)))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post(
+            "/v1/actions/unifi_update_network",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"network_id": "n1"}, "confirm": True},
+        )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is False
+    assert body["error"] == err
+    assert "result" not in body.get("data", {})
+
+    sm = app.state.sessionmaker
+    async with sm() as session:
+        rows = (await session.execute(select(AuditLog))).scalars().all()
+        action_rows = [row for row in rows if row.target == "unifi_update_network"]
+        assert len(action_rows) == 1
+        assert action_rows[0].outcome == "error"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "items_key", "item"),
+    [
+        ("protect_list_known_faces", "faces", {"id": "face-1", "name": "P", "matched_name": "Person One"}),
+        (
+            "protect_list_known_license_plates",
+            "license_plates",
+            {"id": "plate-1", "name": "Vehicle", "matched_name": "ABC1234"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_action_endpoint_unwraps_recognition_list_envelope(
+    tmp_path, monkeypatch, tool_name, items_key, item
+) -> None:
+    """Recognition list tools return a ``{items_key: [...], count, links}`` dict
+    envelope (not a bare list); the action path must unwrap it rather than 500
+    with a serializer contract error."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    envelope = {items_key: [item], "count": 1, "links": {}}
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=envelope))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post(
+            f"/v1/actions/{tool_name}",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["render_hint"]["kind"] == "list"
+    assert isinstance(body["data"], list)
+    assert len(body["data"]) == 1
+    assert body["data"][0]["id"] == item["id"]
+    assert body["data"][0]["matched_name"] == item["matched_name"]
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_redacts_by_default(tmp_path, monkeypatch) -> None:
+    """The API action response path redacts secrets by default."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    wlan = _FakeClient({"_id": "wl-1", "name": "HomeNet", "x_passphrase": "wifi-secret"})
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=wlan))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/unifi_get_wlan_details",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"wlan_id": "wl-1"}, "confirm": False},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["x_passphrase"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_policy_disabled_returns_raw_sensitive_fields(tmp_path, monkeypatch) -> None:
+    """Operator policy can disable action response redaction for the API surface."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+
+    from unifi_api.services import actions as actions_svc
+
+    wlan = _FakeClient({"_id": "wl-1", "name": "HomeNet", "x_passphrase": "wifi-secret"})
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=wlan))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/unifi_get_wlan_details",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"wlan_id": "wl-1"}, "confirm": False},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["x_passphrase"] == "wifi-secret"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_redacts_protect_camera_stream_urls_by_default(tmp_path, monkeypatch) -> None:
+    """Typed action responses also honor response redaction policy."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    streams = {
+        "camera_id": "cam-1",
+        "camera_name": "Door",
+        "channels": {
+            "high": {
+                "rtsp_alias": "abc123",
+                "rtsps_url": "rtsps://nvr.local/abc123",
+                "rtsp_url": "rtsp://nvr.local/abc123",
+            }
+        },
+        "rtsps_streams": {"high": "rtsps://nvr.local/abc123"},
+    }
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=streams))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/protect_get_camera_streams",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"camera_id": "cam-1"}, "confirm": False},
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["channels"]["high"]["rtsp_alias"] == "***REDACTED***"
+    assert data["channels"]["high"]["rtsps_url"] == "***REDACTED***"
+    assert data["channels"]["high"]["rtsp_url"] == "***REDACTED***"
+    assert data["rtsps_streams"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_policy_disabled_returns_raw_protect_camera_stream_urls(tmp_path, monkeypatch) -> None:
+    """Typed action responses return raw stream URLs when API redaction policy is disabled."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+
+    from unifi_api.services import actions as actions_svc
+
+    streams = {
+        "camera_id": "cam-1",
+        "camera_name": "Door",
+        "channels": {
+            "high": {
+                "rtsp_alias": "abc123",
+                "rtsps_url": "rtsps://nvr.local/abc123",
+                "rtsp_url": "rtsp://nvr.local/abc123",
+            }
+        },
+        "rtsps_streams": {"high": "rtsps://nvr.local/abc123"},
+    }
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(return_value=streams))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.post(
+            "/v1/actions/protect_get_camera_streams",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {"camera_id": "cam-1"}, "confirm": False},
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["channels"]["high"]["rtsp_alias"] == "abc123"
+    assert data["channels"]["high"]["rtsps_url"] == "rtsps://nvr.local/abc123"
+    assert data["channels"]["high"]["rtsp_url"] == "rtsp://nvr.local/abc123"
+    assert data["rtsps_streams"]["high"] == "rtsps://nvr.local/abc123"
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_rejects_include_sensitive_before_dispatch(tmp_path, monkeypatch) -> None:
+    """Request args cannot override sensitive-field redaction per call."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+
+    from unifi_api.services import actions as actions_svc
+
+    fake_dispatch = AsyncMock(return_value=_FakeClient({"_id": "wl-1"}))
+    monkeypatch.setattr(actions_svc, "dispatch_action", fake_dispatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        opted_out = await c.post(
+            "/v1/actions/unifi_get_wlan_details",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"wlan_id": "wl-1", "include_sensitive": True},
+                "confirm": False,
+            },
+        )
+
+    assert opted_out.status_code == 200, opted_out.text
+    body = opted_out.json()
+    assert body["success"] is False
+    assert "include_sensitive is not supported" in body["error"]
+    fake_dispatch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -206,3 +849,200 @@ async def test_action_endpoint_unknown_controller(tmp_path, monkeypatch) -> None
             json={"site": "default", "controller": fake_cid, "args": {}, "confirm": False},
         )
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", ["unexpected", "capability", "contract", "registry"])
+async def test_action_exception_details_are_not_exposed(tmp_path, monkeypatch, error_type) -> None:
+    """Arbitrary exception messages must not reach action clients, even on opt-out."""
+    from unifi_api.serializers._base import SerializerContractError
+    from unifi_api.serializers._registry import SerializerRegistryError
+    from unifi_api.services import actions as actions_svc
+
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, redact_sensitive_fields=False)
+    private = "Traceback /private/server.py password=do-not-expose"
+    errors = {
+        "unexpected": RuntimeError(private),
+        "capability": actions_svc.CapabilityMismatch(private),
+        "contract": SerializerContractError(private),
+        "registry": SerializerRegistryError(private),
+    }
+    monkeypatch.setattr(actions_svc, "dispatch_action", AsyncMock(side_effect=errors[error_type]))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/unifi_list_clients",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": {}, "confirm": False},
+        )
+    assert response.status_code == (500 if error_type in {"contract", "registry"} else 200)
+    for marker in ("Traceback", "/private/server.py", "do-not-expose", "RuntimeError"):
+        assert marker not in response.text
+    body = response.json()
+    if response.status_code == 500:
+        assert body["detail"]["tool"] == "unifi_list_clients"
+        assert body["detail"]["kind"] in {"serializer_contract_error", "serializer_missing"}
+    else:
+        assert body["success"] is False
+        assert "Failed to execute action" in body["error"]
+    async with app.state.sessionmaker() as session:
+        rows = (await session.execute(select(AuditLog))).scalars().all()
+        actions = [row for row in rows if row.target == "unifi_list_clients"]
+        assert len(actions) == 1
+        assert actions[0].outcome == "error"
+        assert actions[0].error_kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [
+        {},
+        {"limit": None, "offset": 0, "search": None, "fields": None},
+        {"fields": " , "},
+    ],
+)
+async def test_action_endpoint_list_vouchers_no_arg_and_explicit_defaults_preserve_baseline(
+    tmp_path, monkeypatch, args
+) -> None:
+    """Baseline API action returns 7-key items with explicit nulls and unchanged envelope."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds="network")
+
+    entry = app.state.manifest_registry.resolve("unifi_list_vouchers")
+    custom_schema = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": ["integer", "null"]},
+            "offset": {"type": "integer"},
+            "search": {"type": ["string", "null"]},
+            "fields": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    updated_entry = replace(entry, input_schema=custom_schema)
+    app.state.manifest_registry = ManifestRegistry(
+        {**app.state.manifest_registry._entries, "unifi_list_vouchers": updated_entry}
+    )
+
+    manager = MagicMock()
+    manager._connection.site = "default"
+    manager.get_vouchers = AsyncMock(
+        return_value=[
+            {
+                "_id": "voucher-1",
+                "code": "1234567890",
+                "create_time": 1700000000,
+                "duration": 1440,
+                "status": "VALID_ONE",
+                "note": "Guest pass",
+            }
+        ]
+    )
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/unifi_list_vouchers",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"site": "default", "controller": cid, "args": args, "confirm": False},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert "count" not in body
+    assert "site" not in body
+    assert "render_hint" in body
+    assert body["render_hint"]["display_columns"] == ["code", "status", "duration", "created_at"]
+    assert body["render_hint"]["sort_default"] == "created_at:desc"
+    assert "data" in body
+    assert len(body["data"]) == 1
+    voucher = body["data"][0]
+    expected_keys = {"id", "code", "status", "duration", "qos_overwrite", "created_at", "used_at"}
+    assert set(voucher.keys()) == expected_keys
+    assert voucher["id"] == "voucher-1"
+    assert voucher["code"] == "1234567890"
+    assert voucher["status"] == "VALID_ONE"
+    assert voucher["duration"] == 1440
+    assert voucher["qos_overwrite"] is False
+    assert voucher["created_at"] == 1700000000
+    assert voucher["used_at"] is None  # explicit null
+    manager.get_vouchers.assert_awaited_once_with()
+    await app.state.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_action_endpoint_list_vouchers_shaped_uses_shared_view(tmp_path, monkeypatch) -> None:
+    """Shaped API action call routes through shared Core read view."""
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path, product_kinds="network")
+
+    entry = app.state.manifest_registry.resolve("unifi_list_vouchers")
+    custom_schema = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": ["integer", "null"]},
+            "offset": {"type": "integer"},
+            "search": {"type": ["string", "null"]},
+            "fields": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    updated_entry = replace(entry, input_schema=custom_schema)
+    app.state.manifest_registry = ManifestRegistry(
+        {**app.state.manifest_registry._entries, "unifi_list_vouchers": updated_entry}
+    )
+
+    manager = MagicMock()
+    manager._connection.site = "default"
+    manager.get_vouchers = AsyncMock(
+        return_value=[
+            {
+                "_id": "v1",
+                "code": "1234567890",
+                "create_time": 1700000000,
+                "duration": 1440,
+                "status": "VALID_ONE",
+                "note": "Guest voucher",
+            },
+            {
+                "_id": "v2",
+                "code": "9876543210",
+                "create_time": 1700000500,
+                "duration": 2880,
+                "status": "VALID_MULTI",
+                "note": "Staff voucher",
+            },
+        ]
+    )
+    factory = MagicMock()
+    factory.get_domain_manager = AsyncMock(return_value=manager)
+    app.state.manager_factory = factory
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/actions/unifi_list_vouchers",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "site": "default",
+                "controller": cid,
+                "args": {"search": "12345-67890", "limit": 1, "fields": "code,note"},
+                "confirm": False,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert "meta" in body
+    assert body["meta"]["count"] == 1
+    assert body["meta"]["total_count"] == 1
+    assert body["meta"]["limit"] == 1
+    assert body["meta"]["offset"] == 0
+    assert len(body["data"]) == 1
+    assert body["data"][0] == {"code": "1234567890", "note": "Guest voucher"}
+    manager.get_vouchers.assert_awaited_once_with()
+    await app.state.engine.dispose()

@@ -6,7 +6,9 @@ from aiounifi.models.api import ApiRequest
 from aiounifi.models.device import Device
 
 from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.mac import mac_equal, normalize_mac
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.network.models.devices import normalize_radio_channel, normalize_radio_ht
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -27,8 +29,12 @@ class DeviceManager:
         """
         self._connection = connection_manager
 
-    async def get_devices(self) -> List[Device]:
+    async def get_devices(self) -> List[Device | dict[str, Any]]:
         """Get list of devices for the current site."""
+        if getattr(self._connection, "has_api_key", False) is True:
+            await self._connection.initialize()
+            if self._connection.integration_inventory_only:
+                return await self._connection.public_inventory("devices")
         if not await self._connection.ensure_connected() or not self._connection.controller:
             raise ConnectionError("Not connected to controller")
         cache_key = f"{CACHE_PREFIX_DEVICES}_{self._connection.site}"
@@ -37,12 +43,12 @@ class DeviceManager:
             return cached_data
 
         try:
-            await self._connection.controller.devices.update()
+            await self._connection.refresh_handler("devices")
             devices: List[Device] = list(self._connection.controller.devices.values())
             self._connection._update_cache(cache_key, devices)
             return devices
         except Exception as e:
-            logger.error("Error getting devices: %s", e)
+            logger.error("Error getting devices: %s", type(e).__name__)
             raise
 
     async def get_device_details(self, device_mac: str) -> Device:
@@ -51,8 +57,15 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         devices = await self.get_devices()
-        device: Optional[Device] = next((d for d in devices if d.mac == device_mac), None)
+        if getattr(self._connection, "integration_inventory_only", False) is True:
+            from unifi_core.exceptions import UniFiAuthError
+
+            raise UniFiAuthError(
+                "Full device details and device mutations require Network session authentication on this controller."
+            )
+        device: Optional[Device] = next((d for d in devices if mac_equal(d.mac, device_mac)), None)
         if device is None:
             raise UniFiNotFoundError("device", device_mac)
         return device
@@ -63,6 +76,7 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         await self.get_device_details(device_mac)  # existence check; raises on miss
         try:
             api_request = ApiRequest(
@@ -71,11 +85,11 @@ class DeviceManager:
                 data={"mac": device_mac, "cmd": "restart"},
             )
             await self._connection.request(api_request)
-            logger.info("Reboot command sent for device %s", device_mac)
+            logger.info("Reboot command sent for device [redacted]")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error rebooting device %s: %s", device_mac, e)
+            logger.error("Error rebooting device [redacted]: %s", type(e).__name__)
             raise
 
     async def rename_device(self, device_mac: str, name: str) -> bool:
@@ -84,20 +98,21 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             device = await self.get_device_details(device_mac)  # raises on miss
             if "_id" not in device.raw:
-                logger.error("Cannot rename device %s: missing _id in raw payload.", device_mac)
+                logger.error("Cannot rename device [redacted]: missing _id in raw payload.")
                 return False
             device_id = device.raw["_id"]
 
             api_request = ApiRequest(method="put", path=f"/rest/device/{device_id}", data={"name": name})
             await self._connection.request(api_request)
-            logger.info("Rename command sent for device %s to '%s'", device_mac, name)
+            logger.info("Rename command sent for device [redacted] to '[redacted]'")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error renaming device %s to '%s': %s", device_mac, name, e)
+            logger.error("Error renaming device [redacted] to '[redacted]': %s", type(e).__name__)
             raise
 
     async def adopt_device(self, device_mac: str) -> bool:
@@ -106,6 +121,7 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         await self.get_device_details(device_mac)  # existence check; raises on miss
         try:
             api_request = ApiRequest(
@@ -114,11 +130,11 @@ class DeviceManager:
                 data={"mac": device_mac, "cmd": "adopt"},
             )
             await self._connection.request(api_request)
-            logger.info("Adopt command sent for device %s", device_mac)
+            logger.info("Adopt command sent for device [redacted]")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error adopting device %s: %s", device_mac, e)
+            logger.error("Error adopting device [redacted]: %s", type(e).__name__)
             raise
 
     async def upgrade_device(self, device_mac: str) -> bool:
@@ -127,6 +143,7 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         await self.get_device_details(device_mac)  # existence check; raises on miss
         try:
             api_request = ApiRequest(
@@ -135,11 +152,11 @@ class DeviceManager:
                 data={"mac": device_mac, "cmd": "upgrade"},
             )
             await self._connection.request(api_request)
-            logger.info("Upgrade command sent for device %s", device_mac)
+            logger.info("Upgrade command sent for device [redacted]")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error upgrading device %s: %s", device_mac, e)
+            logger.error("Error upgrading device [redacted]: %s", type(e).__name__)
             raise
 
     async def locate_device(self, device_mac: str, enabled: bool = True) -> bool:
@@ -152,6 +169,7 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             cmd = "set-locate" if enabled else "unset-locate"
             api_request = ApiRequest(
@@ -160,10 +178,10 @@ class DeviceManager:
                 data={"cmd": cmd, "mac": device_mac},
             )
             await self._connection.request(api_request)
-            logger.info("Locate %s for device %s", "enabled" if enabled else "disabled", device_mac)
+            logger.info("Locate %s for device [redacted]", "enabled" if enabled else "disabled")
             return True
         except Exception as e:
-            logger.error("Error setting locate mode on device %s: %s", device_mac, e)
+            logger.error("Error setting locate mode on device [redacted]: %s", type(e).__name__)
             raise
 
     async def force_provision(self, device_mac: str) -> bool:
@@ -175,6 +193,7 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             api_request = ApiRequest(
                 method="post",
@@ -182,23 +201,23 @@ class DeviceManager:
                 data={"cmd": "force-provision", "mac": device_mac},
             )
             await self._connection.request(api_request)
-            logger.info("Force provision command sent for device %s", device_mac)
+            logger.info("Force provision command sent for device [redacted]")
             return True
         except Exception as e:
-            logger.error("Error force provisioning device %s: %s", device_mac, e)
+            logger.error("Error force provisioning device [redacted]: %s", type(e).__name__)
             raise
 
     async def get_device_radio(self, device_mac: str) -> Optional[Dict[str, Any]]:
-        """Get focused radio configuration and live stats for an AP.
+        """Get focused radio configuration and live stats for a device with radios.
 
-        Returns None if the device exists but is not an access point.
+        Returns None if the device exists but has no radios.
 
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         device = await self.get_device_details(device_mac)  # raises on miss
-        device_type = device.raw.get("type", "")
-        if not device_type.startswith("uap"):
+        if "radio_table" not in device.raw:
             return None
 
         stats_by_name: Dict[str, Dict[str, Any]] = {s["name"]: s for s in device.raw.get("radio_table_stats", [])}
@@ -207,8 +226,8 @@ class DeviceManager:
             entry: Dict[str, Any] = {
                 "name": radio.get("name"),
                 "radio": radio.get("radio"),
-                "channel": radio.get("channel"),
-                "ht": radio.get("ht"),
+                "channel": normalize_radio_channel(radio.get("channel")),
+                "ht": normalize_radio_ht(radio.get("ht")),
                 "tx_power_mode": radio.get("tx_power_mode"),
                 "tx_power": radio.get("tx_power"),
                 "min_rssi_enabled": radio.get("min_rssi_enabled"),
@@ -222,7 +241,7 @@ class DeviceManager:
             }
             if stats := stats_by_name.get(radio.get("name", "")):
                 entry["current_tx_power"] = stats.get("tx_power")
-                entry["current_channel"] = stats.get("channel")
+                entry["current_channel"] = normalize_radio_channel(stats.get("channel"))
                 entry["cu_total"] = stats.get("cu_total")
                 entry["cu_self_tx"] = stats.get("cu_self_tx")
                 entry["cu_self_rx"] = stats.get("cu_self_rx")
@@ -240,10 +259,10 @@ class DeviceManager:
         }
 
     async def update_device_radio(self, device_mac: str, radio_id: str, updates: Dict[str, Any]) -> bool:
-        """Update radio settings for a specific band on an AP.
+        """Update radio settings for a specific band on a device with radios.
 
         Args:
-            device_mac: MAC address of the AP.
+            device_mac: MAC address of the device.
             radio_id: Radio identifier -- either the band code ("na", "ng", "6e")
                       or the internal name ("wifi0", "wifi1").
             updates: Dict of radio_table fields to update (e.g. tx_power_mode, channel).
@@ -251,10 +270,11 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             device = await self.get_device_details(device_mac)  # raises on miss
             if "_id" not in device.raw:
-                logger.error("Cannot update radio for %s: missing _id in raw payload.", device_mac)
+                logger.error("Cannot update radio for [redacted]: missing _id in raw payload.")
                 return False
             device_id = device.raw["_id"]
 
@@ -267,7 +287,7 @@ class DeviceManager:
                     break
 
             if not matched:
-                logger.error("Radio '%s' not found on device %s.", radio_id, device_mac)
+                logger.error("Radio '%s' not found on device [redacted].", radio_id)
                 return False
 
             api_request = ApiRequest(
@@ -276,11 +296,11 @@ class DeviceManager:
                 data={"radio_table": radio_table},
             )
             await self._connection.request(api_request)
-            logger.info("Radio '%s' updated on device %s: %s", radio_id, device_mac, list(updates.keys()))
+            logger.info("Radio '%s' updated on device [redacted]: %s", radio_id, list(updates.keys()))
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error updating radio '%s' on device %s: %s", radio_id, device_mac, e)
+            logger.error("Error updating radio '%s' on device [redacted]: %s", radio_id, type(e).__name__)
             raise
 
     async def trigger_speedtest(self, gateway_mac: str) -> bool:
@@ -292,6 +312,7 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        gateway_mac = normalize_mac(gateway_mac) or gateway_mac
         try:
             api_request = ApiRequest(
                 method="post",
@@ -299,10 +320,10 @@ class DeviceManager:
                 data={"mac": gateway_mac, "cmd": "speedtest"},
             )
             await self._connection.request(api_request)
-            logger.info("Speedtest triggered on gateway %s", gateway_mac)
+            logger.info("Speedtest triggered on gateway [redacted]")
             return True
         except Exception as e:
-            logger.error("Error triggering speedtest on %s: %s", gateway_mac, e)
+            logger.error("Error triggering speedtest on [redacted]: %s", type(e).__name__)
             raise
 
     async def get_speedtest_status(self, gateway_mac: str) -> Dict[str, Any]:
@@ -314,6 +335,7 @@ class DeviceManager:
         Returns:
             Dict with speedtest status fields, or empty dict on failure.
         """
+        gateway_mac = normalize_mac(gateway_mac) or gateway_mac
         try:
             api_request = ApiRequest(
                 method="post",
@@ -323,7 +345,7 @@ class DeviceManager:
             response = await self._connection.request(api_request)
             return response if isinstance(response, dict) else {}
         except Exception as e:
-            logger.error("Error getting speedtest status for %s: %s", gateway_mac, e)
+            logger.error("Error getting speedtest status for [redacted]: %s", type(e).__name__)
             raise
 
     async def list_rogue_aps(self, within_hours: int = 24) -> List[Dict[str, Any]]:
@@ -351,7 +373,7 @@ class DeviceManager:
             self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
-            logger.error("Error listing rogue APs: %s", e)
+            logger.error("Error listing rogue APs: %s", type(e).__name__)
             raise
 
     async def trigger_rf_scan(self, ap_mac: str) -> bool:
@@ -363,6 +385,7 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        ap_mac = normalize_mac(ap_mac) or ap_mac
         try:
             api_request = ApiRequest(
                 method="post",
@@ -370,10 +393,10 @@ class DeviceManager:
                 data={"cmd": "spectrum-scan", "mac": ap_mac},
             )
             await self._connection.request(api_request)
-            logger.info("RF scan triggered on AP %s", ap_mac)
+            logger.info("RF scan triggered on AP [redacted]")
             return True
         except Exception as e:
-            logger.error("Error triggering RF scan on %s: %s", ap_mac, e)
+            logger.error("Error triggering RF scan on [redacted]: %s", type(e).__name__)
             raise
 
     async def get_rf_scan_results(self, ap_mac: str) -> List[Dict[str, Any]]:
@@ -385,6 +408,7 @@ class DeviceManager:
         Returns:
             List of scan result dicts, or empty list on failure.
         """
+        ap_mac = normalize_mac(ap_mac) or ap_mac
         cache_key = f"{CACHE_PREFIX_RF_SCAN}_{ap_mac}_{self._connection.site}"
         cached_data: Optional[List[Dict[str, Any]]] = self._connection.get_cached(cache_key)
         if cached_data is not None:
@@ -400,7 +424,7 @@ class DeviceManager:
             self._connection._update_cache(cache_key, result, timeout=60)
             return result
         except Exception as e:
-            logger.error("Error getting RF scan results for %s: %s", ap_mac, e)
+            logger.error("Error getting RF scan results for [redacted]: %s", type(e).__name__)
             raise
 
     async def list_available_channels(self) -> List[Dict[str, Any]]:
@@ -424,7 +448,7 @@ class DeviceManager:
             self._connection._update_cache(cache_key, result, timeout=3600)
             return result
         except Exception as e:
-            logger.error("Error listing available channels: %s", e)
+            logger.error("Error listing available channels: %s", type(e).__name__)
             raise
 
     async def set_device_led_override(self, device_mac: str, led_override: str) -> bool:
@@ -437,10 +461,11 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             device = await self.get_device_details(device_mac)
             if not device or "_id" not in device.raw:
-                logger.error("Cannot set LED override for %s: Not found or missing ID.", device_mac)
+                logger.error("Cannot set LED override for [redacted]: Not found or missing ID.")
                 return False
             device_id = device.raw["_id"]
 
@@ -450,11 +475,11 @@ class DeviceManager:
                 data={"led_override": led_override},
             )
             await self._connection.request(api_request)
-            logger.info("LED override set to '%s' for device %s", led_override, device_mac)
+            logger.info("LED override set to '%s' for device [redacted]", led_override)
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error setting LED override on device %s: %s", device_mac, e)
+            logger.error("Error setting LED override on device [redacted]: %s", type(e).__name__)
             raise
 
     async def set_device_disabled(self, device_mac: str, disabled: bool) -> bool:
@@ -467,10 +492,11 @@ class DeviceManager:
         Returns:
             True on success, False on failure.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         try:
             device = await self.get_device_details(device_mac)
             if not device or "_id" not in device.raw:
-                logger.error("Cannot set disabled state for %s: Not found or missing ID.", device_mac)
+                logger.error("Cannot set disabled state for [redacted]: Not found or missing ID.")
                 return False
             device_id = device.raw["_id"]
 
@@ -480,11 +506,11 @@ class DeviceManager:
                 data={"disabled": disabled},
             )
             await self._connection.request(api_request)
-            logger.info("Device %s %s", device_mac, "disabled" if disabled else "enabled")
+            logger.info("Device [redacted] %s", "disabled" if disabled else "enabled")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
             return True
         except Exception as e:
-            logger.error("Error setting disabled state on device %s: %s", device_mac, e)
+            logger.error("Error setting disabled state on device [redacted]: %s", type(e).__name__)
             raise
 
     @staticmethod
@@ -519,6 +545,7 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         device = await self.get_device_details(device_mac)  # raises on miss
         if not self._is_pdu(device.raw):
             return None
@@ -583,11 +610,14 @@ class DeviceManager:
         Raises:
             UniFiNotFoundError: If the device does not exist.
         """
+        device_mac = normalize_mac(device_mac) or device_mac
+        if outlet_index < 1:
+            raise ValueError("outlet_index must be >= 1.")
         device = await self.get_device_details(device_mac)  # raises on miss
         if not self._is_pdu(device.raw):
             return None
         if "_id" not in device.raw:
-            logger.error("Cannot set outlet state on %s: missing _id in raw payload.", device_mac)
+            logger.error("Cannot set outlet state on [redacted]: missing _id in raw payload.")
             return None
         device_id = device.raw["_id"]
 
@@ -597,8 +627,13 @@ class DeviceManager:
             None,
         )
         if sensed is None:
-            logger.error("Outlet index %s not found on PDU %s.", outlet_index, device_mac)
+            logger.error("Outlet index %s not found on PDU [redacted].", outlet_index)
             return None
+        if sensed.get("has_relay") is False:
+            raise ValueError(
+                f"Outlet {outlet_index} ('{sensed.get('name')}') on PDU {device_mac} "
+                "does not have a controllable relay (has_relay=false)."
+            )
 
         overrides: List[Dict[str, Any]] = copy.deepcopy(device.raw.get("outlet_overrides", []))
 
@@ -628,9 +663,8 @@ class DeviceManager:
         )
         await self._connection.request(api_request)
         logger.info(
-            "Outlet %s on PDU %s set to relay_state=%s cycle_enabled=%s (preserved %d sibling overrides)",
+            "Outlet %s on PDU [redacted] set to relay_state=%s cycle_enabled=%s (preserved %d sibling overrides)",
             outlet_index,
-            device_mac,
             relay_state,
             target.get("cycle_enabled"),
             max(len(overrides) - 1, 0),
@@ -663,5 +697,5 @@ class DeviceManager:
             logger.info("Site LEDs %s", "enabled" if enabled else "disabled")
             return True
         except Exception as e:
-            logger.error("Error setting site LED state: %s", e)
+            logger.error("Error setting site LED state: %s", type(e).__name__)
             raise

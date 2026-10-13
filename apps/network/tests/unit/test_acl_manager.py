@@ -408,3 +408,86 @@ class TestAclManager:
         api_request = call_args[0][0]
         assert api_request.path == "/acl-rules/r1"
         assert api_request.method == "delete"
+
+    # ---- update_acl_rule: mask-clear sentinel handling (real pop path) ----
+
+    @pytest.mark.asyncio
+    async def test_update_clears_mask_via_none_sentinel(self, acl_manager, mock_connection):
+        """A None mac_mask in the update is popped (cleared) before the PUT; MACs survive."""
+        existing = {
+            "_id": "r1",
+            "name": "R",
+            "traffic_source": {"specific_mac_addresses": [], "type": "CLIENT_MAC"},
+            "traffic_destination": {
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "type": "CLIENT_MAC",
+            },
+        }
+        mock_connection.request.side_effect = [[existing], {}]
+        result = await acl_manager.update_acl_rule(
+            "r1", {"traffic_destination": {"mac_mask": None, "type": "CLIENT_MAC"}}
+        )
+        assert "mac_mask" not in result["traffic_destination"]  # cleared
+        assert result["traffic_destination"]["specific_mac_addresses"] == ["01:00:5e:00:00:00"]  # preserved
+
+    @pytest.mark.asyncio
+    async def test_update_clear_idempotent_no_existing_mask(self, acl_manager, mock_connection):
+        """Clearing a side that has no mask is a harmless no-op (no error, MACs intact)."""
+        existing = {
+            "_id": "r1",
+            "name": "R",
+            "traffic_source": {"specific_mac_addresses": ["aa:bb:cc:dd:ee:ff"], "type": "CLIENT_MAC"},
+            "traffic_destination": {"specific_mac_addresses": [], "type": "CLIENT_MAC"},
+        }
+        mock_connection.request.side_effect = [[existing], {}]
+        result = await acl_manager.update_acl_rule("r1", {"traffic_source": {"mac_mask": None, "type": "CLIENT_MAC"}})
+        assert "mac_mask" not in result["traffic_source"]
+        assert result["traffic_source"]["specific_mac_addresses"] == ["aa:bb:cc:dd:ee:ff"]
+
+    @pytest.mark.asyncio
+    async def test_update_clear_both_sides(self, acl_manager, mock_connection):
+        """Clearing both sides in one update pops both masks."""
+        existing = {
+            "_id": "r1",
+            "name": "R",
+            "traffic_source": {
+                "mac_mask": "ff:ff:00:00:00:00",
+                "specific_mac_addresses": ["aa:bb:cc:dd:ee:ff"],
+                "type": "CLIENT_MAC",
+            },
+            "traffic_destination": {
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "type": "CLIENT_MAC",
+            },
+        }
+        mock_connection.request.side_effect = [[existing], {}]
+        result = await acl_manager.update_acl_rule(
+            "r1",
+            {
+                "traffic_source": {"mac_mask": None, "type": "CLIENT_MAC"},
+                "traffic_destination": {"mac_mask": None, "type": "CLIENT_MAC"},
+            },
+        )
+        assert "mac_mask" not in result["traffic_source"]
+        assert "mac_mask" not in result["traffic_destination"]
+
+    @pytest.mark.asyncio
+    async def test_update_clear_does_not_mutate_aliased_untouched_side(self, acl_manager, mock_connection):
+        """Regression: a destination-only update must not pop the source side, even if the (aliased,
+        cached) source dict happens to hold mac_mask=None — popping there would corrupt the cache."""
+        existing = {
+            "_id": "r1",
+            "name": "R",
+            "traffic_source": {"mac_mask": None, "specific_mac_addresses": [], "type": "CLIENT_MAC"},
+            "traffic_destination": {
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "type": "CLIENT_MAC",
+            },
+        }
+        mock_connection.request.side_effect = [[existing], {}]
+        await acl_manager.update_acl_rule("r1", {"traffic_destination": {"mac_mask": None, "type": "CLIENT_MAC"}})
+        # source was absent from the update → its aliased cached dict is left intact (key not popped)
+        assert "mac_mask" in existing["traffic_source"]

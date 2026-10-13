@@ -7,9 +7,8 @@ tool catalog for relay registration.
 Discovery strategy:
 1. Initialize MCP session (initialize request + initialized notification)
 2. List tools via tools/list
-3. If a ``*_tool_index`` meta-tool is found (lazy mode), call it to get the
-   full catalog with annotations and schemas
-4. Otherwise, fall back to using tools/list results directly (eager mode)
+3. If a ``*_tool_index`` meta-tool is present, call it for the canonical catalog
+4. Otherwise, use ``tools/list`` directly
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import aiohttp
 from unifi_mcp_shared.metadata import PROJECT_WEBSITE_URL, mcp_icons_for_server
 from unifi_mcp_shared.protocol import DEFAULT_MCP_PROTOCOL_REVISION
 
+from unifi_mcp_relay.policy import filter_relay_tools
 from unifi_mcp_relay.protocol import ToolInfo
 
 logger = logging.getLogger("unifi-mcp-relay")
@@ -71,6 +71,7 @@ class McpHttpClient:
         self._session_id: str | None = session_id
         self._protocol_version: str | None = protocol_version
         self._request_id: int = 0
+        self._recovery_lock = asyncio.Lock()
 
     @property
     def session_id(self) -> str | None:
@@ -132,6 +133,44 @@ class McpHttpClient:
             RuntimeError: If the server returns a JSON-RPC error.
             aiohttp.ClientError: On transport-level failures.
         """
+        # Snapshot session state while no recovery handshake is in progress.
+        async with self._recovery_lock:
+            headers = self._headers(include_protocol_version=method != "initialize")
+        try:
+            return await self._request_once(method, params, headers)
+        except aiohttp.ClientResponseError as exc:
+            expired_id = headers.get("MCP-Session-Id")
+            if exc.status != 404 or not expired_id or method == "initialize":
+                raise
+
+        # MCP session 404 means the request was rejected before dispatch.
+        # Never replay a timeout, connection failure, or other HTTP error.
+        async with self._recovery_lock:
+            if self._session_id == expired_id:
+                old_protocol = self._protocol_version
+                self._session_id = None
+                self._protocol_version = None
+                try:
+                    await self._request_once(
+                        "initialize",
+                        {
+                            "protocolVersion": DEFAULT_MCP_PROTOCOL_REVISION,
+                            "capabilities": {},
+                            "clientInfo": _relay_client_info(),
+                        },
+                        self._headers(include_protocol_version=False),
+                    )
+                    await self.notify("notifications/initialized")
+                except BaseException:
+                    # Preserve the expired ID so a later call can recover again.
+                    self._session_id = expired_id
+                    self._protocol_version = old_protocol
+                    raise
+            headers = self._headers(include_protocol_version=True)
+        return await self._request_once(method, params, headers)
+
+    async def _request_once(self, method: str, params: dict | None, headers: dict[str, str]) -> dict:
+        """Send once using a fixed session snapshot; never retry transport errors."""
         session = await self._ensure_session()
         self._request_id += 1
 
@@ -143,13 +182,7 @@ class McpHttpClient:
         if params is not None:
             payload["params"] = params
 
-        headers = self._headers(include_protocol_version=method != "initialize")
-
         async with session.post(self._base_url, json=payload, headers=headers) as resp:
-            # Capture session ID from response
-            if "mcp-session-id" in resp.headers:
-                self._session_id = resp.headers["mcp-session-id"]
-
             resp.raise_for_status()
 
             # Handle both JSON and SSE response formats
@@ -175,6 +208,7 @@ class McpHttpClient:
         result = data.get("result", {})
         if method == "initialize":
             self._set_negotiated_protocol_version(result.get("protocolVersion"))
+            self._session_id = resp.headers.get("mcp-session-id")
 
         return result
 
@@ -192,10 +226,7 @@ class McpHttpClient:
         headers = self._headers(include_protocol_version=True)
 
         async with session.post(self._base_url, json=payload, headers=headers) as resp:
-            if "mcp-session-id" in resp.headers:
-                self._session_id = resp.headers["mcp-session-id"]
-            if resp.status >= 400:
-                logger.warning("[discovery] Notification '%s' got HTTP %d", method, resp.status)
+            resp.raise_for_status()
 
     async def close(self) -> None:
         """Close the underlying aiohttp session."""
@@ -214,6 +245,16 @@ def _relay_version() -> str:
         return version("unifi-mcp-relay")
     except PackageNotFoundError:  # pragma: no cover - package is installed in workspace tests
         return "0.0.0"
+
+
+def _relay_client_info() -> dict:
+    return {
+        "name": "unifi-mcp-relay",
+        "title": "UniFi MCP Relay",
+        "version": _relay_version(),
+        "websiteUrl": PROJECT_WEBSITE_URL,
+        "icons": [icon.model_dump(by_alias=True, exclude_none=True) for icon in mcp_icons_for_server("relay")],
+    }
 
 
 def _extract_annotations(tool_data: dict) -> dict | None:
@@ -242,7 +283,7 @@ def _build_tools_from_index(index_result: dict, server_name: str) -> list[ToolIn
                 server_origin=server_name,
             )
         )
-    return tools
+    return filter_relay_tools(tools)
 
 
 def _build_tools_from_list(tools_list: list[dict], server_name: str) -> list[ToolInfo]:
@@ -259,7 +300,43 @@ def _build_tools_from_list(tools_list: list[dict], server_name: str) -> list[Too
                 server_origin=server_name,
             )
         )
-    return tools
+    return filter_relay_tools(tools)
+
+
+def _overlay_listed_metadata(
+    indexed_tools: list[ToolInfo],
+    listed_tools: list[dict],
+    server_name: str,
+) -> list[ToolInfo]:
+    """Supplement indexed tools with metadata exposed directly by tools/list.
+
+    Older eager servers may expose annotations and titles through tools/list but
+    omit them from their index. The index remains canonical for membership and
+    schemas while matching direct entries fill missing metadata.
+    """
+    listed_by_name = {tool.name: tool for tool in _build_tools_from_list(listed_tools, server_name)}
+    merged_tools = []
+    for indexed in indexed_tools:
+        listed = listed_by_name.get(indexed.name)
+        if listed is None:
+            merged_tools.append(indexed)
+            continue
+
+        annotations = None
+        if listed.annotations is not None or indexed.annotations is not None:
+            annotations = {**(listed.annotations or {}), **(indexed.annotations or {})}
+
+        merged_tools.append(
+            ToolInfo(
+                name=indexed.name,
+                title=indexed.title or listed.title,
+                description=indexed.description or listed.description,
+                input_schema=indexed.input_schema or listed.input_schema,
+                annotations=annotations,
+                server_origin=indexed.server_origin,
+            )
+        )
+    return merged_tools
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +350,8 @@ async def discover_tools(server_url: str) -> ServerInfo | None:
     Performs the full MCP handshake:
     1. ``initialize`` — establish session, learn server capabilities
     2. ``tools/list`` — get registered tools (may be meta-tools only in lazy mode)
-    3. If a ``*_tool_index`` tool is found, call it for the full catalog
+    3. Call a ``*_tool_index`` tool for the canonical catalog when available;
+       otherwise use ``tools/list`` directly
 
     Args:
         server_url: Base URL of the MCP server (e.g., ``http://localhost:3000``).
@@ -289,13 +367,7 @@ async def discover_tools(server_url: str) -> ServerInfo | None:
             {
                 "protocolVersion": DEFAULT_MCP_PROTOCOL_REVISION,
                 "capabilities": {},
-                "clientInfo": {
-                    "name": "unifi-mcp-relay",
-                    "title": "UniFi MCP Relay",
-                    "version": _relay_version(),
-                    "websiteUrl": PROJECT_WEBSITE_URL,
-                    "icons": [icon.model_dump(exclude_none=True) for icon in mcp_icons_for_server("relay")],
-                },
+                "clientInfo": _relay_client_info(),
             },
         )
 
@@ -325,8 +397,13 @@ async def discover_tools(server_url: str) -> ServerInfo | None:
             if tool_index_name and lazy_load_tool_name:
                 break
 
-        if tool_index_name:
-            # Lazy mode: call the tool_index for the full catalog
+        # Lazy servers expose direct tools after they are loaded, so direct-tool
+        # presence cannot distinguish eager mode from a warmed lazy server.
+        # Keep the index canonical whenever the server provides one.
+        use_tool_index = tool_index_name is not None
+
+        if use_tool_index:
+            # Lazy/meta-only mode: call the tool_index for the full catalog
             logger.info("[discovery] Found tool index '%s' on %s, fetching full catalog", tool_index_name, server_name)
             call_result = await client.request(
                 "tools/call", {"name": tool_index_name, "arguments": {"include_schemas": True}}
@@ -336,13 +413,14 @@ async def discover_tools(server_url: str) -> ServerInfo | None:
             content = call_result.get("content", [])
             if content and content[0].get("type") == "text":
                 index_data = json.loads(content[0]["text"])
-                tools = _build_tools_from_index(index_data, server_name)
+                indexed_tools = _build_tools_from_index(index_data, server_name)
+                tools = _overlay_listed_metadata(indexed_tools, listed_tools, server_name)
             else:
                 logger.warning("[discovery] Unexpected tool_index response from %s", server_name)
                 tools = _build_tools_from_list(listed_tools, server_name)
         else:
-            # Eager mode fallback: use tools/list directly
-            logger.info("[discovery] No tool_index found on %s, using tools/list directly", server_name)
+            # A server without an index exposes its catalog through tools/list.
+            logger.info("[discovery] No tool index found on %s, using tools/list directly", server_name)
             tools = _build_tools_from_list(listed_tools, server_name)
 
         info = ServerInfo(
@@ -350,7 +428,7 @@ async def discover_tools(server_url: str) -> ServerInfo | None:
             url=server_url,
             session_id=client.session_id,
             protocol_version=client.protocol_version,
-            lazy_load_tool_name=lazy_load_tool_name if tool_index_name else None,
+            lazy_load_tool_name=lazy_load_tool_name if use_tool_index else None,
             tools=tools,
         )
         logger.info("[discovery] Discovered %d tools from %s (%s)", len(tools), server_name, server_url)

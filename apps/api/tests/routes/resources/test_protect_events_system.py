@@ -74,7 +74,7 @@ class _FakeProtectCM:
 
 def _stub_connection(app, cid: str) -> _FakeProtectCM:
     fake = _FakeProtectCM()
-    app.state.manager_factory._connection_cache[(cid, "protect")] = fake
+    app.state.manager_factory._connection_cache[(cid, "protect", None)] = fake
     return fake
 
 
@@ -198,6 +198,44 @@ async def test_get_event_happy_path(tmp_path, monkeypatch) -> None:
     assert body["data"]["id"] == "ev-1"
     assert body["data"]["recognized_person_name"] == "Assigned Person"
     assert body["render_hint"]["kind"] == "detail"
+
+
+@pytest.mark.asyncio
+async def test_get_event_surfaces_plate_identity(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    payload = {
+        "id": "ev-2",
+        "type": "smartDetectZone",
+        "start": 1700000000,
+        "end": 1700000010,
+        "camera_id": "cam-1",
+        "score": 88,
+        "recognized_plate_text": "ABC123",
+        "recognized_plate_group_id": "plate-group-1",
+        "recognized_plate_confidence": 88,
+    }
+
+    async def fake(self, event_id):
+        assert event_id == "ev-2"
+        return payload
+
+    from unifi_core.protect.managers.event_manager import EventManager
+
+    monkeypatch.setattr(EventManager, "get_event", fake)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/events/ev-2?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["data"]["recognized_plate_text"] == "ABC123"
+    assert body["data"]["recognized_plate_group_id"] == "plate-group-1"
+    assert body["data"]["recognized_plate_confidence"] == 88
 
 
 @pytest.mark.asyncio
@@ -448,9 +486,9 @@ async def test_alarm_get_status_happy_path(tmp_path, monkeypatch) -> None:
     async def fake(self):
         return payload
 
-    from unifi_core.protect.managers.alarm_manager import AlarmManager
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
 
-    monkeypatch.setattr(AlarmManager, "get_arm_state", fake)
+    monkeypatch.setattr(AlarmRulesFacade, "get_arm_state", fake)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         r = await c.get(
@@ -470,16 +508,30 @@ async def test_alarm_list_profiles_happy_path(tmp_path, monkeypatch) -> None:
     _stub_connection(app, cid)
 
     fake_profiles = [
-        {"id": "p-1", "name": "Home"},
-        {"id": "p-2", "name": "Away"},
+        {
+            "id": "p-1",
+            "name": "Home",
+            "state": "armed",
+            "state_set_at": "2026-09-04T12:00:00Z",
+            "id_family": "alarm_manager_v2",
+            "arm_compatible": False,
+        },
+        {
+            "id": "p-2",
+            "name": "Away",
+            "state": "disarmed",
+            "state_set_at": "2026-09-04T13:00:00Z",
+            "id_family": "alarm_manager_v2",
+            "arm_compatible": False,
+        },
     ]
 
     async def fake(self):
-        return fake_profiles
+        return fake_profiles, True
 
-    from unifi_core.protect.managers.alarm_manager import AlarmManager
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
 
-    monkeypatch.setattr(AlarmManager, "list_arm_profiles", fake)
+    monkeypatch.setattr(AlarmRulesFacade, "list_profiles", fake)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         r = await c.get(
@@ -489,6 +541,66 @@ async def test_alarm_list_profiles_happy_path(tmp_path, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["items"]) == 2
+    assert {item["id"]: item for item in body["items"]} == {profile["id"]: profile for profile in fake_profiles}
+
+
+@pytest.mark.asyncio
+async def test_alarm_list_profiles_marks_incomplete_empty_fallback(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    async def fake(self):
+        return [], False
+
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
+
+    monkeypatch.setattr(AlarmRulesFacade, "list_profiles", fake)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        response = await c.get(
+            f"/v1/sites/default/alarm-profiles?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["items"] == []
+    assert body["_meta"]["com.github.sirkirby.unifi-mcp/alarm-coverage"]["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_alarm_list_profiles_permission_error_maps_to_403(tmp_path, monkeypatch) -> None:
+    """Non-SuperAdmin on v2 + empty legacy fallback must surface as 403, not 500.
+
+    The facade re-raises ``AlarmManagerPermissionError`` so the actionable
+    remediation is not flattened into a misleading empty list. This route has
+    to translate it rather than let it escape as ``Internal Server Error``.
+    """
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
+    from unifi_core.protect.managers.alarm_manager_service import (
+        AlarmManagerPermissionError,
+    )
+
+    detail = "Alarm Manager v2 requires a SuperAdmin local account."
+
+    async def fake(self):
+        raise AlarmManagerPermissionError(detail)
+
+    monkeypatch.setattr(AlarmRulesFacade, "list_profiles", fake)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/alarm-profiles?controller={cid}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+
+    assert r.status_code == 403, r.text
+    assert detail in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

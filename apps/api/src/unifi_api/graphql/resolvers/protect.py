@@ -6,10 +6,11 @@ Phase 6 PR3 Task D — wires every migrated protect read tool into a typed
 - Fetch helpers route through ``ctx.cache.get_or_fetch`` so concurrent
   resolvers in the same request share a single manager round-trip.
 - Page wrappers carry pagination cursors per LIST resolver.
-- DETAIL resolvers either filter the cached LIST snapshot by primary key
-  (``camera``, ``event`` -> events list, ``recording`` -> per-camera list)
-  or fetch per-id via cache when there is no list (``snapshot``,
-  ``cameraAnalytics``, ``cameraStreams``, ``eventThumbnail``).
+- DETAIL resolvers use a per-id manager method when one exists (``camera``),
+  filter the cached LIST snapshot when the list carries the full shape
+  (``event`` -> events list, ``recording`` -> per-camera list), or fetch
+  per-id via cache when there is no list (``snapshot``, ``cameraAnalytics``,
+  ``cameraStreams``, ``eventThumbnail``).
 - Wrapper-dict tools (``alarmStatus``, ``alarmProfiles``,
   ``recordingStatus``, ``viewers``) return the typed wrapper directly via
   ``Type.from_manager_output(raw)``.
@@ -30,10 +31,23 @@ from typing import Any
 
 import strawberry
 from strawberry.types import Info
+from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.incident_collection import (
+    DEFAULT_CALLS,
+    DEFAULT_ELAPSED_MS,
+    DEFAULT_EVENTS,
+    DEFAULT_WINDOW_SECONDS,
+)
 
 from unifi_api.graphql.context import GraphQLContext
 from unifi_api.graphql.permissions import IsRead
-from unifi_api.graphql.types.protect.alarms import AlarmProfileList, AlarmStatus
+from unifi_api.graphql.types.incident_evidence import IncidentEvidence
+from unifi_api.graphql.types.protect.alarms import (
+    AlarmProfileList,
+    AlarmRule,
+    AlarmRuleList,
+    AlarmStatus,
+)
 from unifi_api.graphql.types.protect.cameras import (
     Camera,
     CameraAnalytics,
@@ -48,7 +62,11 @@ from unifi_api.graphql.types.protect.events import (
 )
 from unifi_api.graphql.types.protect.lights import Light
 from unifi_api.graphql.types.protect.liveviews import Liveview
-from unifi_api.graphql.types.protect.recognition import KnownFace
+from unifi_api.graphql.types.protect.recognition import (
+    DetectionSearchLabels,
+    KnownFace,
+    KnownLicensePlate,
+)
 from unifi_api.graphql.types.protect.recordings import (
     Recording,
     RecordingStatusList,
@@ -59,6 +77,13 @@ from unifi_api.graphql.types.protect.system import (
     ProtectHealth,
     ProtectSystemInfo,
     ViewerList,
+)
+from unifi_api.services.controllers import get_controller
+from unifi_api.services.incident_evidence import (
+    collect_protect_evidence,
+    presentation,
+    protect_request,
+    require_product,
 )
 
 # ---------------------------------------------------------------------------
@@ -83,15 +108,15 @@ def _id_of(obj: Any) -> Any:
 
 
 def _decode_cursor(cursor: str | None):
-    """Translate an opaque cursor string to a Cursor (or raise ValueError)."""
+    """Translate an opaque cursor string to a Cursor (or raise InvalidCursor)."""
     from unifi_api.services.pagination import Cursor, InvalidCursor
 
     if not cursor:
         return None
     try:
         return Cursor.decode(cursor)
-    except InvalidCursor:
-        raise ValueError("invalid cursor")
+    except InvalidCursor as exc:
+        raise InvalidCursor("invalid cursor") from exc
 
 
 async def _maybe_set_site(cm: Any, site: str | None) -> None:
@@ -197,6 +222,30 @@ async def _fetch_cameras(ctx: GraphQLContext, controller: str) -> list:
     return await ctx.cache.get_or_fetch(key, _do)
 
 
+async def _fetch_camera(ctx: GraphQLContext, controller: str, camera_id: str) -> Any:
+    key = f"protect/cameras/{controller}/{camera_id}"
+
+    async def _do() -> Any:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "camera_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            try:
+                return await mgr.get_camera(camera_id)
+            except UniFiNotFoundError:
+                return None
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
 async def _fetch_camera_analytics(
     ctx: GraphQLContext,
     controller: str,
@@ -288,6 +337,47 @@ async def _fetch_known_faces(
     return await ctx.cache.get_or_fetch(key, _do)
 
 
+async def _fetch_known_license_plates(
+    ctx: GraphQLContext,
+    controller: str,
+    min_confidence: int,
+    include_interest: bool,
+    group_types: list[str] | None,
+    order_by: str,
+    order_direction: str,
+) -> list:
+    group_types_key = ",".join(group_types) if group_types else ""
+    key = (
+        f"protect/known-license-plates/{controller}/{min_confidence}/"
+        f"{include_interest}/{group_types_key}/{order_by}/{order_direction}"
+    )
+
+    async def _do() -> list:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "recognition_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            result = await mgr.list_known_license_plates(
+                page_size=1000,
+                min_confidence=min_confidence,
+                include_interest=include_interest,
+                group_types=group_types,
+                order_by=order_by,
+                order_direction=order_direction,
+            )
+            return list(result.get("license_plates", []))
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
 async def _fetch_snapshot(
     ctx: GraphQLContext,
     controller: str,
@@ -345,7 +435,7 @@ async def _fetch_alarm_status(ctx: GraphQLContext, controller: str) -> Any:
                 session,
                 controller,
                 "protect",
-                "alarm_manager",
+                "alarm_facade",
             )
             await ctx.manager_factory.get_connection_manager(
                 session,
@@ -366,14 +456,72 @@ async def _fetch_alarm_profiles(ctx: GraphQLContext, controller: str) -> Any:
                 session,
                 controller,
                 "protect",
-                "alarm_manager",
+                "alarm_facade",
             )
             await ctx.manager_factory.get_connection_manager(
                 session,
                 controller,
                 "protect",
             )
-            return await mgr.list_arm_profiles()
+            profiles, complete = await mgr.list_profiles()
+            return {
+                "profiles": profiles,
+                "count": len(profiles),
+                "complete": complete,
+                "coverage_notice": (
+                    None
+                    if complete
+                    else (
+                        "Showing legacy Protect arm profiles: the UniFi-OS Alarm Manager "
+                        "(/api/v2/alarms) returned no profiles or is unavailable on this console, "
+                        "so v2-only profile fields such as state and state_set_at are not included."
+                    )
+                ),
+            }
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_alarm_rules(ctx: GraphQLContext, controller: str) -> Any:
+    key = f"protect/alarm-rules/{controller}"
+
+    async def _do() -> Any:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "alarm_facade",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            rules, _complete = await mgr.list_rules()
+            return rules
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_alarm_rule(ctx: GraphQLContext, controller: str, rule_id: str) -> Any:
+    key = f"protect/alarm-rules/{controller}/{rule_id}"
+
+    async def _do() -> Any:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "alarm_facade",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            rule, _complete = await mgr.get_rule(rule_id)
+            return rule
 
     return await ctx.cache.get_or_fetch(key, _do)
 
@@ -540,6 +688,64 @@ async def _fetch_recording_status(
                 "protect",
             )
             return await mgr.get_recording_status(camera_id=camera_id)
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_detection_search(
+    ctx: GraphQLContext,
+    controller: str,
+    labels: list[str],
+    limit: int,
+    order: str,
+    exclude_motion: bool,
+    min_confidence: int | None,
+) -> list:
+    labels_key = ",".join(labels)
+    key = f"protect/detection-search/{controller}/{labels_key}/{limit}/{order}/{exclude_motion}/{min_confidence}"
+
+    async def _do() -> list:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "event_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            result = await mgr.search_detections(
+                labels=labels,
+                limit=limit,
+                order=order,
+                exclude_motion=exclude_motion,
+                min_confidence=min_confidence,
+            )
+            return list(result.get("detections", []))
+
+    return await ctx.cache.get_or_fetch(key, _do)
+
+
+async def _fetch_detection_search_labels(ctx: GraphQLContext, controller: str) -> Any:
+    key = f"protect/detection-search-labels/{controller}"
+
+    async def _do() -> Any:
+        async with ctx.sessionmaker() as session:
+            mgr = await ctx.manager_factory.get_domain_manager(
+                session,
+                controller,
+                "protect",
+                "event_manager",
+            )
+            await ctx.manager_factory.get_connection_manager(
+                session,
+                controller,
+                "protect",
+            )
+            return await mgr.get_detection_search_labels()
 
     return await ctx.cache.get_or_fetch(key, _do)
 
@@ -750,6 +956,12 @@ class KnownFacePage:
     next_cursor: str | None
 
 
+@strawberry.type(description="Paginated page of UniFi Protect license-plate identities.")
+class KnownLicensePlatePage:
+    items: list[KnownLicensePlate]
+    next_cursor: str | None
+
+
 # ---------------------------------------------------------------------------
 # ProtectQuery
 # ---------------------------------------------------------------------------
@@ -757,6 +969,61 @@ class KnownFacePage:
 
 @strawberry.type(description="Read-only access to UniFi Protect resources.")
 class ProtectQuery:
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description=(
+            "Collect bounded, read-only Protect event evidence for one incident window as a "
+            "unifi-incident-evidence-view (coverage plus bounded record citations), or with detail full the "
+            "whole unifi-incident-evidence document. Each camera ID is its own source. Stops at the first "
+            "spent budget and says so; check coverage_complete before treating an empty result as an "
+            "all-clear. Not cached."
+        ),
+    )
+    async def incident_evidence(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+        start: str,
+        end: str,
+        camera_ids: list[str] | None = None,
+        location_id: str | None = None,
+        max_window_seconds: int = DEFAULT_WINDOW_SECONDS,
+        max_events: int = DEFAULT_EVENTS,
+        max_calls: int = DEFAULT_CALLS,
+        max_elapsed_ms: int = DEFAULT_ELAPSED_MS,
+        mappings: strawberry.scalars.JSON | None = None,  # type: ignore[name-defined]
+        detail: str = "view",
+        max_records_returned: int | None = None,
+        resume_after: str | None = None,
+    ) -> IncidentEvidence:
+        ctx: GraphQLContext = info.context
+        # Validated before any controller I/O: invalid input never acquires a manager.
+        incident = protect_request(
+            start=start,
+            end=end,
+            camera_ids=camera_ids,
+            location_id=location_id,
+            max_window_seconds=max_window_seconds,
+            max_events=max_events,
+            max_calls=max_calls,
+            max_elapsed_ms=max_elapsed_ms,
+            mappings=mappings,
+        )
+        view = presentation(detail=detail, max_records_returned=max_records_returned, resume_after=resume_after)
+        async with ctx.sessionmaker() as session:
+            # From the database only, before collecting: NOT_FOUND, then CAPABILITY_MISMATCH (REST: 404, 409).
+            require_product(await get_controller(session, controller), "protect")
+
+            async def acquire() -> Any:
+                return await ctx.manager_factory.get_event_reader(session, controller, "protect")
+
+            try:
+                # Acquisition happens inside the first bounded read; its failures are source failures.
+                evidence = await collect_protect_evidence(acquire, incident)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to collect incident evidence ({type(exc).__name__})") from None
+        return IncidentEvidence.from_manager_output(evidence, presentation=view)
+
     # ---- Cameras ---------------------------------------------------------
 
     @strawberry.field(
@@ -803,13 +1070,12 @@ class ProtectQuery:
         id: strawberry.ID,
     ) -> Camera | None:
         ctx: GraphQLContext = info.context
-        raw = await _fetch_cameras(ctx, controller)
-        for c in raw:
-            if _id_of(c) == id:
-                inst = Camera.from_manager_output(c)
-                inst._controller_id = str(controller)
-                return inst
-        return None
+        raw = await _fetch_camera(ctx, controller, str(id))
+        if raw is None:
+            return None
+        inst = Camera.from_manager_output(raw)
+        inst._controller_id = str(controller)
+        return inst
 
     @strawberry.field(
         permission_classes=[IsRead],
@@ -841,7 +1107,7 @@ class ProtectQuery:
         raw = await _fetch_camera_streams(ctx, controller, id)
         if raw is None:
             return None
-        return CameraStreams.from_manager_output(raw)
+        return CameraStreams.from_manager_output(raw, redact_sensitive=ctx.redact_sensitive_fields)
 
     @strawberry.field(
         permission_classes=[IsRead],
@@ -904,6 +1170,93 @@ class ProtectQuery:
             next_cursor=next_cursor.encode() if next_cursor else None,
         )
 
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description=(
+            "List UniFi Protect license-plate identities (vehicle recognition groups). "
+            "Each entry's id is the value to use in a `license_plate_known` alarm-rule condition."
+        ),
+    )
+    async def known_license_plates(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+        limit: int = 50,
+        cursor: str | None = None,
+        min_confidence: int = 30,
+        include_interest: bool = True,
+        group_types: list[str] | None = None,
+        order_by: str = "name",
+        order_direction: str = "asc",
+    ) -> KnownLicensePlatePage:
+        ctx: GraphQLContext = info.context
+        raw = await _fetch_known_license_plates(
+            ctx,
+            str(controller),
+            min_confidence,
+            include_interest,
+            group_types,
+            order_by,
+            order_direction,
+        )
+
+        from unifi_api.services.pagination import paginate
+
+        cursor_obj = _decode_cursor(cursor)
+        page, next_cursor = paginate(
+            list(raw),
+            limit=limit,
+            cursor=cursor_obj,
+            key_fn=_id_key,
+        )
+        return KnownLicensePlatePage(
+            items=[KnownLicensePlate.from_manager_output(plate) for plate in page],
+            next_cursor=next_cursor.encode() if next_cursor else None,
+        )
+
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description=(
+            "Search detections across cameras via Protect's 'Find Anything' filter vocabulary. "
+            "Pass labels of the form 'prefix:value' (e.g. 'vehicleType:truck'); use "
+            "detectionSearchLabels to discover legal values."
+        ),
+    )
+    async def search_detections(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+        labels: list[str],
+        limit: int = 100,
+        order: str = "desc",
+        exclude_motion: bool = True,
+        min_confidence: int | None = None,
+    ) -> list[SmartDetection]:
+        ctx: GraphQLContext = info.context
+        detections = await _fetch_detection_search(
+            ctx,
+            str(controller),
+            labels,
+            limit,
+            order,
+            exclude_motion,
+            min_confidence,
+        )
+        return [SmartDetection.from_manager_output(d) for d in detections]
+
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description="The detection-search filter vocabulary ('Find Anything' label groups).",
+    )
+    async def detection_search_labels(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+    ) -> DetectionSearchLabels:
+        ctx: GraphQLContext = info.context
+        raw = await _fetch_detection_search_labels(ctx, str(controller))
+        return DetectionSearchLabels.from_manager_output(raw)
+
     # ---- Chimes ----------------------------------------------------------
 
     @strawberry.field(
@@ -953,7 +1306,12 @@ class ProtectQuery:
 
     @strawberry.field(
         permission_classes=[IsRead],
-        description="List configured alarm profiles ({profiles, count}).",
+        description=(
+            "List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each "
+            "profile's state and state_set_at timestamp. Alarm Manager v2 profile "
+            "IDs are scoped to this read family; use arm_compatible to determine "
+            "whether a profile can be passed to legacy arm actions."
+        ),
     )
     async def alarm_profiles(
         self,
@@ -965,6 +1323,45 @@ class ProtectQuery:
         if raw is None:
             return None
         return AlarmProfileList.from_manager_output(raw)
+
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description="List configured alarm rules / Alarm Manager automations ({rules, count}).",
+    )
+    async def alarm_rules(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+    ) -> AlarmRuleList | None:
+        ctx: GraphQLContext = info.context
+        raw = await _fetch_alarm_rules(ctx, controller)
+        if raw is None:
+            return None
+        wrapped = (
+            raw
+            if isinstance(raw, dict) and "rules" in raw
+            else {
+                "rules": list(raw) if isinstance(raw, list) else [],
+                "count": len(raw) if isinstance(raw, list) else 0,
+            }
+        )
+        return AlarmRuleList.from_manager_output(wrapped)
+
+    @strawberry.field(
+        permission_classes=[IsRead],
+        description="Fetch a single alarm rule (automation) by id.",
+    )
+    async def alarm_rule(
+        self,
+        info: Info,
+        controller: strawberry.ID,
+        id: strawberry.ID,
+    ) -> AlarmRule | None:
+        ctx: GraphQLContext = info.context
+        raw = await _fetch_alarm_rule(ctx, controller, str(id))
+        if raw is None:
+            return None
+        return AlarmRule.from_manager_output(raw)
 
     # ---- Events ----------------------------------------------------------
 

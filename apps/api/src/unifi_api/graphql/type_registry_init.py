@@ -12,6 +12,9 @@ from unifi_api.graphql.type_registry import TypeRegistry
 from unifi_api.graphql.types.access.credentials import (
     Credential as AccessCredentialType,
 )
+from unifi_api.graphql.types.access.device_configs import (
+    AccessDeviceConfig as AccessDeviceConfigType,
+)
 from unifi_api.graphql.types.access.devices import (
     AccessDevice as AccessDeviceType,
 )
@@ -48,6 +51,7 @@ from unifi_api.graphql.types.access.users import (
 from unifi_api.graphql.types.access.visitors import (
     Visitor as AccessVisitorType,
 )
+from unifi_api.graphql.types.incident_evidence import IncidentEvidence as IncidentEvidenceType
 from unifi_api.graphql.types.network.acl import (
     AclRule as NetworkAclRuleType,
 )
@@ -105,6 +109,9 @@ from unifi_api.graphql.types.network.dpi import (
 from unifi_api.graphql.types.network.dpi import (
     DpiCategory as NetworkDpiCategoryType,
 )
+from unifi_api.graphql.types.network.dynamic_dns import (
+    DynamicDns as NetworkDynamicDnsType,
+)
 from unifi_api.graphql.types.network.event import (
     EventLog as NetworkEventLogType,
 )
@@ -112,10 +119,23 @@ from unifi_api.graphql.types.network.firewall import (
     FirewallGroup as NetworkFirewallGroupType,
 )
 from unifi_api.graphql.types.network.firewall import (
+    FirewallPolicyOrdering as NetworkFirewallPolicyOrderingType,
+)
+from unifi_api.graphql.types.network.firewall import (
     FirewallRule as NetworkFirewallRuleType,
 )
 from unifi_api.graphql.types.network.firewall import (
     FirewallZone as NetworkFirewallZoneType,
+)
+from unifi_api.graphql.types.network.firewall import (
+    LegacyFirewallRule as NetworkLegacyFirewallRuleType,
+)
+from unifi_api.graphql.types.network.gateway_settings import (
+    GatewaySettings as NetworkGatewaySettingsType,
+)
+from unifi_api.graphql.types.network.mdns import MdnsSettings as NetworkMdnsSettingsType
+from unifi_api.graphql.types.network.nat import (
+    NatRule as NetworkNatRuleType,
 )
 from unifi_api.graphql.types.network.network import (
     Network as NetworkNetworkType,
@@ -175,6 +195,9 @@ from unifi_api.graphql.types.network.system import (
     EventTypes as NetworkEventTypesType,
 )
 from unifi_api.graphql.types.network.system import (
+    MgmtSettings as NetworkMgmtSettingsType,
+)
+from unifi_api.graphql.types.network.system import (
     NetworkHealth as NetworkNetworkHealthType,
 )
 from unifi_api.graphql.types.network.system import (
@@ -192,6 +215,18 @@ from unifi_api.graphql.types.network.system import (
 from unifi_api.graphql.types.network.system import (
     TopClient as NetworkTopClientType,
 )
+from unifi_api.graphql.types.network.threat_management import (
+    ThreatManagementSettings as NetworkThreatManagementSettingsType,
+)
+from unifi_api.graphql.types.network.threat_posture import (
+    ThreatPosture as NetworkThreatPostureType,
+)
+from unifi_api.graphql.types.network.traffic_flow import (
+    TrafficFlow as NetworkTrafficFlowType,
+)
+from unifi_api.graphql.types.network.traffic_flow import (
+    TrafficFlowStatistics as NetworkTrafficFlowStatisticsType,
+)
 from unifi_api.graphql.types.network.voucher import (
     Voucher as NetworkVoucherType,
 )
@@ -206,6 +241,12 @@ from unifi_api.graphql.types.network.wlan import (
 )
 from unifi_api.graphql.types.protect.alarms import (
     AlarmProfileList as ProtectAlarmProfileListType,
+)
+from unifi_api.graphql.types.protect.alarms import (
+    AlarmRule as ProtectAlarmRuleType,
+)
+from unifi_api.graphql.types.protect.alarms import (
+    AlarmRuleList as ProtectAlarmRuleListType,
 )
 from unifi_api.graphql.types.protect.alarms import (
     AlarmStatus as ProtectAlarmStatusType,
@@ -241,7 +282,13 @@ from unifi_api.graphql.types.protect.liveviews import (
     Liveview as ProtectLiveviewType,
 )
 from unifi_api.graphql.types.protect.recognition import (
+    DetectionSearchLabels as ProtectDetectionSearchLabelsType,
+)
+from unifi_api.graphql.types.protect.recognition import (
     KnownFace as ProtectKnownFaceType,
+)
+from unifi_api.graphql.types.protect.recognition import (
+    KnownLicensePlate as ProtectKnownLicensePlateType,
 )
 from unifi_api.graphql.types.protect.recordings import (
     Recording as ProtectRecordingType,
@@ -289,6 +336,10 @@ def build_type_registry() -> TypeRegistry:
     )
     reg.register_tool_type("unifi_lookup_by_ip", NetworkClientLookupType, "detail")
 
+    # network/traffic-flows
+    reg.register_tool_type("unifi_get_traffic_flows", NetworkTrafficFlowType, "list")
+    reg.register_tool_type("unifi_get_traffic_flow_statistics", NetworkTrafficFlowStatisticsType, "detail")
+
     # network/devices
     reg.register_type("network", "devices", NetworkDeviceType)
     reg.register_type("network", "devices/{mac}", NetworkDeviceType)
@@ -320,6 +371,9 @@ def build_type_registry() -> TypeRegistry:
     reg.register_tool_type("unifi_list_networks", NetworkNetworkType, "list")
     reg.register_tool_type("unifi_get_network_details", NetworkNetworkType, "detail")
 
+    reg.register_type("network", "gateway_settings", NetworkGatewaySettingsType)
+    reg.register_tool_type("unifi_get_gateway_settings", NetworkGatewaySettingsType, "detail")
+
     # network/wlans
     reg.register_type("network", "wlans", NetworkWlanType)
     reg.register_type("network", "wlans/{id}", NetworkWlanType)
@@ -348,6 +402,14 @@ def build_type_registry() -> TypeRegistry:
         "detail",
     )
 
+    # network/dynamic_dns (tool-keyed only)
+    reg.register_tool_type("unifi_list_dynamic_dns", NetworkDynamicDnsType, "list")
+    reg.register_tool_type(
+        "unifi_get_dynamic_dns_entry_details",
+        NetworkDynamicDnsType,
+        "detail",
+    )
+
     # network/routes (tool-keyed only)
     reg.register_tool_type("unifi_list_routes", NetworkRouteType, "list")
     reg.register_tool_type("unifi_get_route_details", NetworkRouteType, "detail")
@@ -362,6 +424,7 @@ def build_type_registry() -> TypeRegistry:
     # network/firewall (rules + groups + zones)
     reg.register_type("network", "firewall/rules", NetworkFirewallRuleType)
     reg.register_type("network", "firewall/rules/{id}", NetworkFirewallRuleType)
+    reg.register_type("network", "firewall/policy-ordering", NetworkFirewallPolicyOrderingType)
     reg.register_tool_type(
         "unifi_list_firewall_policies",
         NetworkFirewallRuleType,
@@ -386,6 +449,16 @@ def build_type_registry() -> TypeRegistry:
         "unifi_list_firewall_zones",
         NetworkFirewallZoneType,
         "list",
+    )
+    reg.register_tool_type(
+        "unifi_list_legacy_firewall_rules",
+        NetworkLegacyFirewallRuleType,
+        "list",
+    )
+    reg.register_tool_type(
+        "unifi_get_firewall_policy_ordering",
+        NetworkFirewallPolicyOrderingType,
+        "detail",
     )
 
     # network/qos (tool-keyed only)
@@ -440,6 +513,10 @@ def build_type_registry() -> TypeRegistry:
     )
     reg.register_tool_type("unifi_get_port_forward", NetworkPortForwardType, "detail")
 
+    # network/nat (V2 controller ID family)
+    reg.register_tool_type("unifi_list_nat_rules", NetworkNatRuleType, "list")
+    reg.register_tool_type("unifi_get_nat_rule", NetworkNatRuleType, "detail")
+
     # network/vouchers (tool-keyed only)
     reg.register_tool_type("unifi_list_vouchers", NetworkVoucherType, "list")
     reg.register_tool_type("unifi_get_voucher_details", NetworkVoucherType, "detail")
@@ -486,6 +563,15 @@ def build_type_registry() -> TypeRegistry:
     )
     reg.register_tool_type("unifi_get_site_settings", NetworkSiteSettingsType, "detail")
     reg.register_tool_type("unifi_get_snmp_settings", NetworkSnmpSettingsType, "detail")
+    reg.register_tool_type("unifi_get_mdns_settings", NetworkMdnsSettingsType, "detail")
+    reg.register_tool_type(
+        "unifi_get_threat_management_settings",
+        NetworkThreatManagementSettingsType,
+        "detail",
+    )
+    reg.register_tool_type("unifi_get_threat_posture", NetworkThreatPostureType, "detail")
+    reg.register_tool_type("unifi_get_incident_evidence", IncidentEvidenceType, "detail")
+    reg.register_tool_type("unifi_get_mgmt_settings", NetworkMgmtSettingsType, "detail")
     reg.register_tool_type("unifi_get_event_types", NetworkEventTypesType, "detail")
     reg.register_tool_type(
         "unifi_get_autobackup_settings",
@@ -561,6 +647,7 @@ def build_type_registry() -> TypeRegistry:
     reg.register_type("protect", "events", ProtectEventType)
     reg.register_tool_type("protect_list_events", ProtectEventType, "event_log")
     reg.register_tool_type("protect_get_event", ProtectEventType, "detail")
+    reg.register_tool_type("protect_get_incident_evidence", IncidentEvidenceType, "detail")
     reg.register_tool_type(
         "protect_get_event_thumbnail",
         ProtectEventThumbnailType,
@@ -593,6 +680,16 @@ def build_type_registry() -> TypeRegistry:
         ProtectAlarmProfileListType,
         "detail",
     )
+    reg.register_tool_type(
+        "protect_alarm_list_rules",
+        ProtectAlarmRuleListType,
+        "detail",
+    )
+    reg.register_tool_type(
+        "protect_alarm_get_rule",
+        ProtectAlarmRuleType,
+        "detail",
+    )
 
     # protect/lights
     reg.register_type("protect", "lights", ProtectLightType)
@@ -612,6 +709,10 @@ def build_type_registry() -> TypeRegistry:
     # protect/recognition
     reg.register_type("protect", "known_faces", ProtectKnownFaceType)
     reg.register_tool_type("protect_list_known_faces", ProtectKnownFaceType, "list")
+    reg.register_type("protect", "known_license_plates", ProtectKnownLicensePlateType)
+    reg.register_tool_type("protect_list_known_license_plates", ProtectKnownLicensePlateType, "list")
+    reg.register_tool_type("protect_search_detections", ProtectSmartDetectionType, "list")
+    reg.register_tool_type("protect_detection_search_labels", ProtectDetectionSearchLabelsType, "detail")
 
     # protect/system (tool-keyed only) + viewers resource
     reg.register_type("protect", "viewers", ProtectViewerType)
@@ -643,6 +744,7 @@ def build_type_registry() -> TypeRegistry:
     # access/devices (tool-keyed only)
     reg.register_tool_type("access_list_devices", AccessDeviceType, "list")
     reg.register_tool_type("access_get_device", AccessDeviceType, "detail")
+    reg.register_tool_type("access_get_device_configs", AccessDeviceConfigType, "list")
 
     # access/users
     reg.register_type("access", "users", AccessUserType)

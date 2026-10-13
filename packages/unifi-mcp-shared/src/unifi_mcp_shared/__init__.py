@@ -4,13 +4,13 @@ from unifi_core.config import load_yaml_config, setup_logging
 from unifi_core.config_helpers import parse_config_bool
 from unifi_core.confirmation import (
     create_preview,
+    delete_preview,
     preview_response,
     toggle_preview,
     update_preview,
 )
 from unifi_core.formatting import error_response, success_response
 from unifi_core.jobs import JOBS, JobStore, get_job_status, start_async_tool
-from unifi_core.manifest_helpers import get_tool_annotations
 from unifi_core.policy_gate import PolicyGateChecker
 from unifi_core.validators import ResourceValidator, create_response
 
@@ -19,7 +19,15 @@ from unifi_mcp_shared.lazy_tools import (
     build_tool_module_map,
     setup_lazy_loading,
 )
+from unifi_mcp_shared.manifest_helpers import get_tool_annotations
 from unifi_mcp_shared.meta_tools import register_load_tools, register_meta_tools
+from unifi_mcp_shared.server import UniFiMCPServer
+from unifi_mcp_shared.support_bundle import (
+    LiveProbeGate,
+    SupportBundleAdapter,
+    SupportBundleEvidence,
+    SupportBundleService,
+)
 from unifi_mcp_shared.tasks import (
     DEFAULT_TASK_POLL_INTERVAL_MS,
     DEFAULT_TASK_TTL_MS,
@@ -40,11 +48,17 @@ __all__ = [
     "MCP_RELATED_TASK_META",
     "PolicyGateChecker",
     "ResourceValidator",
+    "SupportBundleAdapter",
+    "SupportBundleEvidence",
+    "SupportBundleService",
+    "LiveProbeGate",
+    "UniFiMCPServer",
     "DEFAULT_TASK_POLL_INTERVAL_MS",
     "DEFAULT_TASK_TTL_MS",
     "auto_load_tools",
     "build_tool_module_map",
     "create_preview",
+    "delete_preview",
     "create_response",
     "create_task_result_from_job",
     "error_response",

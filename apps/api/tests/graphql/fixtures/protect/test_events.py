@@ -6,6 +6,8 @@
 # tool: protect_list_smart_detections
 # tool: protect_alarm_get_status
 # tool: protect_alarm_list_profiles
+# tool: protect_alarm_list_rules
+# tool: protect_alarm_get_rule
 """
 
 from __future__ import annotations
@@ -151,13 +153,86 @@ async def test_protect_smart_detections_list(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_protect_event_detail_surfaces_plate_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect")
+    stub_managers(
+        monkeypatch,
+        {
+            ("protect", "event_manager", "list_events"): [
+                {
+                    "id": "evt1",
+                    "type": "smartDetectZone",
+                    "camera_id": "cam1",
+                    "start": 1000,
+                    "recognized_plate_text": "ABC123",
+                    "recognized_plate_group_id": "plate-group-1",
+                    "recognized_plate_confidence": 88,
+                },
+            ],
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ event(controller: "{cid}", id: "evt1") {{
+            id recognizedPlateText recognizedPlateGroupId recognizedPlateConfidence
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    event = body["data"]["protect"]["event"]
+    assert event["recognizedPlateText"] == "ABC123"
+    assert event["recognizedPlateGroupId"] == "plate-group-1"
+    assert event["recognizedPlateConfidence"] == 88
+
+
+@pytest.mark.asyncio
+async def test_protect_smart_detections_surface_plate_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect")
+    stub_managers(
+        monkeypatch,
+        {
+            ("protect", "event_manager", "list_smart_detections"): [
+                {
+                    "id": "sd1",
+                    "type": "vehicle",
+                    "camera_id": "cam1",
+                    "start": 1000,
+                    "score": 90,
+                    "recognized_plate_text": "ABC123",
+                    "recognized_plate_group_id": "plate-group-1",
+                    "recognized_plate_confidence": 88,
+                },
+            ],
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ smartDetections(controller: "{cid}", limit: 10) {{
+            items {{ id recognizedPlateText recognizedPlateGroupId recognizedPlateConfidence }}
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    item = body["data"]["protect"]["smartDetections"]["items"][0]
+    assert item["recognizedPlateText"] == "ABC123"
+    assert item["recognizedPlateGroupId"] == "plate-group-1"
+    assert item["recognizedPlateConfidence"] == 88
+
+
+@pytest.mark.asyncio
 async def test_protect_alarm_status(tmp_path, monkeypatch):
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await bootstrap(tmp_path, product="protect")
     stub_managers(
         monkeypatch,
         {
-            ("protect", "alarm_manager", "get_arm_state"): {
+            ("protect", "alarm_facade", "get_arm_state"): {
                 "armed": True,
                 "status": "armed_away",
                 "active_profile_id": "prof1",
@@ -189,13 +264,27 @@ async def test_protect_alarm_list_profiles(tmp_path, monkeypatch):
     stub_managers(
         monkeypatch,
         {
-            ("protect", "alarm_manager", "list_arm_profiles"): {
-                "profiles": [
-                    {"id": "prof1", "name": "Away"},
-                    {"id": "prof2", "name": "Home"},
+            ("protect", "alarm_facade", "list_profiles"): (
+                [
+                    {
+                        "id": "prof1",
+                        "name": "Away",
+                        "state": "armed",
+                        "state_set_at": "2026-09-04T12:00:00Z",
+                        "id_family": "alarm_manager_v2",
+                        "arm_compatible": False,
+                    },
+                    {
+                        "id": "prof2",
+                        "name": "Home",
+                        "state": "disarmed",
+                        "state_set_at": "2026-09-04T13:00:00Z",
+                        "id_family": "alarm_manager_v2",
+                        "arm_compatible": False,
+                    },
                 ],
-                "count": 2,
-            },
+                True,
+            ),
         },
     )
     body = await graphql_query(
@@ -204,9 +293,117 @@ async def test_protect_alarm_list_profiles(tmp_path, monkeypatch):
         f'''{{
         protect {{ alarmProfiles(controller: "{cid}") {{
             count
+            profiles
+            complete
+            coverageNotice
         }} }}
     }}''',
     )
     assert body.get("errors") is None, body
     result = body["data"]["protect"]["alarmProfiles"]
     assert result["count"] == 2
+    assert result["complete"] is True
+    assert result["coverageNotice"] is None
+    assert {p["id"] for p in result["profiles"]} == {"prof1", "prof2"}
+    away = next(p for p in result["profiles"] if p["id"] == "prof1")
+    assert away["state"] == "armed"
+    assert away["state_set_at"] == "2026-09-04T12:00:00Z"
+    assert away["id_family"] == "alarm_manager_v2"
+    assert away["arm_compatible"] is False
+
+
+@pytest.mark.asyncio
+async def test_protect_alarm_list_profiles_marks_incomplete_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect")
+    stub_managers(
+        monkeypatch,
+        {("protect", "alarm_facade", "list_profiles"): ([], False)},
+    )
+
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ alarmProfiles(controller: "{cid}") {{
+            count profiles complete coverageNotice
+        }} }}
+    }}''',
+    )
+
+    assert body.get("errors") is None, body
+    result = body["data"]["protect"]["alarmProfiles"]
+    assert result["count"] == 0
+    assert result["profiles"] == []
+    assert result["complete"] is False
+    assert "v2-only profile fields" in result["coverageNotice"]
+
+
+@pytest.mark.asyncio
+async def test_protect_alarm_list_rules(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect")
+    stub_managers(
+        monkeypatch,
+        {
+            # facade returns (canonical_rules, complete)
+            ("protect", "alarm_facade", "list_rules"): (
+                [
+                    {"id": "rule1", "title": "Arrival", "enabled": True},
+                    {"id": "rule2", "title": "Departure", "enabled": True},
+                ],
+                True,
+            ),
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ alarmRules(controller: "{cid}") {{
+            count
+            rules
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    result = body["data"]["protect"]["alarmRules"]
+    assert result["count"] == 2
+    assert {r["id"] for r in result["rules"]} == {"rule1", "rule2"}
+
+
+@pytest.mark.asyncio
+async def test_protect_alarm_get_rule(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect")
+    stub_managers(
+        monkeypatch,
+        {
+            # facade returns (canonical_rule, complete)
+            ("protect", "alarm_facade", "get_rule"): (
+                {
+                    "id": "rule1",
+                    "title": "Test Camera Vehicle Arrival",
+                    "enabled": True,
+                    "scope": {"sources": [{"device": "AABBCCDDEEFF", "type": "include"}]},
+                },
+                True,
+            ),
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ alarmRule(controller: "{cid}", id: "rule1") {{
+            id
+            title
+            enabled
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    result = body["data"]["protect"]["alarmRule"]
+    assert result["id"] == "rule1"
+    assert result["title"] == "Test Camera Vehicle Arrival"
+    assert result["enabled"] is True

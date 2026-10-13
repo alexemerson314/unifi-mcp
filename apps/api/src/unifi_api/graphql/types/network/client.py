@@ -38,18 +38,70 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+_ACTIVE_CONNECTION_KEYS: tuple[str, ...] = (
+    "_uptime_by_uap",
+    "_uptime_by_usw",
+    "_uptime_by_ugw",
+    "uptime",
+)
+
+
+def _is_online(raw: dict) -> bool:
+    """Mirror of unifi_core.network.models.clients._is_online — derives
+    online status from a controller record, falling back to
+    active-connection indicators when ``is_online`` is omitted by the
+    controller firmware.
+    """
+    if raw.get("is_online") is True:
+        return True
+    for key in _ACTIVE_CONNECTION_KEYS:
+        v = raw.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            return True
+    return False
+
+
+def _is_online_from(obj: Any) -> bool:
+    """Mirror of unifi_core.network.models.clients._is_online_from —
+    accepts dict, ``.raw``-bearing object, or flat-attribute object.
+    """
+    if isinstance(obj, dict):
+        return _is_online(obj)
+    raw = getattr(obj, "raw", None)
+    if isinstance(raw, dict) and _is_online(raw):
+        return True
+    if getattr(obj, "is_online", None) is True:
+        return True
+    for key in _ACTIVE_CONNECTION_KEYS:
+        v = getattr(obj, key, None)
+        if isinstance(v, (int, float)) and v > 0:
+            return True
+    return False
+
+
 @strawberry.type(description="A client device on the UniFi Network controller.")
 class Client:
     mac: strawberry.ID | None
     ip: str | None
     hostname: str | None
-    is_wired: bool
-    is_guest: bool
+    name: str | None
+    is_wired: bool | None
+    is_guest: bool | None
     status: str
     last_seen: str | None
     first_seen: str | None
     note: str | None
     usergroup_id: str | None
+
+    source_api: str | None = None
+    integration_id: strawberry.ID | None = strawberry.field(
+        default=None,
+        description=(
+            "Public Integration inventory UUID, not a legacy resource ID. "
+            "These IDs are scoped to the Integration inventory tool family — "
+            "do not pass them to legacy resource tools."
+        ),
+    )
 
     # Context for relationship edges — NOT in SDL, NOT in to_dict().
     # Set by the resolver after construction so edge resolvers can look up
@@ -71,12 +123,19 @@ class Client:
     def from_manager_output(cls, obj: Any) -> "Client":
         raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
         return cls(
+            source_api=raw.get("source_api"),
+            integration_id=raw.get("integration_id"),
             mac=raw.get("mac"),
             ip=raw.get("last_ip") or raw.get("ip"),
-            hostname=raw.get("hostname") or raw.get("name"),
-            is_wired=bool(raw.get("is_wired", False)),
-            is_guest=bool(raw.get("is_guest", False)),
-            status="online" if raw.get("is_online") else "offline",
+            hostname=raw.get("hostname") or None,
+            name=raw.get("name") or None,
+            is_wired=raw.get("is_wired")
+            if raw.get("source_api") == "integration"
+            else bool(raw.get("is_wired", False)),
+            is_guest=raw.get("is_guest")
+            if raw.get("source_api") == "integration"
+            else bool(raw.get("is_guest", False)),
+            status="online" if _is_online(raw) else "offline",
             last_seen=_iso(raw.get("last_seen")),
             first_seen=_iso(raw.get("first_seen")),
             note=raw.get("note") or None,
@@ -86,6 +145,9 @@ class Client:
 
     def to_dict(self) -> dict:
         out = asdict(self)
+        if self.source_api is None:
+            out.pop("source_api", None)
+            out.pop("integration_id", None)
         return {k: v for k, v in out.items() if not k.startswith("_") and not callable(v)}
 
     @strawberry.field(description="The AP or switch this client connects through.")
@@ -109,7 +171,7 @@ class Client:
                 raw = getattr(d, "raw", None)
                 d_mac = raw.get("mac") if isinstance(raw, dict) else getattr(d, "mac", None)
             if d_mac == self._ap_mac:
-                instance = Device.from_manager_output(d)
+                instance = Device.from_manager_output(d, redact_sensitive=info.context.redact_sensitive_fields)
                 instance._controller_id = self._controller_id
                 instance._site = site
                 return instance
@@ -120,6 +182,7 @@ class Client:
 class BlockedClient:
     mac: strawberry.ID | None
     hostname: str | None
+    name: str | None
     last_seen: str | None
     blocked: bool
 
@@ -136,7 +199,8 @@ class BlockedClient:
     def from_manager_output(cls, obj: Any) -> "BlockedClient":
         return cls(
             mac=_get(obj, "mac"),
-            hostname=_get(obj, "hostname") or _get(obj, "name"),
+            hostname=_get(obj, "hostname") or None,
+            name=_get(obj, "name") or None,
             last_seen=_iso(_get(obj, "last_seen")),
             blocked=bool(_get(obj, "blocked", True)),
         )
@@ -151,6 +215,7 @@ class ClientLookup:
     mac: strawberry.ID | None
     ip: str | None
     hostname: str | None
+    name: str | None
     is_online: bool
     last_seen: str | None
 
@@ -163,8 +228,9 @@ class ClientLookup:
         return cls(
             mac=_get(obj, "mac"),
             ip=_get(obj, "last_ip") or _get(obj, "ip"),
-            hostname=_get(obj, "hostname") or _get(obj, "name"),
-            is_online=bool(_get(obj, "is_online", False)),
+            hostname=_get(obj, "hostname") or None,
+            name=_get(obj, "name") or None,
+            is_online=_is_online_from(obj),
             last_seen=_iso(_get(obj, "last_seen")),
         )
 

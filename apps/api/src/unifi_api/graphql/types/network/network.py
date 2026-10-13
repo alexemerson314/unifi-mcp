@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
 from strawberry.types import Info
+from unifi_core.network.models.networks import MDNS_ENABLED_DESCRIPTION
 
 if TYPE_CHECKING:
     from unifi_api.graphql.types.network.client import Client
@@ -36,7 +37,7 @@ class Network:
     id: strawberry.ID | None
     name: str | None
     purpose: str | None
-    enabled: bool
+    enabled: bool | None
     vlan_enabled: bool | None
     vlan: str | None
     ip_subnet: str | None
@@ -68,14 +69,76 @@ class Network:
     dhcpd_ip_1: str | None
     dhcpguard_enabled: bool | None
     # Multicast / mDNS
+    auto_scale_enabled: bool | None
     igmp_snooping: bool | None
     igmp_querier_switches: strawberry.scalars.JSON | None  # type: ignore[name-defined]
     igmp_flood_unknown_multicast: bool | None
-    mdns_enabled: bool | None
+    mdns_enabled: bool | None = strawberry.field(description=MDNS_ENABLED_DESCRIPTION)
     # Access control
     network_isolation_enabled: bool | None
     internet_access_enabled: bool | None
     upnp_lan_enabled: bool | None
+    firewall_zone_id: str | None = strawberry.field(
+        description=(
+            "V2 firewall-zone ID. These IDs are scoped to the V2 firewall/network tool family; "
+            "do not pass Integration API firewall-zone UUIDs."
+        )
+    )
+    # WAN uplink (purpose='wan' networks)
+    wan_type: str | None
+    wan_networkgroup: str | None
+    wan_dns_preference: str | None
+    wan_dns1: str | None
+    wan_dns2: str | None
+    wan_load_balance_type: str | None
+    wan_load_balance_weight: int | None
+    wan_failover_priority: int | None
+    wan_sla: str | None = strawberry.field(description="Controller WAN-SLA configuration ID for this uplink.")
+    report_wan_event: bool | None
+    wan_smartq_enabled: bool | None
+    wan_vlan_enabled: bool | None
+    igmp_proxy_upstream: bool | None
+    igmp_proxy_for: strawberry.scalars.JSON | None  # type: ignore[name-defined]
+    mac_override_enabled: bool | None
+    wan_ip_aliases: strawberry.scalars.JSON | None  # type: ignore[name-defined]
+    # WAN uplink — IPv6
+    ipv6_enabled: bool | None
+    wan_type_v6: str | None
+    ipv6_setting_preference: str | None
+    ipv6_wan_delegation_type: str | None
+    wan_dhcpv6_pd_size: int | None
+    wan_dhcpv6_pd_size_auto: bool | None
+    wan_ipv6_dns_preference: str | None
+    wan_ipv6_dns1: str | None
+    wan_ipv6_dns2: str | None
+    # LAN-side IPv6 (per-network)
+    ipv6_interface_type: str | None
+    ipv6_aliases: list[str] | None
+    ipv6_ra_enabled: bool | None
+    ipv6_ra_priority: str | None
+    ipv6_ra_preferred_lifetime: int | None
+    ipv6_client_address_assignment: str | None
+    ipv6_pd_interface: str | None
+    ipv6_pd_prefixid: str | None
+    ipv6_pd_auto_prefixid_enabled: bool | None
+    ipv6_pd_start: str | None
+    ipv6_pd_stop: str | None
+    dhcpdv6_enabled: bool | None
+    dhcpdv6_allow_slaac: bool | None
+    dhcpdv6_dns_auto: bool | None
+    dhcpdv6_leasetime: int | None
+    dhcpdv6_start: str | None
+    dhcpdv6_stop: str | None
+
+    source_api: str | None = None
+    integration_id: strawberry.ID | None = strawberry.field(
+        default=None,
+        description=(
+            "Public Integration inventory UUID, not a legacy resource ID. "
+            "These IDs are scoped to the Integration inventory tool family — "
+            "do not pass them to legacy resource tools."
+        ),
+    )
 
     # Context for relationship edges — NOT in SDL, NOT in to_dict().
     _controller_id: strawberry.Private[str | None] = None
@@ -96,10 +159,12 @@ class Network:
         ip_subnet = raw.get("ip_subnet") or raw.get("subnet")
         vlan_raw = raw.get("vlan")
         return cls(
+            source_api=raw.get("source_api"),
+            integration_id=raw.get("integration_id"),
             id=raw.get("_id") or raw.get("id"),
             name=raw.get("name"),
             purpose=raw.get("purpose"),
-            enabled=bool(raw.get("enabled", False)),
+            enabled=raw.get("enabled") if raw.get("source_api") == "integration" else bool(raw.get("enabled", False)),
             vlan_enabled=raw.get("vlan_enabled"),
             vlan=str(vlan_raw) if vlan_raw is not None else None,
             ip_subnet=ip_subnet,
@@ -129,6 +194,7 @@ class Network:
             dhcp_relay_enabled=raw.get("dhcp_relay_enabled"),
             dhcpd_ip_1=raw.get("dhcpd_ip_1"),
             dhcpguard_enabled=raw.get("dhcpguard_enabled"),
+            auto_scale_enabled=raw.get("auto_scale_enabled"),
             igmp_snooping=raw.get("igmp_snooping"),
             igmp_querier_switches=raw.get("igmp_querier_switches"),
             igmp_flood_unknown_multicast=raw.get("igmp_flood_unknown_multicast"),
@@ -136,10 +202,56 @@ class Network:
             network_isolation_enabled=raw.get("network_isolation_enabled"),
             internet_access_enabled=raw.get("internet_access_enabled"),
             upnp_lan_enabled=raw.get("upnp_lan_enabled"),
+            firewall_zone_id=raw.get("firewall_zone_id"),
+            wan_type=raw.get("wan_type"),
+            wan_networkgroup=raw.get("wan_networkgroup"),
+            wan_dns_preference=raw.get("wan_dns_preference"),
+            wan_dns1=raw.get("wan_dns1"),
+            wan_dns2=raw.get("wan_dns2"),
+            wan_load_balance_type=raw.get("wan_load_balance_type"),
+            wan_load_balance_weight=raw.get("wan_load_balance_weight"),
+            wan_failover_priority=raw.get("wan_failover_priority"),
+            wan_sla=raw.get("wan_sla"),
+            report_wan_event=raw.get("report_wan_event"),
+            wan_smartq_enabled=raw.get("wan_smartq_enabled"),
+            wan_vlan_enabled=raw.get("wan_vlan_enabled"),
+            igmp_proxy_upstream=raw.get("igmp_proxy_upstream"),
+            igmp_proxy_for=raw.get("igmp_proxy_for"),
+            mac_override_enabled=raw.get("mac_override_enabled"),
+            wan_ip_aliases=raw.get("wan_ip_aliases"),
+            ipv6_enabled=raw.get("ipv6_enabled"),
+            wan_type_v6=raw.get("wan_type_v6"),
+            ipv6_setting_preference=raw.get("ipv6_setting_preference"),
+            ipv6_wan_delegation_type=raw.get("ipv6_wan_delegation_type"),
+            wan_dhcpv6_pd_size=raw.get("wan_dhcpv6_pd_size"),
+            wan_dhcpv6_pd_size_auto=raw.get("wan_dhcpv6_pd_size_auto"),
+            wan_ipv6_dns_preference=raw.get("wan_ipv6_dns_preference"),
+            wan_ipv6_dns1=raw.get("wan_ipv6_dns1"),
+            wan_ipv6_dns2=raw.get("wan_ipv6_dns2"),
+            ipv6_interface_type=raw.get("ipv6_interface_type"),
+            ipv6_aliases=raw.get("ipv6_aliases"),
+            ipv6_ra_enabled=raw.get("ipv6_ra_enabled"),
+            ipv6_ra_priority=raw.get("ipv6_ra_priority"),
+            ipv6_ra_preferred_lifetime=raw.get("ipv6_ra_preferred_lifetime"),
+            ipv6_client_address_assignment=raw.get("ipv6_client_address_assignment"),
+            ipv6_pd_interface=raw.get("ipv6_pd_interface"),
+            ipv6_pd_prefixid=raw.get("ipv6_pd_prefixid"),
+            ipv6_pd_auto_prefixid_enabled=raw.get("ipv6_pd_auto_prefixid_enabled"),
+            ipv6_pd_start=raw.get("ipv6_pd_start"),
+            ipv6_pd_stop=raw.get("ipv6_pd_stop"),
+            dhcpdv6_enabled=raw.get("dhcpdv6_enabled"),
+            dhcpdv6_allow_slaac=raw.get("dhcpdv6_allow_slaac"),
+            dhcpdv6_dns_auto=raw.get("dhcpdv6_dns_auto"),
+            dhcpdv6_leasetime=raw.get("dhcpdv6_leasetime"),
+            dhcpdv6_start=raw.get("dhcpdv6_start"),
+            dhcpdv6_stop=raw.get("dhcpdv6_stop"),
         )
 
     def to_dict(self) -> dict:
         out = asdict(self)
+        if self.source_api is None:
+            out.pop("source_api", None)
+            out.pop("integration_id", None)
         return {k: v for k, v in out.items() if not k.startswith("_") and not callable(v)}
 
     @strawberry.field(description="Clients on this network.")
@@ -151,7 +263,7 @@ class Network:
         from unifi_api.graphql.resolvers.network import _fetch_clients
         from unifi_api.graphql.types.network.client import Client
 
-        if not self._controller_id:
+        if not self._controller_id or not self.id:
             return []
         site = self._site or "default"
         raw_clients = await _fetch_clients(info.context, self._controller_id, site)

@@ -38,16 +38,17 @@ async def get_snmp_settings(
             controller.id,
             "network",
             "system_manager",
+            site=site_id,
         )
-        cm = await factory.get_connection_manager(session, controller.id, "network")
-        if cm.site != site_id:
-            await cm.set_site(site_id)
         settings = await mgr.get_settings("snmp")
     type_registry = request.app.state.type_registry
     tool_type = type_registry.lookup_tool("unifi_get_snmp_settings")
     if tool_type is not None:
         type_class, kind = tool_type
-        data = type_class.from_manager_output(settings).to_dict()
+        data = type_class.from_manager_output(
+            settings,
+            redact_sensitive=request.app.state.config.policy.response.redact_sensitive_fields,
+        ).to_dict()
         hint = type_class.render_hint(kind)
     else:
         registry = request.app.state.serializer_registry

@@ -9,7 +9,9 @@ call :func:`register_tools_for_mode` with server-specific parameters.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
+
+from unifi_mcp_shared.tool_index import normalize_tool_annotations
 
 
 def _parse_filter_list(value: Any) -> list[str] | None:
@@ -20,6 +22,34 @@ def _parse_filter_list(value: Any) -> list[str] | None:
         return None
     # Already a list or other type — pass through
     return value
+
+
+def _read_only(tool: Any) -> bool:
+    return (normalize_tool_annotations(getattr(tool, "annotations", None)) or {}).get("readOnlyHint") is True
+
+
+async def register_lazy_direct_tools(server: Any, lazy_loader: Any, tool_names: Sequence[str]) -> None:
+    """List read-only domain tools directly in lazy mode.
+
+    Lazy mode lists only meta-tools, and its one route to a domain tool,
+    ``*_execute``, is not read-only, so a client that permits only
+    ``readOnlyHint`` tools reaches no domain tool at all. Loading these
+    tools' modules at startup lists them with their own annotations.
+
+    Loading a module registers every tool in it, so each module must hold
+    only the named tools, and each must be read-only; anything else fails
+    startup rather than widening what lazy mode exposes.
+    """
+    before = {tool.name for tool in await server.list_tools()}
+    for name in tool_names:
+        if not await lazy_loader.load_tool(name):
+            raise ValueError(f"lazy direct tool {name!r} could not be loaded")
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    problems = [f"{name} is not registered" for name in tool_names if name not in tools]
+    problems += [f"{name} is not read-only" for name in tool_names if name in tools and not _read_only(tools[name])]
+    problems += [f"{name} was registered alongside them" for name in sorted(set(tools) - before - set(tool_names))]
+    if problems:
+        raise ValueError("lazy direct tools must be read-only tools in their own modules: " + "; ".join(problems))
 
 
 async def register_tools_for_mode(
@@ -36,11 +66,14 @@ async def register_tools_for_mode(
     base_package: str,
     config: Any,
     logger: logging.Logger,
+    support_bundle_handler: Callable | None = None,
     prefix: str = "",
     server_label: str = "",
     register_meta_tools: Callable | None = None,
     register_load_tools: Callable | None = None,
     auto_load_tools: Callable | None = None,
+    include_meta_tools: bool = True,
+    lazy_direct_tools: Sequence[str] = (),
 ) -> None:
     """Register meta-tools and domain tools based on *mode*.
 
@@ -57,14 +90,29 @@ async def register_tools_for_mode(
         base_package: Dotted package path for tool modules (e.g. ``"unifi_network_mcp.tools"``).
         config: Server config object (used for ``enabled_categories``/``enabled_tools``).
         logger: Logger instance.
+        support_bundle_handler: Optional runtime callback; legacy callers can omit it.
         prefix: Tool name prefix (e.g. ``"protect"``). Empty string for Network (uses ``"unifi"``).
         server_label: Human-readable server name (e.g. ``"UniFi Protect"``).
         register_meta_tools: Shared meta-tools registration function.
         register_load_tools: Shared load_tools registration function.
         auto_load_tools: Shared eager tool auto-discovery function.
+        include_meta_tools: Whether to expose indirect discovery, execute, and
+            batch tools. Disabling is supported only in eager mode, where
+            direct tools can be allowlisted independently.
+        lazy_direct_tools: Read-only tools lazy mode lists directly at startup
+            (see :func:`register_lazy_direct_tools`). Ignored in other modes:
+            eager lists every tool and meta_only lists none.
     """
+    if not include_meta_tools and mode != "eager":
+        raise ValueError("meta-tools can be disabled only in eager registration mode")
+
+    enabled_categories = _parse_filter_list(config.server.get("enabled_categories")) if mode == "eager" else None
+    enabled_tools = _parse_filter_list(config.server.get("enabled_tools")) if mode == "eager" else None
+    if not include_meta_tools and not (enabled_categories or enabled_tools):
+        raise ValueError("disabling meta-tools requires enabled_categories or enabled_tools")
+
     # Late-import defaults from shared package if not provided
-    if register_meta_tools is None:
+    if include_meta_tools and register_meta_tools is None:
         from unifi_mcp_shared.meta_tools import register_meta_tools
     if register_load_tools is None:
         from unifi_mcp_shared.meta_tools import register_load_tools
@@ -80,25 +128,31 @@ async def register_tools_for_mode(
         get_job_status=get_job_status,
         register_tool=register_tool,
     )
+    if support_bundle_handler is not None:
+        meta_kwargs["support_bundle_handler"] = support_bundle_handler
     if prefix:
         meta_kwargs["prefix"] = prefix
         meta_kwargs["server_label"] = server_label
 
-    # Always register meta-tools first
-    register_meta_tools(**meta_kwargs)
+    if include_meta_tools:
+        register_meta_tools(**meta_kwargs)
+    else:
+        logger.info("Meta-tools disabled for confined eager registration")
 
     tool_prefix = prefix or "unifi"
+    support_hint = f", {tool_prefix}_get_support_bundle" if support_bundle_handler is not None else ""
 
     if mode == "meta_only":
         logger.info("Tool registration mode: meta_only")
         logger.info(
-            "   Meta-tools: %s_tool_index, %s_execute, %s_batch, %s_batch_status",
+            "   Meta-tools: %s_tool_index, %s_execute, %s_batch, %s_batch_status%s",
             tool_prefix,
             tool_prefix,
             tool_prefix,
             tool_prefix,
+            support_hint,
         )
-        logger.info("   Use %s_execute to run any tool discovered via %s_tool_index", tool_prefix, tool_prefix)
+        logger.info("   Use %s_execute to run domain tools by name", tool_prefix)
         logger.info("   To load all tools directly: set UNIFI_TOOL_REGISTRATION_MODE=eager")
 
         setup_lazy_loading(server, original_tool_decorator)
@@ -107,12 +161,13 @@ async def register_tools_for_mode(
     elif mode == "lazy":
         logger.info("Tool registration mode: lazy")
         logger.info(
-            "   Meta-tools: %s_tool_index, %s_execute, %s_batch, %s_batch_status, %s_load_tools",
+            "   Meta-tools: %s_tool_index, %s_execute, %s_batch, %s_batch_status, %s_load_tools%s",
             tool_prefix,
             tool_prefix,
             tool_prefix,
             tool_prefix,
             tool_prefix,
+            support_hint,
         )
         logger.info("   Use %s_execute to run any tool - works with all clients", tool_prefix)
 
@@ -130,13 +185,14 @@ async def register_tools_for_mode(
             load_kwargs["server_label"] = server_label
         register_load_tools(**load_kwargs)
 
+        if lazy_direct_tools:
+            await register_lazy_direct_tools(server, lazy_loader, lazy_direct_tools)
+            logger.info("   Read-only tools listed directly: %s", ", ".join(lazy_direct_tools))
+
         logger.info("   Lazy loader ready - %d tools available on-demand", len(tool_module_map))
 
     else:  # eager
         logger.info("Tool registration mode: eager")
-
-        enabled_categories = _parse_filter_list(config.server.get("enabled_categories"))
-        enabled_tools = _parse_filter_list(config.server.get("enabled_tools"))
 
         if enabled_categories:
             logger.info("   Filtering by categories: %s", enabled_categories)
@@ -145,12 +201,14 @@ async def register_tools_for_mode(
         else:
             logger.info("   All tools registered (no filtering)")
 
-        auto_load_tools(
+        filtering = auto_load_tools(
             base_package=base_package,
             enabled_categories=enabled_categories,
             enabled_tools=enabled_tools,
             server=server,
         )
+        if filtering is not None:
+            await filtering
 
     # Log registered tools
     try:

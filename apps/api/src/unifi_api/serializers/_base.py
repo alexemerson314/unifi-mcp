@@ -5,6 +5,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Callable
 
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_core.write_verification import WriteVerificationResult
+
 
 class RenderKind(str, Enum):
     LIST = "list"
@@ -18,6 +21,20 @@ class RenderKind(str, Enum):
 
 class SerializerContractError(Exception):
     """Raised when manager-method return type doesn't match declared kind."""
+
+
+def _is_ack_tuple(result: Any) -> bool:
+    """True for a mutation ``(ok: bool, error: Optional[str])`` ack tuple.
+
+    Fetch-merge-put update managers (e.g. update_network / update_wlan /
+    update_gateway_settings) return this shape instead of the resource dict.
+    """
+    return (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], bool)
+        and (result[1] is None or isinstance(result[1], str))
+    )
 
 
 class Serializer:
@@ -54,7 +71,25 @@ class Serializer:
             hint["sort_default"] = self.sort_default
         return hint
 
-    def serialize_action(self, result, *, tool_name: str) -> dict:
+    def _redact(self, data: Any, *, redact_sensitive: bool = True) -> Any:
+        return redact_sensitive_fields(data, redact_sensitive=redact_sensitive)
+
+    def serialize_action(self, result, *, tool_name: str, redact_sensitive: bool = True) -> dict:
+        if isinstance(result, WriteVerificationResult):
+            return self._redact(result.to_dict(), redact_sensitive=redact_sensitive)
+
+        # Mutation managers that follow the fetch-merge-put golden path return a
+        # (ok: bool, error: Optional[str]) ack tuple rather than the resource. Surface
+        # it as a structured envelope so the action path reports failures correctly.
+        # Without this the tuple falls through to serialize()'s str() fallback, which
+        # stringifies it into data.result and always reports top-level success=True.
+        if _is_ack_tuple(result):
+            ok, error = result
+            envelope: dict[str, Any] = {"success": ok}
+            if error:
+                envelope["error"] = error
+            return envelope
+
         kind = self._kind_for_tool(tool_name)
         hint = self._render_hint(kind)
         if kind == RenderKind.LIST:
@@ -62,21 +97,41 @@ class Serializer:
                 raise SerializerContractError(
                     f"tool '{tool_name}' declared kind=list but manager returned {type(result).__name__}"
                 )
-            return {"success": True, "data": [self.serialize(item) for item in result], "render_hint": hint}
+            return {
+                "success": True,
+                "data": self._redact([self.serialize(item) for item in result], redact_sensitive=redact_sensitive),
+                "render_hint": hint,
+            }
         if kind == RenderKind.DETAIL:
-            return {"success": True, "data": self.serialize(result), "render_hint": hint}
+            return {
+                "success": True,
+                "data": self._redact(self.serialize(result), redact_sensitive=redact_sensitive),
+                "render_hint": hint,
+            }
         if kind == RenderKind.EMPTY:
             return {"success": True, "render_hint": hint}
         if kind == RenderKind.DIFF:
-            return {"success": True, "data": self.serialize(result), "render_hint": hint}
+            return {
+                "success": True,
+                "data": self._redact(self.serialize(result), redact_sensitive=redact_sensitive),
+                "render_hint": hint,
+            }
         if kind == RenderKind.STREAM:
-            return {"success": True, "data": self.serialize(result), "render_hint": hint}
+            return {
+                "success": True,
+                "data": self._redact(self.serialize(result), redact_sensitive=redact_sensitive),
+                "render_hint": hint,
+            }
         if kind in (RenderKind.TIMESERIES, RenderKind.EVENT_LOG):
             if not isinstance(result, list):
                 raise SerializerContractError(
                     f"tool '{tool_name}' declared kind={kind.value} but manager returned {type(result).__name__}"
                 )
-            return {"success": True, "data": [self.serialize(item) for item in result], "render_hint": hint}
+            return {
+                "success": True,
+                "data": self._redact([self.serialize(item) for item in result], redact_sensitive=redact_sensitive),
+                "render_hint": hint,
+            }
         raise SerializerContractError(f"unknown kind {kind} for tool '{tool_name}'")
 
 

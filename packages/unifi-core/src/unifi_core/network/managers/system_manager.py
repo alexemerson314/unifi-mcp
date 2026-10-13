@@ -1,12 +1,30 @@
 import asyncio
 import logging
+from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from aiounifi.models.api import ApiRequest
+from aiounifi.models.api import ApiRequest, ApiRequestV2
 from aiounifi.models.site import Site  # Import Site model
 
-from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.network.managers.connection_manager import ConnectionManager, SettingsControllerRejection
+from unifi_core.network.models.mdns import (
+    MdnsSettings,
+    mdns_from_controller,
+    mdns_to_controller_update,
+    validate_mdns_service_selection,
+)
+from unifi_core.network.models.threat_management import (
+    ThreatManagementSettings,
+    ThreatManagementValidationError,
+    merge_threat_management_update,
+    threat_management_from_controller,
+    threat_management_to_controller_update,
+)
+from unifi_core.network.models.threat_posture import ThreatPosture, threat_posture_from_controller
+from unifi_core.redaction import collect_secret_values, sanitize_exception
+from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -181,7 +199,7 @@ class SystemManager:
                 "autobackup_cloud_enabled": settings.get("autobackup_cloud_enabled", False),
             }
         except Exception as e:
-            logger.error("Error getting auto-backup settings: %s", e, exc_info=True)
+            logger.error("Error getting auto-backup settings: %s", type(e).__name__)
             raise
 
     async def update_autobackup_settings(self, settings: Dict[str, Any]) -> bool:
@@ -197,8 +215,305 @@ class SystemManager:
             # update_settings handles cache invalidation with correct site-qualified key
             return await self.update_settings("super_mgmt", settings)
         except Exception as e:
-            logger.error("Error updating auto-backup settings: %s", e, exc_info=True)
+            logger.error("Error updating auto-backup settings: %s", type(e).__name__)
             raise
+
+    async def _fresh_mdns_record(self) -> Dict[str, Any]:
+        """Fetch the singleton record without the generic settings cache."""
+        try:
+            response = await self._connection.request(ApiRequest(method="get", path="/get/setting/mdns"))
+            if (
+                not isinstance(response, list)
+                or len(response) != 1
+                or not isinstance(response[0], dict)
+                or not isinstance(response[0].get("_id"), str)
+                or not response[0]["_id"]
+            ):
+                raise ValueError("invalid singleton")
+            return response[0]
+        except Exception as exc:
+            logger.error("Failed to read mDNS settings: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read mDNS settings") from None
+
+    async def get_mdns_settings(self) -> MdnsSettings:
+        """Read site-wide mDNS services and read-only network scope."""
+        record = await self._fresh_mdns_record()
+        try:
+            return mdns_from_controller(record)
+        except Exception as exc:
+            logger.error("Failed to shape mDNS settings: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read mDNS settings") from None
+
+    async def update_mdns_settings(self, update_data: Dict[str, Any]) -> WriteVerificationResult:
+        """Merge service fields into a fresh full record and verify the write."""
+        updates = mdns_to_controller_update(update_data)
+        try:
+            session_ready = await self._connection.ensure_session_connected()
+        except Exception as exc:
+            logger.error("Failed to prepare mDNS session: %s", type(exc).__name__)
+            raise RuntimeError("Updating mDNS settings requires Network session authentication") from None
+        if not session_ready:
+            raise RuntimeError("Updating mDNS settings requires Network session authentication")
+        before = await self._fresh_mdns_record()
+        merged = deepcopy(before)
+        merged.update(updates)
+        try:
+            validate_mdns_service_selection(merged)
+        except ValueError as exc:
+            return failed_write(str(exc), operation="update_mdns_settings")
+        try:
+            public_before = mdns_from_controller(before).model_dump()
+        except Exception as exc:
+            logger.error("Failed to shape mDNS settings: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read mDNS settings") from None
+        if all(before.get(key) == value for key, value in updates.items()):
+            return noop_write(operation="update_mdns_settings", resource=public_before)
+
+        cache_key = f"{CACHE_PREFIX_SETTINGS}_mdns_{self._connection.site}"
+        try:
+            await self._connection.request(ApiRequest(method="put", path="/set/setting/mdns", data=merged))
+        except Exception as exc:
+            logger.error("Failed to update mDNS settings: %s", type(exc).__name__)
+            if isinstance(exc, SettingsControllerRejection):
+                return failed_write(
+                    f"Controller rejected mDNS settings update ({exc.code})",
+                    operation="update_mdns_settings",
+                )
+            return failed_write(
+                "mDNS write outcome uncertain; inspect settings before another update",
+                operation="update_mdns_settings",
+                mutation_applied=None,
+                metadata={"outcome_uncertain": True},
+            )
+        finally:
+            self._connection._invalidate_cache(cache_key)
+
+        # ConnectionManager unwraps V1 responses to body["data"]. Even [] is
+        # a returned write; only the fresh readback can establish persistence.
+        try:
+            after = await self._fresh_mdns_record()
+            public_after = mdns_from_controller(after).model_dump()
+        except Exception:
+            return failed_write(
+                "mDNS write outcome uncertain; readback failed",
+                operation="update_mdns_settings",
+                mutation_applied=None,
+                metadata={"outcome_uncertain": True},
+            )
+
+        scope = {key: before[key] for key in ("enabled_for", "enabled_for_network_ids") if key in before}
+        result = verify_write(
+            operation="update_mdns_settings",
+            requested={**updates, **scope},
+            before=before,
+            after=after,
+        )
+        return replace(result, resource=public_after)
+
+    async def get_threat_management_settings(self) -> ThreatManagementSettings:
+        """Read site-wide threat management (IPS/IDS) and traffic identification (DPI) settings."""
+        try:
+            ips_list = await self.get_settings("ips")
+            dpi_list = await self.get_settings("dpi")
+            ips = ips_list[0] if ips_list and isinstance(ips_list[0], dict) else {}
+            dpi = dpi_list[0] if dpi_list and isinstance(dpi_list[0], dict) else {}
+            return threat_management_from_controller(ips, dpi)
+        except Exception as exc:
+            logger.error("Failed to read threat management settings: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read threat management settings") from None
+
+    async def _fresh_threat_record(self, section: str) -> Dict[str, Any]:
+        """Read a known singleton without trusting cached settings for a write."""
+        if section not in {"ips", "dpi"}:
+            raise ValueError("Unsupported threat management section")
+        try:
+            response = await self._connection.request(ApiRequest(method="get", path=f"/get/setting/{section}"))
+            if (
+                not isinstance(response, list)
+                or len(response) != 1
+                or not isinstance(response[0], dict)
+                or not isinstance(response[0].get("_id"), str)
+                or not response[0]["_id"]
+            ):
+                raise ValueError("Invalid settings singleton")
+            return response[0]
+        except Exception as exc:
+            logger.error("Failed to read threat management record: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read threat management settings; check controller compatibility") from None
+
+    async def _prepare_threat_update(self, update_data: Dict[str, Any]) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+        updates = threat_management_to_controller_update(update_data)
+        try:
+            ready = await self._connection.ensure_session_connected()
+        except Exception as exc:
+            logger.error("Failed to prepare threat management session: %s", type(exc).__name__)
+            raise RuntimeError("Updating threat management requires Network session authentication") from None
+        if not ready:
+            raise RuntimeError("Updating threat management requires Network session authentication")
+        section = "ips" if set(updates) & {"ips_mode", "enabled_categories"} else "dpi"
+        before = await self._fresh_threat_record(section)
+        supported = None
+        if section == "ips" and updates.get("ips_mode", before.get("ips_mode")) != "disabled":
+            memory = before.get("memory_optimized")
+            if type(memory) is not bool:
+                raise ThreatManagementValidationError(
+                    "Cannot validate IPS categories: controller memory optimization state is unknown"
+                )
+            try:
+                rows = await self._connection.request(
+                    ApiRequestV2(
+                        method="get",
+                        path=f"/settings/ips/available-categories?memoryOptimized={str(memory).lower()}",
+                    )
+                )
+                if (
+                    not isinstance(rows, list)
+                    or not rows
+                    or any(
+                        not isinstance(row, dict) or not isinstance(row.get("value"), str) or not row["value"]
+                        for row in rows
+                    )
+                ):
+                    raise ValueError("Invalid category catalog")
+                supported = {row["value"] for row in rows}
+            except Exception as exc:
+                logger.error("Failed to read IPS category catalog: %s", type(exc).__name__)
+                raise RuntimeError("Cannot validate IPS categories; check controller catalog support") from None
+        return section, before, merge_threat_management_update(updates, before, supported)
+
+    @staticmethod
+    def _public_threat_record(section: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        model = threat_management_from_controller(**{section: record}).model_dump()
+        keys = (
+            {"ips_mode", "enabled", "advanced_filtering_preference", "enabled_categories", "enabled_networks"}
+            if section == "ips"
+            else {"traffic_identification_enabled", "device_fingerprinting_enabled"}
+        )
+        return {key: value for key, value in model.items() if key in keys}
+
+    async def preview_threat_management_settings(self, update_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return validated public before/after state; never write during preview."""
+        section, before, updates = await self._prepare_threat_update(update_data)
+        after = {**before, **updates}
+        return {
+            "section": section,
+            "current": self._public_threat_record(section, before),
+            "after": self._public_threat_record(section, after),
+        }
+
+    async def update_threat_management_settings(self, update_data: Dict[str, Any]) -> WriteVerificationResult:
+        """Merge into one fresh settings record, save once, then verify persistence."""
+        operation = "update_threat_management_settings"
+        if not threat_management_to_controller_update(update_data):
+            return noop_write(operation=operation)
+        section, before, updates = await self._prepare_threat_update(update_data)
+        public_before = self._public_threat_record(section, before)
+        if all(type(before.get(key)) is type(value) and before.get(key) == value for key, value in updates.items()):
+            return noop_write(operation=operation, resource=public_before)
+        merged = deepcopy(before)
+        merged.update(updates)
+        try:
+            await self._connection.request(ApiRequest(method="post", path=f"/set/setting/{section}", data=merged))
+        except Exception as exc:
+            logger.error("Failed to update threat management: %s", type(exc).__name__)
+            if isinstance(exc, SettingsControllerRejection):
+                return failed_write(f"Controller rejected threat management update ({exc.code})", operation=operation)
+            return failed_write(
+                "Threat management write outcome uncertain; inspect settings before another update",
+                operation=operation,
+                mutation_applied=None,
+                metadata={"outcome_uncertain": True},
+            )
+        finally:
+            self._connection._invalidate_cache(f"{CACHE_PREFIX_SETTINGS}_{section}_{self._connection.site}")
+        try:
+            after = await self._fresh_threat_record(section)
+        except Exception:
+            return failed_write(
+                "Threat management write outcome uncertain; readback failed",
+                operation=operation,
+                mutation_applied=None,
+                metadata={"outcome_uncertain": True},
+            )
+        public_after = self._public_threat_record(section, after)
+        public_wanted = self._public_threat_record(section, merged)
+        # Category/network order is not meaningful. Automatic category selection
+        # is controller-owned; protected network membership must still be preserved.
+        if section == "ips" and merged.get("advanced_filtering_preference") == "auto":
+            public_wanted.pop("enabled_categories", None)
+
+        def comparison(record: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                key: sorted(value)
+                if key in {"enabled_categories", "enabled_networks"} and isinstance(value, list)
+                else value
+                for key, value in record.items()
+            }
+
+        result = verify_write(
+            operation=operation,
+            requested=comparison(public_wanted),
+            before=comparison(public_before),
+            after=comparison(public_after),
+        )
+        targeted = set(updates)
+        if section == "ips":
+            targeted.add("enabled")
+        else:
+            names = {
+                "enabled": "traffic_identification_enabled",
+                "fingerprintingEnabled": "device_fingerprinting_enabled",
+            }
+            targeted = {names[key] for key in updates}
+        collateral = sorted((set(result.dropped_fields) | set(result.coerced_fields)) - targeted)
+        if collateral:
+            result = replace(
+                result,
+                error=(
+                    "Controller accepted the threat management update but also changed preserved field(s): "
+                    + ", ".join(collateral)
+                    + ". The mutation was not rolled back; inspect details_after_attempt before another update."
+                ),
+                metadata={"collateral_changed_fields": collateral},
+            )
+        # Never expose controller secrets or unknown settings, even when redaction is disabled.
+        return replace(result, resource=public_after)
+
+    async def get_threat_posture(self, period: str = "DAY") -> ThreatPosture:
+        """Read a CyberSecure summary and gateway signatures using the Network session."""
+        if period not in ("HOUR", "DAY", "WEEK", "MONTH") or type(period) is not str:
+            raise ValueError("Invalid threat posture period; use HOUR, DAY, WEEK, or MONTH")
+        try:
+            session_ready = await self._connection.ensure_session_connected()
+        except Exception as exc:
+            logger.error("Failed to prepare threat posture session: %s", type(exc).__name__)
+            raise RuntimeError("Failed to prepare Network session for threat posture") from None
+        if not session_ready:
+            raise RuntimeError("Threat posture requires Network session authentication")
+        try:
+            summary = await self._connection.request(
+                ApiRequestV2(method="get", path=f"/cybersecure/summary?period={period}")
+            )
+        except Exception as exc:
+            logger.error("Failed to request threat posture summary: %s", type(exc).__name__)
+            raise RuntimeError("Failed to read threat posture summary; check Network session and controller") from None
+        if not isinstance(summary, list) or len(summary) != 1 or not isinstance(summary[0], dict):
+            logger.error("Failed to read threat posture summary: unexpected envelope")
+            raise RuntimeError("Unexpected threat posture summary response; check controller compatibility")
+        try:
+            if self._connection.controller is None:
+                raise RuntimeError("Network controller session unavailable")
+            await self._connection.refresh_handler("devices")
+            controller = self._connection.controller
+            if controller is None:
+                raise RuntimeError("Network controller session unavailable")
+            devices = list(controller.devices.values())
+            return threat_posture_from_controller(period, summary[0], devices)
+        except Exception as exc:
+            logger.error("Failed to read threat posture: %s", type(exc).__name__)
+            raise RuntimeError(
+                "Failed to read threat posture; check Network session and controller compatibility"
+            ) from None
 
     async def check_firmware_updates(self) -> Dict[str, Any]:
         """Check for firmware updates for devices."""
@@ -276,7 +591,7 @@ class SystemManager:
             self._connection._update_cache(cache_key, settings_list)
             return settings_list
         except Exception as e:
-            logger.error("Error getting %s settings: %s", section, e)
+            logger.error("Error getting %s settings: %s", section, type(e).__name__)
             raise
 
     async def update_settings(self, section: str, settings_data: Dict[str, Any]) -> bool:
@@ -324,11 +639,16 @@ class SystemManager:
             if success:
                 logger.info("%s settings updated successfully", section)
             else:
-                logger.error("Error updating %s settings: %s", section, response)
+                # Controller-only secrets in a response cannot be scrubbed using
+                # the submitted values. Keep the response out of logs entirely.
+                logger.error("Error updating %s settings: controller rejected update", section)
 
             return success
         except Exception as e:
-            logger.error("Error updating %s settings: %s", section, e)
+            # The transport scrubs its own errors; repeat here so the manager
+            # holds the contract on its own.
+            sanitize_exception(e, collect_secret_values(settings_data))
+            logger.error("Error updating %s settings: %s", section, type(e).__name__)
             raise
 
     async def get_network_health(self) -> List[Dict[str, Any]]:

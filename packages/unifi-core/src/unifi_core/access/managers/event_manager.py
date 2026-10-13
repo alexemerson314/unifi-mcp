@@ -19,11 +19,57 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
-from unifi_core.exceptions import UniFiConnectionError, UniFiNotFoundError
+from unifi_core.access.managers.connection_manager import reconnects_on_demand
+from unifi_core.access.models.events import event_from_controller, event_identity, with_event_identity
+from unifi_core.exceptions import UniFiConnectionError, UniFiNotFoundError, UniFiOperationError
 
 logger = logging.getLogger(__name__)
+
+_GET_EVENT_PAGE_SIZE = 100
+_MAX_SCAN_PAGES = 10
+MAX_EVENT_QUERY_LIMIT = 5000
+
+
+def _parse_iso_timestamp(value: str | None, name: str) -> tuple[datetime, str] | tuple[None, None]:
+    """Convert an ISO 8601 string into a UTC datetime and RFC 3339 string with fractional seconds preserved.
+
+    Raises ValueError on invalid timestamps.
+    """
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid timestamp {value!r} for {name}: expected ISO 8601 string")
+    text = value.strip()
+    if not text:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception as exc:
+        raise ValueError(f"Invalid timestamp {value!r} for {name}: expected ISO 8601 string") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt, dt.isoformat().replace("+00:00", "Z")
+
+
+def _matches_filters(event: Any, door_id: str | None, user_id: str | None) -> bool:
+    """Check if an event matches the specified door_id and user_id filters.
+
+    Uses typed event identity from event_from_controller, ensuring hub actors
+    (type != 'user') and non-door devices (e.g. readers) are excluded from matches.
+    """
+    if not door_id and not user_id:
+        return True
+    norm = event_from_controller(event)
+    if door_id and norm.door_id != door_id:
+        return False
+    if user_id and norm.user_id != user_id:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +113,8 @@ class EventBuffer:
         cutoff = time.time() - self._ttl
         results: list[dict[str, Any]] = []
         for event in reversed(self._buffer):
+            if limit is not None and len(results) >= limit:
+                break
             if event.get("_buffered_at", 0) < cutoff:
                 continue
             if event_type and event.get("type") != event_type:
@@ -74,8 +122,6 @@ class EventBuffer:
             if door_id and event.get("door_id") != door_id:
                 continue
             results.append(event)
-            if limit and len(results) >= limit:
-                break
         return results
 
     def clear(self) -> None:
@@ -91,6 +137,80 @@ class EventBuffer:
 # ---------------------------------------------------------------------------
 
 
+# The topics are the Access UI's own syslog Category filters, lowercased and
+# snake_cased. All seven verified against a live controller; anything else is
+# rejected with CODE_PARAMS_INVALID "no such topic".
+#
+# "unlocks" is the door history - access.door.unlock and access.dps.status.update
+# records, i.e. "Access Granted (Face)" and door open/close. Guessing at names
+# like door_openings or access finds nothing, which is what made this look
+# unreachable.
+SYSTEM_LOG_TOPICS: tuple[str, ...] = (
+    "unlocks",
+    "access_denial",
+    "ring",
+    "updates",
+    "critical",
+    "admin",
+    "admin_activity",
+)
+
+
+# The controller's histogram endpoint fails with CODE_SYSTEM_ERROR once the
+# request spans too many buckets. Measured live: 100 buckets succeed, 104 and
+# above return a 500. Kept well under the observed edge.
+_MAX_HISTOGRAM_BUCKETS = 96
+
+# Finest-to-coarsest: the loop below returns the FIRST interval that fits, so
+# this order is what makes the chosen bucket the finest one available. Reordering
+# it would silently pick the coarsest interval every time.
+_HISTOGRAM_INTERVALS = (3600, 7200, 21600, 43200, 86400, 604800)
+
+
+def _histogram_interval(days: int) -> int:
+    """Pick the finest bucket interval whose bucket count the controller accepts.
+
+    A fixed ``interval=3600`` meant the default 7-day window asked for 168
+    buckets and always failed, so the tool never worked at its own default.
+
+    Raises ``ValueError`` when no interval fits. Falling back to the coarsest
+    one instead would re-create the very failure this guards: 1000 days at one
+    bucket per week is 142 buckets, back over the limit. ``days`` is unbounded
+    on the MCP tool and the GraphQL resolver, so the bound has to be here.
+    """
+    span = max(int(days), 1) * 86400
+    for interval in _HISTOGRAM_INTERVALS:
+        # Ceil, not floor: the controller sees ceil(span/interval) buckets, so
+        # flooring let days=673 pass the guard and then ask for 97 against a
+        # cap of 96, while the error text still claimed 672 was the limit.
+        if -(-span // interval) <= _MAX_HISTOGRAM_BUCKETS:
+            return interval
+    max_days = _MAX_HISTOGRAM_BUCKETS * _HISTOGRAM_INTERVALS[-1] // 86400
+    raise ValueError(
+        f"A {int(days)}-day activity window cannot be served: even at one bucket "
+        f"per week it exceeds the controller's histogram limit. "
+        f"Request at most {max_days} days."
+    )
+
+
+# Delivered by the "*" subscription but deliberately NOT buffered: these are
+# high-rate telemetry, and the ring holds only 100 entries. A burst of them
+# would evict a door unlock seconds after it happened, so
+# get_recent(event_type="access.door.unlock") would come back empty.
+_BUFFER_EXCLUDED_EVENTS: frozenset[str] = frozenset(
+    {
+        "access.data.v2.location.update",
+        "access.data.device.location_update_v2",
+        "access.data.location.update",
+        "access.data.v2.device.update",
+        "access.remote_view",
+        "access.remote_view.change",
+        "access.base.info",
+    }
+)
+
+
+@reconnects_on_demand
 class EventManager:
     """Domain logic for UniFi Access events.
 
@@ -136,32 +256,75 @@ class EventManager:
             return
 
         try:
-            handlers = {
-                "door_open": self._on_event,
-                "door_close": self._on_event,
-                "access_granted": self._on_event,
-                "access_denied": self._on_event,
-                "door_alarm": self._on_event,
-            }
+            # The client dispatches on ``WebsocketMessage.event``, whose values
+            # are the controller's dotted names - ``access.logs.add``,
+            # ``access.hw.door_bell``, ``access.data.device.remote_unlock`` and
+            # friends. Enumerating friendly names like ``door_open`` matched
+            # none of them, so every message hit the client's "unhandled" branch
+            # and the buffer stayed empty. ``"*"`` is the client's wildcard.
+            handlers = {"*": self._on_event}
+            # NB: the wildcard also delivers high-rate telemetry frames. See
+            # _BUFFER_EXCLUDED_EVENTS - they are logged but not buffered, so a
+            # burst cannot evict a just-occurred door event from the ring.
             self._cm.start_websocket(handlers)
             logger.info("[event-mgr] Websocket subscription started.")
         except Exception as e:
             logger.error("[event-mgr] Failed to start websocket: %s", e, exc_info=True)
 
+    @staticmethod
+    def _normalize_ws_event(event_data: Any) -> dict[str, Any]:
+        """Flatten a websocket message into the buffer's dict shape.
+
+        The client hands the handler a frozen ``WebsocketMessage`` carrying
+        ``event`` / ``event_object_id`` / ``door_id``. It has no ``type``,
+        ``id``, ``user_id`` or ``timestamp``, so reading those names off it
+        buffered ``{"type": "unknown", "door_id": ""}`` - a row that no
+        ``get_recent`` filter could match and that carried no time at all.
+        """
+        raw: dict[str, Any] = {}
+        if isinstance(event_data, dict):
+            raw = dict(event_data)
+        else:
+            # Prefer the model's own dump, but only when it really yields a
+            # mapping - `hasattr` alone is true for any mock or proxy object.
+            dump = getattr(event_data, "model_dump", None)
+            if callable(dump):
+                try:
+                    dumped = dump()
+                except Exception:  # pragma: no cover - defensive
+                    dumped = None
+                if isinstance(dumped, dict):
+                    raw = dict(dumped)
+            if not raw:
+                # Plain object: read both naming schemes, since callers may
+                # hand us either the websocket model or a legacy event object.
+                raw = {
+                    key: getattr(event_data, key, None)
+                    for key in ("id", "type", "door_id", "user_id", "timestamp", "event", "event_object_id")
+                }
+
+        # Project to a known flat shape rather than carrying the whole dump.
+        # `model_dump()` includes the `data` sub-payload (actor display names,
+        # credential and device identifiers), and both `access_recent_events`
+        # and GET /access/recent-events return buffered rows unprojected - so
+        # keeping it would widen what a READ-scoped caller sees.
+        normalized: dict[str, Any] = {}
+        normalized["type"] = raw.get("type") or raw.get("event") or "unknown"
+        normalized["id"] = raw.get("id") or raw.get("event_object_id") or None
+        normalized["door_id"] = raw.get("door_id") or None
+        normalized["user_id"] = raw.get("user_id") or None
+        # Websocket messages are not timestamped by the controller; stamp on
+        # arrival so buffered rows can be ordered and aged like any other.
+        normalized["timestamp"] = raw.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        return normalized
+
     def _on_event(self, event_data: Any) -> None:
         """Callback invoked for websocket events. Buffers the event."""
         try:
-            if isinstance(event_data, dict):
-                event_dict = event_data
-            else:
-                # Convert to dict if it's an object
-                event_dict = {
-                    "id": getattr(event_data, "id", None),
-                    "type": getattr(event_data, "type", "unknown"),
-                    "door_id": getattr(event_data, "door_id", None),
-                    "user_id": getattr(event_data, "user_id", None),
-                    "timestamp": getattr(event_data, "timestamp", None),
-                }
+            event_dict = self._normalize_ws_event(event_data)
+            if event_dict.get("type") in _BUFFER_EXCLUDED_EVENTS:
+                logger.debug("[event-mgr] Skipping high-rate frame %s", event_dict.get("type"))
+                return
             self._buffer.add(event_dict)
             logger.debug("[event-mgr] Buffered event from websocket")
             # Phase 4B: fan out to subscribers
@@ -228,49 +391,147 @@ class EventManager:
         Parameters
         ----------
         topic:
-            Event topic to query.  Valid values include ``admin`` and
-            ``admin_activity``.  The Access API requires this field.
+            Event topic to query. One of :data:`SYSTEM_LOG_TOPICS`, which
+            mirrors the Access UI's syslog Category filter. ``unlocks`` is the
+            door history (grants plus open/close), ``access_denial`` the
+            refused attempts. Anything else is rejected with ``no such topic``.
         start:
-            ISO 8601 start time filter.
+            ISO 8601 start time filter (e.g. '2026-09-19T00:00:00Z').
+            Translated to UTC RFC 3339 ``since`` parameter for the controller.
         end:
-            ISO 8601 end time filter.
+            ISO 8601 end time filter (e.g. '2026-09-19T23:59:59Z').
+            Translated to UTC RFC 3339 ``until`` parameter for the controller.
         door_id:
-            Filter events by door UUID.
+            Filter events by door UUID. Enforced client-side using typed event
+            models, excluding non-door devices (e.g. readers).
         user_id:
-            Filter events by user UUID.
+            Filter events by user UUID. Enforced client-side using typed event
+            models, excluding hub actors from user matches.
         limit:
-            Maximum number of events to return (page size).
+            Maximum number of matching events to return (0-5000, default 30).
         """
+        if topic not in SYSTEM_LOG_TOPICS:
+            raise ValueError(
+                f"Unsupported topic {topic!r}. The controller accepts only "
+                f"{', '.join(SYSTEM_LOG_TOPICS)}. Door unlock and open/close history "
+                "is under 'unlocks'; denied attempts are under 'access_denial'."
+            )
+
+        if limit < 0:
+            raise ValueError("limit must be zero or greater")
+        if limit > MAX_EVENT_QUERY_LIMIT:
+            raise ValueError(
+                f"limit must not exceed {MAX_EVENT_QUERY_LIMIT}; narrow the time range for larger histories"
+            )
+
         if not self._cm.has_proxy:
-            raise UniFiConnectionError("No proxy session available for list_events")
+            raise self._cm.unavailable_error("No proxy session available for list_events")
+
+        if limit == 0:
+            return []
+
+        since_dt, since_rfc = _parse_iso_timestamp(start, "start")
+        until_dt, until_rfc = _parse_iso_timestamp(end, "end")
+        if since_dt is not None and until_dt is not None and since_dt > until_dt:
+            raise ValueError(f"start time ({since_rfc}) must not be after end time ({until_rfc})")
+
+        door_id_filter = door_id.strip() if isinstance(door_id, str) and door_id.strip() else None
+        user_id_filter = user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
+        has_client_filters = bool(door_id_filter or user_id_filter)
 
         try:
-            # The system_log/search endpoint requires a ``topic`` field.
             body: dict[str, Any] = {"topic": topic}
-            if start:
-                body["start"] = start
-            if end:
-                body["end"] = end
-            if door_id:
-                body["door_id"] = door_id
-            if user_id:
-                body["user_id"] = user_id
+            if since_rfc is not None:
+                body["since"] = since_rfc
+            if until_rfc is not None:
+                body["until"] = until_rfc
 
-            page_size = limit or 30
-            path = f"insights/system_log/search?page_size={page_size}&page_num=1&isAccess"
+            collected: list[dict[str, Any]] = []
+            page_num = 1
+            page_size = _GET_EVENT_PAGE_SIZE if has_client_filters else min(limit, _GET_EVENT_PAGE_SIZE)
+            page_budget = (
+                _MAX_SCAN_PAGES if has_client_filters else (limit + page_size - 1) // page_size + _MAX_SCAN_PAGES
+            )
+            scanned_pages = 0
+            scanned_events = 0
+            seen_identities: set[str] = set()
+            seen_page_signatures: set[tuple[str, ...]] = set()
+            exhausted = False
 
-            data = await self._cm.proxy_request("POST", path, json=body)
+            while len(collected) < limit:
+                if scanned_pages >= page_budget:
+                    break
 
-            inner = self._cm.extract_data(data)
-            # Response wraps events in {"events": [...], "versions": {...}}
-            if isinstance(inner, dict):
-                events = inner.get("events", [])
-            elif isinstance(inner, list):
-                events = inner
-            else:
-                events = []
-            return events
-        except UniFiConnectionError:
+                path = f"insights/system_log/search?page_size={page_size}&page_num={page_num}&isAccess"
+                data = await self._cm.proxy_request("POST", path, json=body)
+                scanned_pages += 1
+
+                inner = self._cm.extract_data(data)
+                # Response wraps events in {"events": [...], "versions": {...}}
+                if isinstance(inner, dict):
+                    events = inner.get("events", [])
+                elif isinstance(inner, list):
+                    events = inner
+                else:
+                    events = []
+
+                if not isinstance(events, list):
+                    events = []
+
+                if not events:
+                    exhausted = True
+                    break
+
+                page_sig = tuple(str(event_identity(e) or id(e)) for e in events)
+                if page_sig in seen_page_signatures:
+                    raise UniFiOperationError(
+                        f"Cannot establish completeness for access events: controller returned repeated page "
+                        f"data on page {page_num}. Narrow the date range using start and end filters."
+                    )
+                seen_page_signatures.add(page_sig)
+
+                scanned_events += len(events)
+
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    ident = event_identity(event) or str(event)
+                    if ident in seen_identities:
+                        continue
+                    seen_identities.add(ident)
+
+                    if _matches_filters(event, door_id_filter, user_id_filter):
+                        collected.append(with_event_identity(event))
+                        if len(collected) >= limit:
+                            break
+
+                total = data.get("total") if isinstance(data, dict) else None
+                if total is None and isinstance(inner, dict):
+                    total = inner.get("total")
+                try:
+                    total_count = int(total) if total is not None else None
+                except (TypeError, ValueError):
+                    total_count = None
+
+                if total_count is not None:
+                    if len(seen_identities) >= total_count:
+                        exhausted = True
+                        break
+                elif len(events) < page_size:
+                    exhausted = True
+                    break
+
+                page_num += 1
+
+            if len(collected) < limit and not exhausted:
+                raise UniFiOperationError(
+                    f"Cannot establish completeness for access events: scanned {scanned_pages} pages "
+                    f"({scanned_events} events) and found {len(collected)} matching events, but more events remain "
+                    "on the controller. Narrow the date range using start and end filters."
+                )
+
+            return collected[:limit]
+        except (UniFiConnectionError, UniFiOperationError, ValueError):
             raise
         except Exception as e:
             logger.error("Failed to list events: %s", e, exc_info=True)
@@ -279,27 +540,57 @@ class EventManager:
     async def get_event(self, event_id: str) -> dict[str, Any]:
         """Get a single event by ID.
 
-        Searches the system log for the specific event. Raises
-        ``ValueError`` if the event is not found.
+        Searches every available system-log topic and raises
+        ``UniFiNotFoundError`` if the event is not found.
         """
         if not event_id:
             raise ValueError("event_id is required")
 
         if not self._cm.has_proxy:
-            raise UniFiConnectionError("No proxy session available for get_event")
+            raise self._cm.unavailable_error("No proxy session available for get_event")
 
         try:
-            # Search across both known topics for the event
-            for topic in ("admin", "admin_activity"):
-                path = "insights/system_log/search?page_size=100&page_num=1&isAccess"
-                data = await self._cm.proxy_request("POST", path, json={"topic": topic})
-                inner = self._cm.extract_data(data)
-                events = (
-                    inner.get("events", []) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
-                )
-                for ev in events:
-                    if isinstance(ev, dict) and ev.get("id") == event_id:
-                        return ev
+            # The controller has no direct event-by-id endpoint. Search every
+            # page of each supported topic so any ID returned by list_events
+            # remains addressable, including synthetic system-log IDs.
+            for topic in SYSTEM_LOG_TOPICS:
+                page_num = 1
+                while True:
+                    path = f"insights/system_log/search?page_size={_GET_EVENT_PAGE_SIZE}&page_num={page_num}&isAccess"
+                    try:
+                        data = await self._cm.proxy_request("POST", path, json={"topic": topic})
+                    except UniFiConnectionError as exc:
+                        # Topic availability can vary by Access version. An
+                        # unsupported category must not prevent lookup in the
+                        # remaining categories.
+                        if "no such topic" in str(exc).lower():
+                            logger.debug("Skipping unsupported Access event topic %s", topic)
+                            break
+                        raise
+                    inner = self._cm.extract_data(data)
+                    events = (
+                        inner.get("events", [])
+                        if isinstance(inner, dict)
+                        else (inner if isinstance(inner, list) else [])
+                    )
+                    for ev in events:
+                        if isinstance(ev, dict) and event_identity(ev) == event_id:
+                            return with_event_identity(ev)
+
+                    total = data.get("total") if isinstance(data, dict) else None
+                    if total is None and isinstance(inner, dict):
+                        total = inner.get("total")
+                    try:
+                        total_count = int(total) if total is not None else None
+                    except (TypeError, ValueError):
+                        total_count = None
+                    if not events:
+                        break
+                    if total_count is not None and page_num * _GET_EVENT_PAGE_SIZE >= total_count:
+                        break
+                    if total_count is None and len(events) < _GET_EVENT_PAGE_SIZE:
+                        break
+                    page_num += 1
             raise UniFiNotFoundError("event", event_id)
         except (UniFiConnectionError, UniFiNotFoundError, ValueError):
             raise
@@ -325,12 +616,17 @@ class EventManager:
             Number of days to include in the summary (default 7).
         """
         if not self._cm.has_proxy:
-            raise UniFiConnectionError("No proxy session available for get_activity_summary")
+            raise self._cm.unavailable_error("No proxy session available for get_activity_summary")
 
         try:
+            # Clamp once and use the clamped value for the window too: the MCP
+            # tool declares `days: int` with no bounds, so days=0 sent an empty
+            # window and days=-5 sent since > until, both slipping past the
+            # interval guard that had already judged the request servable.
+            window_days = max(int(days), 1)
             now = int(time.time())
-            since = now - (days * 86400)
-            path = f"activities/histogram?since={since}&until={now}&interval=3600"
+            since = now - (window_days * 86400)
+            path = f"activities/histogram?since={since}&until={now}&interval={_histogram_interval(window_days)}"
             if door_id:
                 path += f"&door_id={door_id}"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from unifi_core.network.models.devices import (
     DEVICE_MUTABLE_FIELDS,
     DEVICE_READ_ONLY_FIELDS,
@@ -10,9 +11,12 @@ from unifi_core.network.models.devices import (
     Device,
     DeviceRadio,
     from_controller,
+    normalize_radio_channel,
+    normalize_radio_ht,
     radio_from_controller,
     radio_to_controller_update,
     to_controller_update,
+    validate_radio_update,
 )
 
 
@@ -154,6 +158,49 @@ class TestRadioFromController:
         assert radio.radio is None
         assert radio.tx_power_mode is None
 
+    def test_normalizes_live_gateway_shape(self) -> None:
+        """A UDM 6GHz radio reports channel "auto" and an int ht; both normalise
+        to the canonical forms (0-for-auto int channel, MHz-string ht)."""
+        raw = {
+            "radio": "6e",
+            "tx_power_mode": "auto",
+            "channel": "auto",
+            "ht": 160,
+            "min_rssi_enabled": True,
+            "min_rssi": -75,
+        }
+        radio = radio_from_controller(raw)
+        assert radio.channel == 0
+        assert radio.ht == "160"
+
+
+class TestRadioNormalizers:
+    def test_channel_auto_maps_to_zero(self) -> None:
+        assert normalize_radio_channel("auto") == 0
+
+    def test_channel_int_passthrough(self) -> None:
+        assert normalize_radio_channel(36) == 36
+
+    def test_channel_none_passthrough(self) -> None:
+        assert normalize_radio_channel(None) is None
+
+    def test_channel_numeric_string_coerces(self) -> None:
+        assert normalize_radio_channel("11") == 11
+
+    def test_channel_unknown_string_drops_with_warning(self, caplog) -> None:
+        with caplog.at_level("WARNING"):
+            assert normalize_radio_channel("disabled") is None
+        assert "disabled" in caplog.text
+
+    def test_ht_int_becomes_string(self) -> None:
+        assert normalize_radio_ht(160) == "160"
+
+    def test_ht_string_passthrough(self) -> None:
+        assert normalize_radio_ht("20") == "20"
+
+    def test_ht_none_passthrough(self) -> None:
+        assert normalize_radio_ht(None) is None
+
 
 class TestRadioToControllerUpdate:
     def test_allows_mutable_fields(self) -> None:
@@ -183,3 +230,29 @@ class TestRadioToControllerUpdate:
         # since False is not None, it should be kept
         assert "min_rssi_enabled" in result
         assert result["min_rssi_enabled"] is False
+
+
+class TestValidateRadioUpdate:
+    def test_accepts_controller_safe_cross_field_values(self) -> None:
+        result = validate_radio_update(
+            "na",
+            {"tx_power_mode": "custom", "tx_power": 20, "channel": 36, "ht": "80"},
+        )
+
+        assert result == {"tx_power_mode": "custom", "tx_power": 20, "channel": 36, "ht": "80"}
+
+    @pytest.mark.parametrize(
+        ("radio", "fields", "message"),
+        [
+            ("invalid", {"channel": 36}, "Invalid radio"),
+            ("na", {"tx_power_mode": "invalid"}, "Invalid tx_power_mode"),
+            ("na", {"tx_power_mode": "auto", "tx_power": 20}, "tx_power can only"),
+            ("na", {"ht": "10"}, "Invalid ht"),
+            ("na", {"min_rssi": -70}, "min_rssi can only"),
+            ("na", {"sens_level": -70}, "sens_level can only"),
+            ("na", {}, "No radio settings"),
+        ],
+    )
+    def test_rejects_invalid_or_incomplete_updates(self, radio: str, fields: dict, message: str) -> None:
+        with pytest.raises(ValueError, match=message):
+            validate_radio_update(radio, fields)

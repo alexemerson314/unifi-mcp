@@ -8,7 +8,7 @@ unifi:
   api_key: ${oc.env:UNIFI_PROTECT_API_KEY,""}
 
 server:
-  host: ${oc.env:UNIFI_MCP_HOST,0.0.0.0}
+  host: ${oc.env:UNIFI_MCP_HOST,127.0.0.1}
   port: ${oc.env:UNIFI_MCP_PORT,3001}
   log_level: INFO
 
@@ -30,7 +30,7 @@ server:
   #     - devices      # All Protect devices (lights, sensors, chimes)
   #     - liveviews    # Liveview management
   #     - system       # System info, NVR health, storage
-  #     - alarm        # Alarm Manager arm/disarm (Protect 6.1+)
+  #     - alarm        # Alarm Manager arm/disarm and rule CRUD (Protect 6.1+)
   #   Example: "cameras,events,system" or ["cameras", "events", "system"]
   #
   # enabled_tools: Only register these specific tools (use with enabled_categories or alone)
@@ -42,7 +42,7 @@ server:
   enabled_tools: ${oc.env:UNIFI_ENABLED_TOOLS,null}
 
   http:
-    enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,true}
+    enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,false}
     force: ${oc.env:UNIFI_MCP_HTTP_FORCE,false}
     transport: ${oc.env:UNIFI_MCP_HTTP_TRANSPORT,streamable-http}
   diagnostics:
@@ -50,6 +50,11 @@ server:
     log_tool_args: ${oc.env:UNIFI_MCP_DIAG_LOG_TOOL_ARGS,true}
     log_tool_result: ${oc.env:UNIFI_MCP_DIAG_LOG_TOOL_RESULT,true}
     max_payload_chars: ${oc.env:UNIFI_MCP_DIAG_MAX_PAYLOAD,2000}
+
+policy:
+  response:
+    redact_sensitive_fields: ${oc.env:UNIFI_PROTECT_REDACT_SENSITIVE_FIELDS,true}
+    mcp_content_mode: ${oc.env:UNIFI_PROTECT_MCP_CONTENT_MODE,adaptive}
 
 protect:
   events:
