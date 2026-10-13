@@ -5,7 +5,6 @@ This module provides MCP tools to manage devices in a Unifi Network Controller.
 """
 
 import logging
-from datetime import datetime, timedelta
 from typing import Annotated, Any, Dict, List, Optional
 
 from mcp.types import ToolAnnotations
@@ -24,80 +23,39 @@ from unifi_core.network.models._actions import (
     SetSiteLedsInput,
     UpgradeDeviceInput,
 )
-from unifi_core.network.models.devices import radio_to_controller_update
+from unifi_core.network.models.devices import validate_radio_update
+from unifi_core.network.read_views import shape_device_details, shape_device_list, shape_rogue_ap_list
+from unifi_core.redaction import redact_sensitive_fields
 
 # Import the global FastMCP server instance, config, and managers
-from unifi_network_mcp.runtime import device_manager, server
+from unifi_network_mcp.runtime import device_manager, server, should_redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
 
 
-# Model prefixes for USP Smart Power devices that may report as 'uap' type
-_POWER_DEVICE_MODELS = {"UP1", "UP6", "USP"}
-
-
-def classify_device(device: Dict[str, Any]) -> str:
-    """Classify a device into a semantic category.
-
-    Uses the controller's ``is_access_point`` flag as the primary signal
-    for distinguishing real APs from other ``uap``-typed devices (e.g.,
-    USP Smart Power strips that connect via wireless mesh).  Falls back
-    to model-prefix matching when the flag is absent.
-
-    Returns one of: 'ap', 'switch', 'gateway', 'pdu', 'unknown'
-    """
-    device_type = device.get("type", "")
-    model = device.get("model", "")
-
-    # Explicit power device types
-    if device_type.startswith("usp"):
-        return "pdu"
-
-    # For uap-typed devices, use the controller's is_access_point flag
-    if device_type.startswith("uap"):
-        is_ap = device.get("is_access_point")
-        if is_ap is not None:
-            if not is_ap:
-                return "pdu"
-            return "ap"
-        # Fallback: check model prefix when flag is missing (older firmware)
-        if any(model.upper().startswith(prefix) for prefix in _POWER_DEVICE_MODELS):
-            return "pdu"
-        return "ap"
-
-    if device_type[:3] in ("usw", "usk"):
-        return "switch"
-    if device_type[:3] in ("ugw", "udm", "uxg"):
-        return "gateway"
-    if device_type == "uci":
-        return "wan"
-
-    return "unknown"
-
-
-def get_wifi_bands(device: Dict[str, Any]) -> List[str]:
-    """Extract active WiFi bands from device radio table."""
-    bands = set()
-    for radio in device.get("radio_table", []):
-        if radio.get("radio") == "na":
-            bands.add("5GHz")
-        elif radio.get("radio") == "ng":
-            bands.add("2.4GHz")
-        elif radio.get("radio") == "wifi6e":
-            bands.add("6GHz")
-    return sorted(list(bands))
-
-
 @server.tool(
     name="unifi_list_devices",
+    auth="either",
     description=(
         "Returns adopted device inventory with MAC, name, model, IP, firmware version, "
         "uptime, status (online/offline/upgrading/etc), device_category (ap/switch/gateway/pdu), "
         "upgradable flag, connection_network, uplink topology, load_avg, mem_pct, and model_eol. "
         "Filter by device_type (ap/switch/gateway/pdu) and status (online/offline/pending/upgrading). "
         "Note: device_type=ap correctly excludes USP Smart Power strips. "
-        "Set include_details=true for radio tables, port tables, and client counts. "
-        "For a single device's full raw object, use unifi_get_device_details."
+        "Use search to filter by name, IP, or MAC (case-insensitive). "
+        "Set include_details=true for additional per-device fields: by default (summary=true) "
+        "compressed radio/port summaries; set summary=false to return the full raw tables "
+        "(radio_table, port_table, network_table, system_stats, wan1/wan2). "
+        "Pass an entry's MAC to the device tools as mac_address "
+        "(unifi_get_device_details, unifi_reboot_device, unifi_rename_device, "
+        "unifi_upgrade_device, unifi_get_switch_ports, unifi_get_port_stats, "
+        "unifi_set_switch_port_profile, unifi_locate_device, ...). "
+        "RF scan tools (unifi_trigger_rf_scan, unifi_get_rf_scan_results) use ap_mac "
+        "for the access point to scan from."
+        " API-key inventory uses legacy reads when supported, otherwise limited public inventory. "
+        "Public results include source_api=integration and integration_id; missing legacy fields are unknown. "
+        "These IDs are scoped to the Integration inventory tool family — do not pass them to other resource tools. "
+        "Full details and mutations can require session credentials."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
@@ -114,164 +72,72 @@ async def list_devices(
             description="Filter by device status: 'all' (default), 'online', 'offline', 'pending', 'adopting', 'provisioning', or 'upgrading'"
         ),
     ] = "all",
+    search: Annotated[
+        Optional[str],
+        Field(description="Filter by name, IP, or MAC (case-insensitive substring match)"),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        Field(description="Maximum number of devices to return (default: all)"),
+    ] = None,
     include_details: Annotated[
         bool,
         Field(
-            description="When true, includes additional details like radio tables (APs), port tables (switches), WAN info (gateways), and client counts. Default false"
+            description="When true, includes additional per-device details (shape controlled by summary). Default false"
         ),
     ] = False,
+    summary: Annotated[
+        bool,
+        Field(
+            description=(
+                "Controls the shape of include_details (only applies when include_details=true). "
+                "When true (default), returns compressed summaries (counts, flattened uplink fields). "
+                "When false, returns the legacy raw tables (radio_table/port_table/network_table/"
+                "system_stats/wan1/wan2/poe_info)."
+            )
+        ),
+    ] = True,
+    fields: Annotated[
+        Optional[str],
+        Field(
+            description="Optional comma-separated top-level response fields, e.g. 'mac,name,status'. "
+            "Projection applies after include_details and summary; fields absent from a device's shaped response "
+            "are omitted. Omit or pass an empty string to keep all fields."
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Implementation for listing devices."""
     try:
         devices = await device_manager.get_devices()
-
-        # Convert Device objects to plain dictionaries for easier filtering
-        devices_raw = [d.raw if hasattr(d, "raw") else d for d in devices]
-
-        # Filter by device type using semantic classification
-        if device_type != "all":
-            devices_raw = [d for d in devices_raw if classify_device(d) == device_type]
-
-        # Filter by status
-        if status != "all":
-            status_map = {
-                "online": 1,
-                "offline": 0,
-                "pending": 2,
-                "adopting": 4,
-                "provisioning": 5,
-                "upgrading": 6,
-            }
-            target_state = status_map.get(status)
-            if target_state is not None:
-                devices_raw = [d for d in devices_raw if d.get("state") == target_state]
-            else:
-                logger.warning("Unknown status filter: %s", status)
-
-        formatted_devices = []
-        state_map = {
-            0: "offline",
-            1: "online",
-            2: "pending_adoption",
-            4: "managed_by_other/adopting",
-            5: "provisioning",
-            6: "upgrading",
-            11: "error/heartbeat_missed",
-        }
-
-        for device in devices_raw:
-            device_state = device.get("state", 0)
-            device_status_str = state_map.get(device_state, f"unknown_state ({device_state})")
-
-            category = classify_device(device)
-
-            # Extract per-device resource stats (available on all device types)
-            sys_stats = device.get("sys_stats", {})
-            mem_total = sys_stats.get("mem_total", 0)
-            mem_used = sys_stats.get("mem_used", 0)
-            mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total else None
-
-            # Uplink topology
-            uplink = device.get("uplink", device.get("last_uplink", {}))
-            uplink_info = None
-            if uplink:
-                uplink_info = {
-                    "type": uplink.get("type", "unknown"),
-                    "speed": uplink.get("speed", 0),
-                    "uplink_device": uplink.get("uplink_device_name"),
-                    "uplink_port": uplink.get("uplink_remote_port"),
-                }
-
-            device_info = {
-                "mac": device.get("mac", ""),
-                "name": device.get("name", device.get("model", "Unknown")),
-                "model": device.get("model", ""),
-                "type": device.get("type", ""),
-                "device_category": category,
-                "ip": device.get("ip", ""),
-                "status": device_status_str,
-                "uptime": str(timedelta(seconds=device.get("uptime", 0))) if device.get("uptime") else "N/A",
-                "last_seen": (
-                    datetime.fromtimestamp(device.get("last_seen", 0)).isoformat() if device.get("last_seen") else "N/A"
-                ),
-                "firmware": device.get("version", ""),
-                "upgradable": device.get("upgradable", False),
-                "adopted": device.get("adopted", False),
-                "connection_network": device.get("connection_network_name", ""),
-                "uplink": uplink_info,
-                "load_avg_1": sys_stats.get("loadavg_1"),
-                "mem_pct": mem_pct,
-                "model_eol": device.get("model_in_eol", False),
-                "_id": device.get("_id", ""),
-            }
-
-            if include_details:
-                details_to_add = {
-                    "serial": device.get("serial", ""),
-                    "hw_revision": device.get("hw_rev", ""),
-                    "model_display": device.get("model_display", device.get("model")),
-                    "clients": device.get("num_sta", 0),
-                }
-
-                if category == "ap":
-                    details_to_add.update(
-                        {
-                            "radio_table": device.get("radio_table", []),
-                            "vap_table": device.get("vap_table", []),
-                            "wifi_bands": get_wifi_bands(device),
-                            "experience_score": device.get("satisfaction", 0),
-                            "num_clients": device.get("num_sta", 0),
-                        }
-                    )
-                elif category == "switch":
-                    details_to_add.update(
-                        {
-                            "ports": device.get("port_table", []),
-                            "total_ports": len(device.get("port_table", [])),
-                            "num_clients": device.get("user-num_sta", 0) + device.get("guest-num_sta", 0),
-                            "poe_info": {
-                                "poe_current": device.get("poe_current"),
-                                "poe_power": device.get("poe_power"),
-                                "poe_voltage": device.get("poe_voltage"),
-                            },
-                        }
-                    )
-                elif category == "gateway":
-                    details_to_add.update(
-                        {
-                            "wan1": device.get("wan1", {}),
-                            "wan2": device.get("wan2", {}),
-                            "num_clients": device.get("user-num_sta", 0) + device.get("guest-num_sta", 0),
-                            "network_table": device.get("network_table", []),
-                            "system_stats": device.get("system-stats", {}),
-                            "speedtest_status": device.get("speedtest-status", {}),
-                        }
-                    )
-
-                device_info.update(details_to_add)
-
-            formatted_devices.append(device_info)
-
-        return {
-            "success": True,
-            "site": device_manager._connection.site,
-            "filter_type": device_type,
-            "filter_status": status,
-            "count": len(formatted_devices),
-            "devices": formatted_devices,
-        }
+        result = shape_device_list(
+            devices,
+            site=device_manager._connection.site,
+            device_type=device_type,
+            status=status,
+            search=search,
+            limit=limit,
+            include_details=include_details,
+            summary=summary,
+            fields=fields,
+        )
+        return redact_sensitive_fields(result, redact_sensitive=should_redact_sensitive_fields())
     except Exception as e:
-        logger.error("Error listing devices: %s", e, exc_info=True)
+        logger.error("Error listing devices: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to list devices: {e}"}
 
 
 @server.tool(
     name="unifi_get_device_details",
     description=(
-        "Returns the full raw device object for one device by MAC address — includes "
-        "radio tables, port tables, system stats, WAN info, firmware details, and all "
-        "controller-reported fields. Use when you need deep inspection of a specific "
-        "device. For a filtered overview of all devices, use unifi_list_devices."
+        "Returns device data for one device by MAC address. By default (summary=false) returns the "
+        "full raw device object — all controller-reported fields including radio tables, port tables, "
+        "system stats, WAN info, firmware details. Set summary=true to trim to selected sections via "
+        "include (basic, ports, radios, stats, uplink, lldp, all).\n\n"
+        "Port fields (summary mode):\n"
+        "- last_seen_mac: last MAC that sent traffic on port (may be wireless client traffic, not reliable)\n"
+        "- lldp_neighbor: actual connected infrastructure device (from LLDP, reliable for switches/APs)\n\n"
+        "Examples: <no args> (full raw); summary=true,include='basic' (minimal); "
+        "summary=true,include='basic,ports' (switches); summary=true,include='basic,radios' (APs)."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
@@ -280,19 +146,40 @@ async def get_device_details(
         str,
         Field(description="Device MAC address in format AA:BB:CC:DD:EE:FF (from unifi_list_devices)"),
     ],
+    include: Annotated[
+        str,
+        Field(
+            description=(
+                "Comma-separated sections to return when summary=true (default 'basic,ports'). "
+                "Sections: basic, ports, radios, stats, uplink, lldp, all."
+            )
+        ),
+    ] = "basic,ports",
+    summary: Annotated[
+        bool,
+        Field(
+            description=(
+                "When false (default), returns the full raw device object. "
+                "When true, trims to the sections named in include."
+            )
+        ),
+    ] = False,
 ) -> Dict[str, Any]:
     """Implementation for getting device details."""
     try:
         device = await device_manager.get_device_details(mac_address)
-        return {
-            "success": True,
-            "site": device_manager._connection.site,
-            "device": device.raw if hasattr(device, "raw") else device,
-        }
+        result = shape_device_details(
+            device,
+            site=device_manager._connection.site,
+            mac_address=mac_address,
+            include=include,
+            summary=summary,
+        )
+        return redact_sensitive_fields(result, redact_sensitive=should_redact_sensitive_fields())
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error getting device details for %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error getting device details for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get device details for {mac_address}: {e}"}
 
 
@@ -341,7 +228,7 @@ async def reboot_device(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error rebooting device %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error rebooting device [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to reboot device {mac_address}: {e}"}
 
 
@@ -389,7 +276,7 @@ async def rename_device(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error renaming device %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error renaming device [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to rename device {mac_address}: {e}"}
 
 
@@ -442,7 +329,7 @@ async def adopt_device(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error adopting device %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error adopting device [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to adopt device {mac_address}: {e}"}
 
 
@@ -499,21 +386,17 @@ async def upgrade_device(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error upgrading device %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error upgrading device [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to upgrade device {mac_address}: {e}"}
 
 
 RADIO_BAND_LABELS = {"ng": "2.4GHz", "na": "5GHz", "6e": "6GHz", "wifi6e": "6GHz"}
 
-VALID_RADIOS = {"na", "ng", "6e", "wifi6e"}
-VALID_TX_POWER_MODES = {"auto", "high", "medium", "low", "custom"}
-VALID_HT_VALUES = {"20", "40", "80", "160", "320"}
-
 
 @server.tool(
     name="unifi_get_device_radio",
     description=(
-        "Get radio configuration and live statistics for an access point. "
+        "Get radio configuration and live statistics for a device with radios (AP, or UDM/gateway with built-in WiFi). "
         "Returns per-band config (channel, tx_power, channel width, min_rssi) "
         "and live stats (actual tx_power, channel utilization, client count, retries)."
     ),
@@ -523,17 +406,17 @@ async def get_device_radio(
     mac_address: Annotated[
         str,
         Field(
-            description="MAC address of the access point, in format AA:BB:CC:DD:EE:FF (from unifi_list_devices with device_type='ap')"
+            description="MAC address of a device with radios (AP, or UDM/gateway with built-in WiFi), in format AA:BB:CC:DD:EE:FF (from unifi_list_devices)"
         ),
     ],
 ) -> Dict[str, Any]:
-    """Implementation for getting focused radio config and stats for an AP."""
+    """Implementation for getting focused radio config and stats for a device with radios."""
     try:
         result = await device_manager.get_device_radio(mac_address)
         if result is None:
             return {
                 "success": False,
-                "error": f"Device {mac_address} is not an access point.",
+                "error": f"Device {mac_address} does not have radios.",
             }
         return {
             "success": True,
@@ -543,14 +426,14 @@ async def get_device_radio(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error getting radio info for %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error getting radio info for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get radio info for device {mac_address}: {e}"}
 
 
 @server.tool(
     name="unifi_update_device_radio",
     description=(
-        "Update radio settings for a specific band on an access point. "
+        "Update radio settings for a specific band on a device with radios (AP, or UDM/gateway with built-in WiFi). "
         "Supports tx_power_mode, tx_power (custom dBm), channel, ht (channel width), "
         "min_rssi_enabled, min_rssi, assisted_roaming_enabled (802.11k/v), "
         "antenna_gain (dBi), vwire_enabled, sens_level_enabled, sens_level. "
@@ -563,7 +446,9 @@ async def get_device_radio(
 async def update_device_radio(
     mac_address: Annotated[
         str,
-        Field(description="MAC address of the access point, in format AA:BB:CC:DD:EE:FF (from unifi_list_devices)"),
+        Field(
+            description="MAC address of a device with radios (AP, or UDM/gateway with built-in WiFi), in format AA:BB:CC:DD:EE:FF (from unifi_list_devices)"
+        ),
     ],
     radio: Annotated[
         str,
@@ -620,34 +505,7 @@ async def update_device_radio(
         Field(description="When true, applies radio changes. When false (default), returns a preview of the changes"),
     ] = False,
 ) -> Dict[str, Any]:
-    """Implementation for updating AP radio settings."""
-    if radio not in VALID_RADIOS and not radio.startswith("wifi"):
-        return {
-            "success": False,
-            "error": (
-                f"Invalid radio '{radio}'. Must be a band code ({', '.join(sorted(VALID_RADIOS))}) "
-                "or an internal radio name (e.g. 'wifi0', 'wifi1')."
-            ),
-        }
-
-    if tx_power_mode is not None and tx_power_mode not in VALID_TX_POWER_MODES:
-        return {
-            "success": False,
-            "error": f"Invalid tx_power_mode '{tx_power_mode}'. Must be one of: {', '.join(sorted(VALID_TX_POWER_MODES))}",
-        }
-
-    if tx_power is not None and tx_power_mode != "custom":
-        return {"success": False, "error": "tx_power can only be set when tx_power_mode is 'custom'."}
-
-    if ht is not None and ht not in VALID_HT_VALUES:
-        return {"success": False, "error": f"Invalid ht '{ht}'. Must be one of: {', '.join(sorted(VALID_HT_VALUES))}"}
-
-    if min_rssi is not None and min_rssi_enabled is not True:
-        return {"success": False, "error": "min_rssi can only be set when min_rssi_enabled is true."}
-
-    if sens_level is not None and sens_level_enabled is not True:
-        return {"success": False, "error": "sens_level can only be set when sens_level_enabled is true."}
-
+    """Implementation for updating radio settings on a device with radios."""
     updates: Dict[str, Any] = {}
     if tx_power_mode is not None:
         updates["tx_power_mode"] = tx_power_mode
@@ -672,18 +530,17 @@ async def update_device_radio(
     if sens_level is not None:
         updates["sens_level"] = sens_level
 
-    if not updates:
-        return {"success": False, "error": "No radio settings provided to update."}
-
-    # Filter to known mutable radio fields via pydantic model
-    validated_data = radio_to_controller_update(updates)
+    try:
+        validated_data = validate_radio_update(radio, updates)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     try:
         radio_data = await device_manager.get_device_radio(mac_address)
         if radio_data is None:
             return {
                 "success": False,
-                "error": f"Device {mac_address} not found or is not an access point.",
+                "error": f"Device {mac_address} not found or does not have radios.",
             }
 
         target_radio = next((r for r in radio_data["radios"] if r["radio"] == radio or r["name"] == radio), None)
@@ -710,7 +567,7 @@ async def update_device_radio(
                 updates=validated_data,
             )
             preview["warnings"] = [
-                "AP radio will restart briefly after changes are applied.",
+                "Device radio will restart briefly after changes are applied.",
                 "Connected clients may experience a brief disconnection.",
             ]
             return preview
@@ -726,7 +583,7 @@ async def update_device_radio(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error updating radio on %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error updating radio on [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to update radio on device {mac_address}: {e}"}
 
 
@@ -742,7 +599,7 @@ async def update_device_radio(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def locate_device(
-    device_mac: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
     enabled: Annotated[bool, Field(description="True to start blinking, False to stop")],
     confirm: Annotated[
         bool,
@@ -751,7 +608,7 @@ async def locate_device(
 ) -> Dict[str, Any]:
     """Toggles device locate mode (LED blinking)."""
     try:
-        LocateDeviceInput(device_mac=device_mac, enabled=enabled)
+        LocateDeviceInput(device_mac=mac_address, enabled=enabled)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
@@ -759,20 +616,20 @@ async def locate_device(
         action = "start" if enabled else "stop"
         return create_preview(
             resource_type="device_locate",
-            resource_data={"device_mac": device_mac, "enabled": enabled},
-            resource_name=device_mac,
-            warnings=[f"Will {action} LED blinking on device {device_mac}."],
+            resource_data={"mac_address": mac_address, "enabled": enabled},
+            resource_name=mac_address,
+            warnings=[f"Will {action} LED blinking on device {mac_address}."],
         )
 
     try:
-        success = await device_manager.locate_device(device_mac, enabled)
+        success = await device_manager.locate_device(mac_address, enabled)
         if success:
             state = "enabled" if enabled else "disabled"
-            return {"success": True, "message": f"Locate mode {state} on device '{device_mac}'."}
-        return {"success": False, "error": f"Failed to set locate mode on '{device_mac}'."}
+            return {"success": True, "message": f"Locate mode {state} on device '{mac_address}'."}
+        return {"success": False, "error": f"Failed to set locate mode on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error setting locate mode on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to set locate mode on {device_mac}: {e}"}
+        logger.error("Error setting locate mode on [redacted]: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to set locate mode on {mac_address}: {e}"}
 
 
 @server.tool(
@@ -785,7 +642,7 @@ async def locate_device(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def force_provision_device(
-    device_mac: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
     confirm: Annotated[
         bool,
         Field(description="When true, force provisions the device. When false (default), returns a preview"),
@@ -793,25 +650,25 @@ async def force_provision_device(
 ) -> Dict[str, Any]:
     """Force re-provisions a device."""
     try:
-        ForceProvisionDeviceInput(device_mac=device_mac)
+        ForceProvisionDeviceInput(device_mac=mac_address)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
     if not confirm:
         return create_preview(
             resource_type="force_provision",
-            resource_data={"device_mac": device_mac},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address},
+            resource_name=mac_address,
         )
 
     try:
-        success = await device_manager.force_provision(device_mac)
+        success = await device_manager.force_provision(mac_address)
         if success:
-            return {"success": True, "message": f"Force provision initiated for device '{device_mac}'."}
-        return {"success": False, "error": f"Failed to force provision device '{device_mac}'."}
+            return {"success": True, "message": f"Force provision initiated for device '{mac_address}'."}
+        return {"success": False, "error": f"Failed to force provision device '{mac_address}'."}
     except Exception as e:
-        logger.error("Error force provisioning %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to force provision device {device_mac}: {e}"}
+        logger.error("Error force provisioning [redacted]: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to force provision device {mac_address}: {e}"}
 
 
 # ---- Speedtest Commands ----
@@ -849,7 +706,7 @@ async def trigger_speedtest(
             }
         return {"success": False, "error": f"Failed to trigger speedtest on '{gateway_mac}'."}
     except Exception as e:
-        logger.error("Error triggering speedtest on %s: %s", gateway_mac, e, exc_info=True)
+        logger.error("Error triggering speedtest on [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to trigger speedtest on {gateway_mac}: {e}"}
 
 
@@ -871,7 +728,7 @@ async def get_speedtest_status(
             "status": status,
         }
     except Exception as e:
-        logger.error("Error getting speedtest status for %s: %s", gateway_mac, e, exc_info=True)
+        logger.error("Error getting speedtest status for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get speedtest status for {gateway_mac}: {e}"}
 
 
@@ -882,10 +739,9 @@ async def get_speedtest_status(
     name="unifi_list_rogue_aps",
     description=(
         "List neighboring/rogue APs detected by your access points. "
-        "Returns BSSID, SSID, channel, RSSI, band, and which of your APs detected each one. "
-        "Useful for RF environment analysis and interference troubleshooting. "
-        "WARNING: This can return hundreds of APs. Use channel and/or min_signal filters "
-        "to reduce the result set."
+        "Defaults to a compact 100-record page; pass summary=false for raw records in the selected page. "
+        "Filters apply before pagination, limit is at most 500, and pagination metadata includes "
+        "total_count, returned_count/count, limit, offset, next_offset, and has_more."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
@@ -902,27 +758,34 @@ async def list_rogue_aps(
         Optional[int],
         Field(description="Minimum signal strength in dBm (e.g., -70 to only show strong neighbors)"),
     ] = None,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=500, description="Maximum records per page (default 100, max 500)"),
+    ] = 100,
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Zero-based offset into the filtered records (default 0)"),
+    ] = 0,
+    summary: Annotated[
+        bool,
+        Field(description="Return compact AP fields; default true. Set false for raw records in the selected page"),
+    ] = True,
 ) -> Dict[str, Any]:
     """List neighboring/rogue APs detected by your access points."""
     try:
         rogue_aps = await device_manager.list_rogue_aps(within_hours)
-
-        # Apply client-side filters
-        if channel is not None:
-            rogue_aps = [ap for ap in rogue_aps if ap.get("channel") == channel]
-        if min_signal is not None:
-            rogue_aps = [ap for ap in rogue_aps if ap.get("signal", -100) >= min_signal]
-
-        return {
-            "success": True,
-            "site": device_manager._connection.site,
-            "within_hours": within_hours,
-            "filters": {"channel": channel, "min_signal": min_signal},
-            "count": len(rogue_aps),
-            "rogue_aps": rogue_aps,
-        }
+        return shape_rogue_ap_list(
+            rogue_aps,
+            site=device_manager._connection.site,
+            within_hours=within_hours,
+            channel=channel,
+            min_signal=min_signal,
+            limit=limit,
+            offset=offset,
+            summary=summary,
+        )
     except Exception as e:
-        logger.error("Error listing rogue APs: %s", e, exc_info=True)
+        logger.error("Error listing rogue APs: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to list rogue APs: {e}"}
 
 
@@ -977,7 +840,7 @@ async def trigger_rf_scan(
             }
         return {"success": False, "error": f"Failed to trigger RF scan on AP '{ap_mac}'."}
     except Exception as e:
-        logger.error("Error triggering RF scan on %s: %s", ap_mac, e, exc_info=True)
+        logger.error("Error triggering RF scan on [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to trigger RF scan on AP '{ap_mac}': {e}"}
 
 
@@ -1010,7 +873,7 @@ async def get_rf_scan_results(
             "scan_results": results,
         }
     except Exception as e:
-        logger.error("Error getting RF scan results for %s: %s", ap_mac, e, exc_info=True)
+        logger.error("Error getting RF scan results for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get RF scan results for AP '{ap_mac}': {e}"}
 
 
@@ -1033,7 +896,7 @@ async def list_available_channels() -> Dict[str, Any]:
             "channels": channels,
         }
     except Exception as e:
-        logger.error("Error listing available channels: %s", e, exc_info=True)
+        logger.error("Error listing available channels: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to list available channels: {e}"}
 
 
@@ -1052,7 +915,7 @@ async def list_available_channels() -> Dict[str, Any]:
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def set_device_led(
-    device_mac: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
     led_state: Annotated[
         str,
         Field(description="LED override state: 'on' (force on), 'off' (force off), or 'default' (use site setting)"),
@@ -1064,7 +927,7 @@ async def set_device_led(
 ) -> Dict[str, Any]:
     """Set LED override state on a device."""
     try:
-        SetDeviceLedInput(device_mac=device_mac, led_state=led_state)
+        SetDeviceLedInput(device_mac=mac_address, led_state=led_state)
     except ValidationError as e:
         return {"success": False, "error": f"Invalid input: {e.errors()[0]['msg']}"}
 
@@ -1078,18 +941,18 @@ async def set_device_led(
     if not confirm:
         return create_preview(
             resource_type="device_led",
-            resource_data={"device_mac": device_mac, "led_override": led_state},
-            resource_name=device_mac,
+            resource_data={"mac_address": mac_address, "led_override": led_state},
+            resource_name=mac_address,
         )
 
     try:
-        success = await device_manager.set_device_led_override(device_mac, led_state)
+        success = await device_manager.set_device_led_override(mac_address, led_state)
         if success:
-            return {"success": True, "message": f"LED override set to '{led_state}' on device '{device_mac}'."}
-        return {"success": False, "error": f"Failed to set LED override on '{device_mac}'."}
+            return {"success": True, "message": f"LED override set to '{led_state}' on device '{mac_address}'."}
+        return {"success": False, "error": f"Failed to set LED override on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error setting LED override on %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to set LED override on {device_mac}: {e}"}
+        logger.error("Error setting LED override on [redacted]: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to set LED override on {mac_address}: {e}"}
 
 
 @server.tool(
@@ -1104,7 +967,7 @@ async def set_device_led(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
 )
 async def toggle_device(
-    device_mac: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
+    mac_address: Annotated[str, Field(description="MAC address of the device (from unifi_list_devices)")],
     disabled: Annotated[bool, Field(description="True to disable the device, False to enable it")],
     confirm: Annotated[
         bool,
@@ -1116,20 +979,20 @@ async def toggle_device(
         action = "disable" if disabled else "enable"
         return create_preview(
             resource_type="device_toggle",
-            resource_data={"device_mac": device_mac, "disabled": disabled},
-            resource_name=device_mac,
-            warnings=[f"Will {action} device {device_mac}. A disabled device stops passing traffic."],
+            resource_data={"mac_address": mac_address, "disabled": disabled},
+            resource_name=mac_address,
+            warnings=[f"Will {action} device {mac_address}. A disabled device stops passing traffic."],
         )
 
     try:
-        success = await device_manager.set_device_disabled(device_mac, disabled)
+        success = await device_manager.set_device_disabled(mac_address, disabled)
         if success:
             state = "disabled" if disabled else "enabled"
-            return {"success": True, "message": f"Device '{device_mac}' has been {state}."}
-        return {"success": False, "error": f"Failed to set disabled state on '{device_mac}'."}
+            return {"success": True, "message": f"Device '{mac_address}' has been {state}."}
+        return {"success": False, "error": f"Failed to set disabled state on '{mac_address}'."}
     except Exception as e:
-        logger.error("Error toggling device %s: %s", device_mac, e, exc_info=True)
-        return {"success": False, "error": f"Failed to toggle device {device_mac}: {e}"}
+        logger.error("Error toggling device [redacted]: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to toggle device {mac_address}: {e}"}
 
 
 @server.tool(
@@ -1172,7 +1035,7 @@ async def set_site_leds(
             return {"success": True, "message": f"Site-wide LEDs have been {state}."}
         return {"success": False, "error": "Failed to set site-wide LED state."}
     except Exception as e:
-        logger.error("Error setting site LEDs: %s", e, exc_info=True)
+        logger.error("Error setting site LEDs: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to set site-wide LED state: {e}"}
 
 
@@ -1214,7 +1077,7 @@ async def get_pdu_outlets(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error getting PDU outlets for %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error getting PDU outlets for [redacted]: %s", type(e).__name__)
         return {"success": False, "error": f"Failed to get PDU outlets for {mac_address}: {e}"}
 
 
@@ -1361,7 +1224,7 @@ async def set_outlet_state(
     except UniFiNotFoundError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        logger.error("Error setting outlet state on %s: %s", mac_address, e, exc_info=True)
+        logger.error("Error setting outlet state on [redacted]: %s", type(e).__name__)
         return {
             "success": False,
             "error": f"Failed to set outlet state on PDU {mac_address}: {e}",

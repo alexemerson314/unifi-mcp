@@ -5,7 +5,14 @@
   <img src="../../assets/hero-access.svg" alt="UniFi Access MCP Server" width="720">
 </p>
 
-MCP server exposing UniFi Access tools for LLMs, agents, and automation platforms. Manage doors, credentials, access policies, visitors, events, and devices -- with safe-by-default permissions and preview-before-confirm for all mutations.
+MCP server exposing UniFi Access tools for AI assistants and other MCP-capable
+clients. Manage doors, credentials, access policies, visitors, events, and
+devices with safe-by-default permissions and preview-before-confirm for all
+mutations.
+
+Software integrating over HTTP, including automation services and MCP adapters,
+should use [`unifi-api-server`](../api/) for REST and GraphQL reads, actions,
+and SSE events.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/downloads/)
@@ -24,10 +31,12 @@ The plugin installs the MCP server, an agent skill for tool discovery, and a gui
 Then run the interactive setup to configure your controller connection:
 
 ```
-/unifi-access:setup
+/unifi-access:unifi-access-setup
 ```
 
-This walks you through connecting to your Access controller, explains the dual-auth system (API key for reads, username/password for mutations), and configures permissions — then writes everything to `.claude/settings.local.json`. If you already have other UniFi plugins configured on the same controller, the setup will detect and reuse those credentials. Restart Claude Code after setup to connect.
+This walks you through connecting to your Access controller, explains the dual-auth system (API key for reads, username/password for mutations), and configures permissions. Credentials are given as a file or command provider, never typed into chat. Setup saves the result as the plugin's Claude Code options, which apply in every project; a password or API key entered as an option is stored in the system keychain. Start a new Claude Code session after setup to connect.
+
+Upgrading from a plugin version before 1.0.0, which kept settings in the project's `.claude/settings.local.json`? Follow the [plugin upgrade guide](../../docs/plugin-upgrade.md).
 
 ### Codex
 
@@ -37,7 +46,7 @@ Register the marketplace, then install `unifi-access` from Codex's `/plugins` UI
 codex plugin marketplace add sirkirby/unifi-mcp
 ```
 
-After installing, ask Codex to use the UniFi Access setup skill. The setup flow registers the MCP server with `codex mcp add`, stores your controller environment values in Codex's MCP configuration, and prompts you to restart Codex.
+After installing, ask Codex to use the UniFi Access setup skill. Setup saves a version-pinned MCP server entry with your controller settings in Codex's `config.toml` and prompts you to restart Codex. After each plugin upgrade, re-run setup with `--refresh`.
 
 ### PyPI / Docker
 
@@ -74,7 +83,9 @@ All queries are read-only by default. Mutations (visitor passes, credential chan
 
 ## Configure
 
-Set these environment variables (or create a `.env` file). If you used `/unifi-access:setup`, this is already done.
+Set these variables in the server's process environment. The plugin setup skill already does this for Codex and OpenClaw; in Claude Code the plugin maps its options onto these variables. The server does not automatically load `.env` or working-directory YAML files; load a trusted env file explicitly in your launcher (Docker `env_file:` is supported), or select custom YAML with an absolute `CONFIG_PATH`. See [configuration](docs/configuration.md) for migration examples.
+
+With no controller host configured, the server still starts in setup mode: it tells the client how to configure it, offers only the read-only `access_setup_status` tool, and makes no controller connections.
 
 ```bash
 # Server-specific variables (recommended)
@@ -89,6 +100,14 @@ UNIFI_ACCESS_PASSWORD=your-password # Admin password
 
 **Fallback:** The shared `UNIFI_*` variables (e.g., `UNIFI_HOST`) also work. The server checks for `UNIFI_ACCESS_*` first and falls back to `UNIFI_*` if the server-specific variable is not set. For single-controller setups, the shared variables are all you need.
 
+### MCP response size
+
+For tool results that already provide structured output, `adaptive` is the default response mode. It classifies each request by the canonical date-based `protocolVersion` advertised during MCP initialization, not by the client's product name or application version. Requests advertising MCP `2025-06-18` or later receive concise `content` plus the full result once in `structuredContent`; requests advertising an earlier revision (such as `2024-11-05` or `2025-03-26`), or whose revision metadata is missing or malformed, keep full compatibility JSON in `content`. Set `UNIFI_ACCESS_MCP_CONTENT_MODE` to `compat` to force the duplicated compatibility form, or to `compact` to force concise text plus full structured output outside a negotiated request. This server-specific variable overrides `UNIFI_MCP_CONTENT_MODE`; use `compat` for any client that consumes the full result only from `content`, regardless of its advertised revision.
+
+The lazy-loading meta-tools (`*_tool_index`, `*_execute`, `*_batch`, `*_batch_status`, and lazy-only `*_load_tools`) remain content-only; they are not the pre-`2025-06-18` protocol category described above. For structured inner results, `*_execute` and `*_batch_status` expose one normalized JSON payload in `content` rather than a nested transport pair; content-only execute results remain unchanged. Response modes do not convert these meta-tools to `structuredContent`.
+
+When Network is enabled alongside Access, its largest source responses are independently bounded: `unifi_get_dashboard` defaults to `summary=true`, and `unifi_list_rogue_aps` defaults to a summarized page of at most 100 records; `summary=false` restores the full selected data.
+
 ### Dual Authentication
 
 The Access server supports two independent auth paths:
@@ -97,6 +116,10 @@ The Access server supports two independent auth paths:
 2. **Local proxy session** -- Logs in via `/api/auth/login` on the UniFi OS Console (port 443) and proxies requests through `/proxy/access/api/v2/...`. Required for door lock/unlock, credential management, policies, visitors, and events.
 
 At least one path must be configured. When both are available, each tool selects the most appropriate path. Most mutating tools require the local proxy session.
+
+## Secret redaction
+
+Access tools redact credential secrets by default before returning data to MCP clients — credential `token` and `pin_code` values surface as `***REDACTED***` in reads, lists, and create previews. Disable redaction for a trusted local administration process with `UNIFI_ACCESS_REDACT_SENSITIVE_FIELDS=false` or the global `UNIFI_REDACT_SENSITIVE_FIELDS=false` policy flag when raw values are required. To preserve an existing secret on an update, omit the field rather than passing the `***REDACTED***` marker back (which is rejected).
 
 ## Run
 
@@ -161,9 +184,9 @@ No additional configuration is required — if both plugins are active, the skil
 
 - [Configuration](docs/configuration.md) -- Full env var reference, YAML config, Access-specific options
 - [Permissions](docs/permissions.md) -- Permission system, category defaults, how to enable mutations
-- [Tool Catalog](docs/tools.md) -- All 29 tools organized by category
+- [Tool Catalog](docs/tools.md) -- All 37 tools organized by category
 - [Event Streaming](docs/events.md) -- Real-time event architecture, WebSocket buffer, polling
-- [Troubleshooting](docs/troubleshooting.md) -- Connection issues, dual auth debugging, missing tools
+- [Troubleshooting and support bundles](docs/troubleshooting.md) -- Reviewed support evidence, dual auth debugging, missing tools
 
 ## Development
 

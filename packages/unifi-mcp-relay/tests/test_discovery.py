@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from importlib.metadata import version
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
-from unifi_mcp_relay.discovery import LEGACY_MCP_PROTOCOL_REVISION, McpHttpClient
+from unifi_mcp_relay.discovery import (
+    LEGACY_MCP_PROTOCOL_REVISION,
+    McpHttpClient,
+    _build_tools_from_index,
+    _build_tools_from_list,
+    _relay_client_info,
+)
 from unifi_mcp_shared.protocol import DEFAULT_MCP_PROTOCOL_REVISION
 
 
@@ -19,6 +27,7 @@ def mock_mcp_client():
         mock_cls = MagicMock()
         mock_instance = MagicMock()
         mock_instance.request = AsyncMock(side_effect=side_effect_fn)
+        mock_instance.notify = AsyncMock()
         mock_instance.close = AsyncMock()
         mock_instance.session_id = "session-abc-123"
         mock_instance.protocol_version = LEGACY_MCP_PROTOCOL_REVISION
@@ -42,7 +51,7 @@ class FakeResponse:
 
     def raise_for_status(self) -> None:
         if self.status >= 400:
-            raise RuntimeError(f"HTTP {self.status}")
+            raise aiohttp.ClientResponseError(MagicMock(), (), status=self.status)
 
     async def json(self) -> dict:
         return self._payload
@@ -58,6 +67,79 @@ class FakeSession:
     def post(self, url: str, *, json: dict, headers: dict):
         self.posts.append({"url": url, "json": json, "headers": headers})
         return self._responses.pop(0)
+
+
+def test_relay_client_info_matches_current_initialize_metadata():
+    info = _relay_client_info()
+
+    assert info["name"] == "unifi-mcp-relay"
+    assert info["title"] == "UniFi MCP Relay"
+    assert info["version"] == version("unifi-mcp-relay")
+    assert info["websiteUrl"] == "https://github.com/sirkirby/unifi-mcp"
+    assert [icon["sizes"] for icon in info["icons"]] == [["48x48"], ["96x96"], ["192x192"]]
+    assert {icon["mimeType"] for icon in info["icons"]} == {"image/png"}
+    assert base64.b64decode(info["icons"][0]["src"].removeprefix("data:image/png;base64,")).startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+
+
+def test_discovery_filters_support_tools_from_index_and_eager_list():
+    index = _build_tools_from_index(
+        {
+            "tools": [
+                {"name": "unifi_tool_index", "schema": {"input": {}}},
+                {"name": "unifi_get_support_bundle", "schema": {"input": {}}},
+            ]
+        },
+        "unifi-network-mcp",
+    )
+    listed = _build_tools_from_list(
+        [
+            {"name": "protect_get_support_bundle", "inputSchema": {}},
+            {"name": "protect_tool_index", "inputSchema": {}},
+        ],
+        "unifi-protect-mcp",
+    )
+
+    assert [tool.name for tool in index] == ["unifi_tool_index"]
+    assert [tool.name for tool in listed] == ["protect_tool_index"]
+
+
+@pytest.mark.asyncio
+async def test_discover_tools_uses_current_initialize_flow_before_tools_list(mock_mcp_client):
+    """Current discovery initializes, sends initialized, then lists tools."""
+
+    calls: list[str] = []
+
+    def route_request(method, params=None):
+        calls.append(method)
+        if method == "initialize":
+            assert params["protocolVersion"] == DEFAULT_MCP_PROTOCOL_REVISION
+            return {
+                "protocolVersion": DEFAULT_MCP_PROTOCOL_REVISION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "unifi-network-mcp", "version": "1.0.0"},
+            }
+        if method == "tools/list":
+            return {"tools": []}
+        raise ValueError(f"Unexpected method: {method}")
+
+    mock_cls, mock_instance = mock_mcp_client(route_request)
+
+    async def route_notify(method, params=None):
+        calls.append(method)
+
+    mock_instance.notify.side_effect = route_notify
+
+    with patch("unifi_mcp_relay.discovery.McpHttpClient", mock_cls):
+        from unifi_mcp_relay.discovery import discover_tools
+
+        result = await discover_tools("http://localhost:3000")
+
+    assert result is not None
+    assert result.name == "unifi-network-mcp"
+    assert calls == ["initialize", "notifications/initialized", "tools/list"]
+    mock_instance.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -353,6 +435,198 @@ async def test_discover_tools_eager_mode_fallback(mock_mcp_client):
 
 
 @pytest.mark.asyncio
+async def test_discover_tools_warmed_lazy_mode_still_uses_full_index(mock_mcp_client):
+    """A partially loaded lazy server must retain its full indexed catalog."""
+
+    def route_request(method, params=None):
+        if method == "initialize":
+            return {
+                "protocolVersion": LEGACY_MCP_PROTOCOL_REVISION,
+                "serverInfo": {"name": "unifi-network-mcp", "version": "1.0.0"},
+            }
+        if method == "tools/list":
+            return {
+                "tools": [
+                    {"name": "unifi_tool_index", "description": "Index", "inputSchema": {"type": "object"}},
+                    {"name": "unifi_execute", "description": "Execute", "inputSchema": {"type": "object"}},
+                    {"name": "unifi_batch", "description": "Batch", "inputSchema": {"type": "object"}},
+                    {"name": "unifi_batch_status", "description": "Status", "inputSchema": {"type": "object"}},
+                    {"name": "unifi_load_tools", "description": "Load", "inputSchema": {"type": "object"}},
+                    {
+                        "name": "unifi_list_clients",
+                        "description": "Already loaded directly",
+                        "inputSchema": {"type": "object"},
+                    },
+                ]
+            }
+        if method == "tools/call":
+            assert params == {"name": "unifi_tool_index", "arguments": {"include_schemas": True}}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": __import__("json").dumps(
+                            {
+                                "tools": [
+                                    {
+                                        "name": "unifi_list_clients",
+                                        "description": "List clients",
+                                        "schema": {"input": {"type": "object"}},
+                                        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                                    },
+                                    {
+                                        "name": "unifi_list_devices",
+                                        "description": "List devices",
+                                        "schema": {"input": {"type": "object"}},
+                                        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                                    },
+                                ]
+                            }
+                        ),
+                    }
+                ]
+            }
+        raise AssertionError(f"Unexpected call: {method}")
+
+    mock_cls, mock_instance = mock_mcp_client(route_request)
+    with patch("unifi_mcp_relay.discovery.McpHttpClient", mock_cls):
+        from unifi_mcp_relay.discovery import discover_tools
+
+        result = await discover_tools("http://localhost:3000")
+
+    assert result is not None
+    assert result.lazy_load_tool_name == "unifi_load_tools"
+    assert [call.args[0] for call in mock_instance.request.await_args_list] == [
+        "initialize",
+        "tools/list",
+        "tools/call",
+    ]
+    assert {tool.name for tool in result.tools} == {"unifi_list_clients", "unifi_list_devices"}
+    assert all(tool.annotations == {"readOnlyHint": True, "openWorldHint": False} for tool in result.tools)
+
+
+@pytest.mark.asyncio
+async def test_discover_tools_overlays_direct_annotations_missing_from_legacy_index(mock_mcp_client):
+    """A current relay must preserve annotations from older eager servers."""
+
+    def route_request(method, params=None):
+        if method == "initialize":
+            return {
+                "protocolVersion": LEGACY_MCP_PROTOCOL_REVISION,
+                "serverInfo": {"name": "unifi-network-mcp", "version": "0.27.0"},
+            }
+        if method == "tools/list":
+            return {
+                "tools": [
+                    {"name": "unifi_tool_index", "description": "Index", "inputSchema": {"type": "object"}},
+                    {
+                        "name": "unifi_list_clients",
+                        "title": "List Clients",
+                        "description": "Direct eager description",
+                        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
+                        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                    },
+                ]
+            }
+        if method == "tools/call":
+            assert params == {"name": "unifi_tool_index", "arguments": {"include_schemas": True}}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": __import__("json").dumps(
+                            {
+                                "tools": [
+                                    {
+                                        "name": "unifi_list_clients",
+                                        "description": "Indexed description",
+                                        "schema": {"input": {"type": "object"}},
+                                    }
+                                ]
+                            }
+                        ),
+                    }
+                ]
+            }
+        raise AssertionError(f"Unexpected call: {method}")
+
+    mock_cls, _ = mock_mcp_client(route_request)
+    with patch("unifi_mcp_relay.discovery.McpHttpClient", mock_cls):
+        from unifi_mcp_relay.discovery import discover_tools
+
+        result = await discover_tools("http://localhost:3000")
+
+    assert result is not None
+    assert [tool.name for tool in result.tools] == ["unifi_list_clients"]
+    tool = result.tools[0]
+    assert tool.description == "Indexed description"
+    assert tool.title == "List Clients"
+    assert tool.input_schema == {"type": "object"}
+    assert tool.annotations == {"readOnlyHint": True, "openWorldHint": False}
+
+
+@pytest.mark.asyncio
+async def test_discover_tools_meta_only_mode_calls_index_without_load_tools(mock_mcp_client):
+    """Four canonical meta-tools without load-tools is meta-only, not eager."""
+
+    def route_request(method, params=None):
+        if method == "initialize":
+            return {
+                "protocolVersion": LEGACY_MCP_PROTOCOL_REVISION,
+                "serverInfo": {"name": "unifi-network-mcp", "version": "1.0.0"},
+            }
+        if method == "tools/list":
+            return {
+                "tools": [
+                    {"name": name, "description": name, "inputSchema": {"type": "object"}}
+                    for name in (
+                        "unifi_tool_index",
+                        "unifi_execute",
+                        "unifi_batch",
+                        "unifi_batch_status",
+                    )
+                ]
+            }
+        if method == "tools/call":
+            assert params == {"name": "unifi_tool_index", "arguments": {"include_schemas": True}}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": __import__("json").dumps(
+                            {
+                                "tools": [
+                                    {
+                                        "name": "unifi_list_clients",
+                                        "description": "List clients",
+                                        "schema": {"input": {"type": "object"}},
+                                        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+                                    }
+                                ]
+                            }
+                        ),
+                    }
+                ]
+            }
+        raise AssertionError(f"Unexpected call: {method}")
+
+    mock_cls, mock_instance = mock_mcp_client(route_request)
+    with patch("unifi_mcp_relay.discovery.McpHttpClient", mock_cls):
+        from unifi_mcp_relay.discovery import discover_tools
+
+        result = await discover_tools("http://localhost:3000")
+
+    assert result is not None
+    assert result.lazy_load_tool_name is None
+    assert [call.args[0] for call in mock_instance.request.await_args_list] == [
+        "initialize",
+        "tools/list",
+        "tools/call",
+    ]
+    assert result.tools[0].annotations == {"readOnlyHint": True, "openWorldHint": False}
+
+
+@pytest.mark.asyncio
 async def test_discover_all_concurrent(mock_mcp_client):
     """discover_all runs multiple servers concurrently and collects results."""
 
@@ -405,3 +679,147 @@ async def test_discover_all_handles_failures(mock_mcp_client):
         results = await discover_all(["http://localhost:3000", "http://localhost:3001"])
 
     assert results == []
+
+
+def recovered_session_responses() -> list[FakeResponse]:
+    return [
+        FakeResponse(
+            {"result": {"protocolVersion": DEFAULT_MCP_PROTOCOL_REVISION}},
+            headers={"mcp-session-id": "fresh"},
+        ),
+        FakeResponse(status=202),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_client_recovers_expired_session_without_stale_headers():
+    session = FakeSession(
+        [
+            FakeResponse(status=404),
+            *recovered_session_responses(),
+            FakeResponse({"result": {"ok": True}}),
+        ]
+    )
+    client = McpHttpClient("http://localhost:3000", "expired", LEGACY_MCP_PROTOCOL_REVISION)
+    client._session = session
+
+    assert await client.request("tools/call", {"name": "mutate", "arguments": {"confirm": True}}) == {"ok": True}
+    assert [post["json"]["method"] for post in session.posts] == [
+        "tools/call",
+        "initialize",
+        "notifications/initialized",
+        "tools/call",
+    ]
+    assert "MCP-Session-Id" not in session.posts[1]["headers"]
+    assert "MCP-Protocol-Version" not in session.posts[1]["headers"]
+    assert session.posts[-1]["headers"]["MCP-Session-Id"] == "fresh"
+    assert session.posts[-1]["headers"]["MCP-Protocol-Version"] == DEFAULT_MCP_PROTOCOL_REVISION
+    assert session.posts[0]["json"]["params"] == session.posts[-1]["json"]["params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403, 429, 500, 503])
+async def test_http_client_does_not_replay_other_http_errors(status):
+    session = FakeSession([FakeResponse(status=status)])
+    client = McpHttpClient("http://localhost:3000", "existing", DEFAULT_MCP_PROTOCOL_REVISION)
+    client._session = session
+    with pytest.raises(aiohttp.ClientResponseError) as error:
+        await client.request("tools/call", {"name": "mutate"})
+    assert error.value.status == status
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.TimeoutError(), aiohttp.ServerDisconnectedError()])
+async def test_http_client_does_not_replay_uncertain_transport_failures(error):
+    client = McpHttpClient("http://localhost:3000", "existing", DEFAULT_MCP_PROTOCOL_REVISION)
+    with patch.object(client, "_request_once", AsyncMock(side_effect=error)) as send:
+        with pytest.raises(type(error)):
+            await client.request("tools/call", {"name": "mutate"})
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method,session_id", [("initialize", "existing"), ("tools/call", None)])
+async def test_http_client_does_not_recover_404_without_an_established_session(method, session_id):
+    session = FakeSession([FakeResponse(status=404)])
+    client = McpHttpClient("http://localhost:3000", session_id)
+    client._session = session
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.request(method)
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_client_retries_expired_request_at_most_once():
+    session = FakeSession([FakeResponse(status=404), *recovered_session_responses(), FakeResponse(status=404)])
+    client = McpHttpClient("http://localhost:3000", "expired", DEFAULT_MCP_PROTOCOL_REVISION)
+    client._session = session
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.request("tools/call", {"name": "mutate"})
+    assert len(session.posts) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_notification", [False, True])
+async def test_http_client_can_recover_on_later_call_after_failed_handshake(fail_notification):
+    initial = recovered_session_responses()[:1] if fail_notification else []
+    session = FakeSession(
+        [
+            FakeResponse(status=404),
+            *initial,
+            FakeResponse(status=503),
+            FakeResponse(status=404),
+            *recovered_session_responses(),
+            FakeResponse({"result": {"ok": True}}),
+        ]
+    )
+    client = McpHttpClient("http://localhost:3000", "expired", LEGACY_MCP_PROTOCOL_REVISION)
+    client._session = session
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.request("tools/call", {"name": "mutate"})
+    assert client.session_id == "expired"
+    assert client.protocol_version == LEGACY_MCP_PROTOCOL_REVISION
+    assert await client.request("tools/call", {"name": "mutate"}) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expired_requests_share_one_recovery():
+    client = McpHttpClient("http://localhost:3000", "expired", DEFAULT_MCP_PROTOCOL_REVISION)
+    expired_requests = 0
+    both_expired = asyncio.Event()
+    handshake_started = asyncio.Event()
+    finish_handshake = asyncio.Event()
+    initialized = 0
+
+    async def send(method, params, headers):
+        nonlocal expired_requests, initialized
+        if headers.get("MCP-Session-Id") == "expired":
+            expired_requests += 1
+            if expired_requests == 2:
+                both_expired.set()
+            await both_expired.wait()
+            raise aiohttp.ClientResponseError(MagicMock(), (), status=404)
+        if method == "initialize":
+            initialized += 1
+            handshake_started.set()
+            await finish_handshake.wait()
+            client._session_id = "fresh"
+            client._protocol_version = DEFAULT_MCP_PROTOCOL_REVISION
+            return {}
+        assert headers["MCP-Session-Id"] == "fresh"
+        return params
+
+    with patch.object(client, "_request_once", side_effect=send), patch.object(client, "notify", AsyncMock()) as notify:
+        async with asyncio.timeout(3):
+            first = asyncio.create_task(client.request("tools/call", {"n": 1}))
+            second = asyncio.create_task(client.request("tools/call", {"n": 2}))
+            await handshake_started.wait()
+            # New calls must not see the half-initialized session.
+            third = asyncio.create_task(client.request("tools/call", {"n": 3}))
+            await asyncio.sleep(0)
+            assert not third.done()
+            finish_handshake.set()
+            assert await asyncio.gather(first, second, third) == [{"n": 1}, {"n": 2}, {"n": 3}]
+    assert initialized == 1
+    notify.assert_awaited_once_with("notifications/initialized")

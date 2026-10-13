@@ -7,8 +7,8 @@ Phase 6 PR4 Task B migration target. The single read serializer
 
 Resource-registered (LIST + DETAIL paths). Mutation acks
 (``access_create_credential`` / ``access_revoke_credential``) stay in
-``serializers/access/credentials.py`` — both flow through the manager's
-preview path and produce dict acks.
+``serializers/access/credentials.py``; the API action path dispatches to
+the manager mutation methods and serializes their dict acknowledgements.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from dataclasses import asdict
 from typing import Any
 
 import strawberry
+from unifi_core.redaction import redact_value
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -53,7 +54,7 @@ class Credential:
         }
 
     @classmethod
-    def from_manager_output(cls, obj: Any) -> "Credential":
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "Credential":
         return cls(
             id=_get(obj, "id"),
             user_id=_get(obj, "user_id"),
@@ -61,8 +62,8 @@ class Credential:
             status=_get(obj, "status"),
             expiry=_get(obj, "expiry"),
             last_used=_get(obj, "last_used"),
-            token=_get(obj, "token"),
-            pin_code=_get(obj, "pin_code"),
+            token=redact_value("token", _get(obj, "token"), redact_sensitive=redact_sensitive),
+            pin_code=redact_value("pin_code", _get(obj, "pin_code"), redact_sensitive=redact_sensitive),
         )
 
     def to_dict(self) -> dict:

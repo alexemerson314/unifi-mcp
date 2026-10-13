@@ -6,6 +6,7 @@ from unifi_core.access.models.devices import (
     MUTABLE_FIELDS,
     READ_ONLY_FIELDS,
     AccessDevice,
+    AccessLocation,
     from_controller,
 )
 
@@ -19,7 +20,7 @@ class TestFieldSets:
         assert READ_ONLY_FIELDS == all_fields
 
     def test_read_only_contains_expected(self) -> None:
-        for field in ("id", "name", "type", "is_online", "firmware_version", "location"):
+        for field in ("id", "name", "type", "is_online", "firmware_version", "mac", "ip", "location"):
             assert field in READ_ONLY_FIELDS, f"Expected {field!r} in READ_ONLY_FIELDS"
 
     def test_mutable_and_read_only_are_disjoint(self) -> None:
@@ -32,14 +33,24 @@ class TestFieldSets:
 
 
 class TestFromController:
-    def test_full_dict(self) -> None:
+    def test_full_dict_with_structured_location(self) -> None:
+        """Real UNVR shape: location is a structured dict."""
         raw = {
             "id": "dev-1",
             "name": "Front Door Reader",
             "type": "UA-Reader-Pro",
             "is_online": True,
             "firmware_version": "3.2.7",
-            "location": "Main Entrance",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "ip": "192.168.1.20",
+            "location": {
+                "unique_id": "loc-uuid-1",
+                "name": "Front Door",
+                "up_id": "parent-uuid",
+                "location_type": "door",
+                "full_name": "Site - 1F - Front Door",
+                "level": 0,
+            },
         }
         d = from_controller(raw)
         assert d.id == "dev-1"
@@ -47,7 +58,27 @@ class TestFromController:
         assert d.type == "UA-Reader-Pro"
         assert d.is_online is True
         assert d.firmware_version == "3.2.7"
-        assert d.location == "Main Entrance"
+        assert d.mac == "aa:bb:cc:dd:ee:ff"
+        assert d.ip == "192.168.1.20"
+        assert isinstance(d.location, AccessLocation)
+        assert d.location.unique_id == "loc-uuid-1"
+        assert d.location.name == "Front Door"
+        assert d.location.up_id == "parent-uuid"
+        assert d.location.location_type == "door"
+        assert d.location.full_name == "Site - 1F - Front Door"
+        assert d.location.level == 0
+
+    def test_bare_string_location_wrapped_into_name(self) -> None:
+        """Legacy/string location is mapped to AccessLocation(name=...)."""
+        d = from_controller({"id": "dev-1", "location": "Main Entrance"})
+        assert isinstance(d.location, AccessLocation)
+        assert d.location.name == "Main Entrance"
+        assert d.location.unique_id is None
+        assert d.location.location_type is None
+
+    def test_empty_string_location_is_none(self) -> None:
+        d = from_controller({"id": "dev-1", "location": "   "})
+        assert d.location is None
 
     def test_missing_fields_are_none(self) -> None:
         d = from_controller({})
@@ -56,11 +87,39 @@ class TestFromController:
         assert d.type is None
         assert d.is_online is None
         assert d.firmware_version is None
+        assert d.mac is None
+        assert d.ip is None
         assert d.location is None
 
     def test_is_online_false_preserved(self) -> None:
         d = from_controller({"id": "dev-2", "is_online": False})
         assert d.is_online is False
+
+    def test_proxy_shape_is_projected_without_losing_identity(self) -> None:
+        d = from_controller(
+            {
+                "unique_id": "Device-ABC",
+                "alias": "Side Reader",
+                "device_type": "UA-G3",
+                "is_connected": False,
+                "firmware": "3.17.11",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "192.168.1.21",
+                "_door_name": "Side Door",
+            }
+        )
+
+        assert d.id == "Device-ABC"
+        assert d.name == "Side Reader"
+        assert d.type == "UA-G3"
+        assert d.is_online is False
+        assert d.firmware_version == "3.17.11"
+        assert d.mac == "AA:BB:CC:DD:EE:FF"
+        assert d.ip == "192.168.1.21"
+        assert d.location == AccessLocation(name="Side Door")
+
+    def test_api_connected_field_maps_to_is_online(self) -> None:
+        assert from_controller({"id": "aa:bb:cc:dd:ee:ff", "connected": False}).is_online is False
 
     def test_handles_partial_dict(self) -> None:
         d = from_controller({"id": "dev-3", "name": "Garage Hub", "type": "UA-Hub"})
@@ -71,7 +130,7 @@ class TestFromController:
         assert d.firmware_version is None
         assert d.location is None
 
-    def test_from_object(self) -> None:
+    def test_from_object_with_string_location(self) -> None:
         """from_controller works with an attribute-bearing object."""
 
         class Obj:
@@ -88,7 +147,23 @@ class TestFromController:
         assert d.type == "UA-Lock"
         assert d.is_online is True
         assert d.firmware_version == "2.1.0"
-        assert d.location == "Side Door"
+        assert d.location is not None
+        assert d.location.name == "Side Door"
+
+    def test_partial_location_dict_only_some_fields(self) -> None:
+        """Location dict with only some fields populates available subset, leaves rest None."""
+        d = from_controller({"id": "dev-5", "location": {"name": "Lobby", "location_type": "floor"}})
+        assert d.location is not None
+        assert d.location.name == "Lobby"
+        assert d.location.location_type == "floor"
+        assert d.location.unique_id is None
+        assert d.location.full_name is None
+        assert d.location.level is None
+
+    def test_unknown_location_value_type_yields_none(self) -> None:
+        """Defensive: an unexpected location shape (e.g. a list) yields None rather than crashing."""
+        d = from_controller({"id": "dev-6", "location": ["not", "a", "valid", "shape"]})
+        assert d.location is None
 
     def test_model_dump_exclude_none_omits_missing(self) -> None:
         d = from_controller({"id": "dev-5", "name": "Hub A"})
@@ -99,3 +174,18 @@ class TestFromController:
         assert "is_online" not in dumped
         assert "firmware_version" not in dumped
         assert "location" not in dumped
+
+    def test_model_dump_serializes_nested_location(self) -> None:
+        """model_dump produces a nested dict for the location field, not a string."""
+        d = from_controller(
+            {
+                "id": "dev-7",
+                "location": {"unique_id": "loc-7", "name": "Roof", "location_type": "floor"},
+            }
+        )
+        dumped = d.model_dump(exclude_none=True)
+        assert dumped["location"] == {
+            "unique_id": "loc-7",
+            "name": "Roof",
+            "location_type": "floor",
+        }

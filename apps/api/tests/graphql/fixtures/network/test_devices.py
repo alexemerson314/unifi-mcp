@@ -53,14 +53,14 @@ async def test_devices_list(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_device_detail(tmp_path, monkeypatch):
+async def test_device_detail_matches_equivalent_mac_format(tmp_path, monkeypatch):
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await bootstrap(tmp_path, product="network")
     stub_managers(
         monkeypatch,
         {
             ("network", "device_manager", "get_devices"): [
-                {"mac": "ap:01", "name": "AP-Living", "model": "U7PRO"},
+                {"mac": "aa:bb:cc:dd:ee:01", "name": "AP-Living", "model": "U7PRO"},
             ],
         },
     )
@@ -68,13 +68,13 @@ async def test_device_detail(tmp_path, monkeypatch):
         app,
         key,
         f'''{{
-        network {{ device(controller: "{cid}", mac: "ap:01") {{
+        network {{ device(controller: "{cid}", mac: "AABBCCDDEE01") {{
             mac name
         }} }}
     }}''',
     )
     assert body.get("errors") is None, body
-    assert body["data"]["network"]["device"]["mac"] == "ap:01"
+    assert body["data"]["network"]["device"]["mac"] == "aa:bb:cc:dd:ee:01"
 
 
 @pytest.mark.asyncio
@@ -85,8 +85,14 @@ async def test_device_radio(tmp_path, monkeypatch):
         monkeypatch,
         {
             ("network", "device_manager", "get_device_radio"): {
-                "mac": "ap:01",
-                "radio_table": [],
+                "mac": "udm:01",
+                "name": "Gateway",
+                "radios": [
+                    # AP-style raw row: int channel, string ht.
+                    {"name": "wifi0", "radio": "ng", "channel": 11, "ht": "20", "current_channel": 11},
+                    # Gateway-style raw row: "auto" channel, int ht.
+                    {"name": "wifi2", "radio": "6e", "channel": "auto", "ht": 160, "current_channel": 37},
+                ],
             },
         },
     )
@@ -94,13 +100,19 @@ async def test_device_radio(tmp_path, monkeypatch):
         app,
         key,
         f'''{{
-        network {{ deviceRadio(controller: "{cid}", mac: "ap:01") {{
+        network {{ deviceRadio(controller: "{cid}", mac: "udm:01") {{
             mac
+            radios {{ radio channel ht currentChannel }}
         }} }}
     }}''',
     )
     assert body.get("errors") is None, body
-    assert body["data"]["network"]["deviceRadio"]["mac"] == "ap:01"
+    radio_data = body["data"]["network"]["deviceRadio"]
+    assert radio_data["mac"] == "udm:01"
+    assert radio_data["radios"] == [
+        {"radio": "ng", "channel": 11, "ht": "20", "currentChannel": 11},
+        {"radio": "6e", "channel": 0, "ht": "160", "currentChannel": 37},
+    ]
 
 
 @pytest.mark.asyncio
@@ -303,3 +315,86 @@ async def test_pdu_outlets(tmp_path, monkeypatch):
     assert pdu["mac"] == "ac:8b:a9:11:22:33"
     assert pdu["outlets"][0]["index"] == 1
     assert pdu["outlets"][0]["relayState"] is True
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (42, 42.0),
+        ("42.5", 42.5),
+        (None, None),
+        (True, None),
+        ("bad", None),
+        ("nan", None),
+        (float("inf"), None),
+        ({}, None),
+    ],
+)
+def test_device_health_temperature_parsing(value, expected):
+    from unifi_api.graphql.types.network.device import Device
+
+    assert Device.from_manager_output({"general_temperature": value}).general_temperature == expected
+
+
+def test_device_health_shapes_and_primary_stats_key():
+    from unifi_api.graphql.types.network.device import Device
+
+    device = Device.from_manager_output(
+        {"system-stats": {"cpu": "12"}, "system_stats": {"cpu": "99"}, "temperatures": {}, "uptime_stats": []}
+    )
+    assert device.system_stats == {"cpu": "12"}
+    assert device.temperatures is None
+    assert device.uptime_stats is None
+    assert Device.from_manager_output({"system_stats": {"mem": "21"}}).system_stats == {"mem": "21"}
+    empty = Device.from_manager_output({}).to_dict()
+    assert all(empty[k] is None for k in ("system_stats", "general_temperature", "temperatures", "uptime_stats"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redact", [True, False])
+async def test_device_health_rest_graphql_parity_and_policy(tmp_path, monkeypatch, redact):
+    from httpx import ASGITransport, AsyncClient
+
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="network", redact_sensitive_fields=redact)
+    raw = {
+        "mac": "aa:bb:cc:dd:ee:01",
+        "system-stats": {"cpu": "12", "api_key": "secret"},
+        "general_temperature": "42.5",
+        "temperatures": [{"name": "board", "value": 43, "password": "secret"}],
+        "uptime_stats": {"WAN": {"monitors": [{"latency_average": 4, "token": "secret"}]}},
+    }
+    stub_managers(
+        monkeypatch,
+        {("network", "device_manager", "get_devices"): [raw], ("network", "device_manager", "get_device_details"): raw},
+    )
+    fields = "system_stats general_temperature temperatures uptime_stats"
+    selection = (
+        "system_stats: systemStats general_temperature: generalTemperature temperatures uptime_stats: uptimeStats"
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{ network {{
+            devices(controller:"{cid}") {{ items {{ {selection} }} }}
+            device(controller:"{cid}",mac:"aa:bb:cc:dd:ee:01") {{ {selection} }}
+        }} }}''',
+    )
+    assert not body.get("errors"), body
+    item = body["data"]["network"]["devices"]["items"][0]
+    assert item == body["data"]["network"]["device"]
+    async with AsyncClient(
+        transport=ASGITransport(app), base_url="http://test", headers={"Authorization": f"Bearer {key}"}
+    ) as client:
+        response = await client.get(f"/v1/sites/default/devices?controller={cid}")
+        assert response.status_code == 200
+        rest = response.json()["items"][0]
+        detail = await client.get(f"/v1/sites/default/devices/aa:bb:cc:dd:ee:01?controller={cid}")
+        assert detail.status_code == 200
+        assert {k: rest[k] for k in fields.split()} == item
+        assert {k: detail.json()["data"][k] for k in fields.split()} == item
+    expected = "***REDACTED***" if redact else "secret"
+    assert item["system_stats"]["api_key"] == expected
+    assert item["temperatures"][0]["password"] == expected
+    assert item["uptime_stats"]["WAN"]["monitors"][0]["token"] == expected
+    assert raw["system-stats"]["api_key"] == "secret"

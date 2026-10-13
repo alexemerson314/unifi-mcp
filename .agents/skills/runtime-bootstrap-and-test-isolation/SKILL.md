@@ -3,27 +3,33 @@ name: myco:runtime-bootstrap-and-test-isolation
 description: |-
   Activate this skill when adding a new manager, adding a new tool category,
   writing or debugging tool unit tests, diagnosing tool-visibility failures,
-  or investigating startup performance — even if the user doesn't explicitly
-  ask about the runtime architecture. Covers four procedural domains: (1) the
-  four-stage bootstrap sequence and which layer owns which changes, (2) adding
-  a new manager via @lru_cache singleton factories in runtime.py, (3) the
-  three-stage decorator replacement system that enables test isolation without
-  a live controller, and (4) lazy loading mechanics and tools_manifest.json
-  regeneration that controls which tool categories are visible to tool_index.
+  investigating startup performance, or extending/maintaining/debugging the
+  two-tier tool discovery system (`tool_index`) — even if the user doesn't
+  explicitly ask about the runtime architecture or "tool discovery." Covers:
+  (1) the four-stage bootstrap sequence and which layer owns which changes,
+  (2) adding a new manager via @lru_cache singleton factories in runtime.py,
+  (3) the three-stage decorator replacement system that enables test isolation
+  without a live controller, (4) lazy loading mechanics and
+  tools_manifest.json regeneration that controls which tool categories are
+  visible, (5) the permission model's two safety axes, and (6) the two-tier
+  tool_index discovery layer: the FastMCP named-param wrapper vs. the silent
+  `args: dict` trap, compact-vs-full schema tiers (`include_schemas`), Worker
+  cloud parity, and SKILL.md runtime manifest sync.
 managed_by: myco
 user-invocable: true
 allowed-tools: Read, Edit, Write, Bash, Grep, Glob
 ---
 
-# Runtime Bootstrap, Singleton Management, and Test Isolation
+# Runtime Bootstrap, Singleton Management, Test Isolation, and Tool Discovery
 
-The project uses a four-stage lazy-loading architecture that keeps startup token cost near ~200 tokens (meta-tools only) while making the full ~5000-token tool suite available on demand. Understanding the layer boundaries is essential for knowing where to make changes when adding managers, tool categories, or writing tests. The wrong layer means silent failures — missing singletons, invisible tools, or broken test imports.
+The project uses a four-stage lazy-loading architecture that keeps startup token cost near ~200 tokens (meta-tools only) while making the full ~5000-token tool suite available on demand. Understanding the layer boundaries is essential for knowing where to make changes when adding managers, tool categories, or writing tests. The wrong layer means silent failures — missing singletons, invisible tools, or broken test imports. The `tool_index` meta-tool (Procedure F) is the discovery layer that surfaces those lazily-loaded tools to agents.
 
 ## Prerequisites
 
-- Familiarity with the project's `runtime.py`, `main.py`, and `tools/` directory layout
+- Familiarity with the project's `runtime.py`, `main.py`, and `tools/` directory layout. Each app has its own copy under `apps/{app}/src/{package}/` (e.g., `apps/network/src/unifi_network_mcp/runtime.py`).
 - `make manifest` available (run from repo root; `uv run make manifest` if outside the venv)
 - Any new tool category module must be created on disk before regenerating the manifest
+- For Procedure F (tool discovery): two implementation surfaces exist — local server (per-app handler, e.g. `apps/access/src/unifi_access_mcp/tool_index.py`, plus the shared `packages/unifi-mcp-shared/src/unifi_mcp_shared/tool_index.py`) and Worker cloud (`apps/worker/worker/src/`). Both must move together.
 
 ## Procedure A: Understanding the Bootstrap Sequence and Layer Ownership
 
@@ -69,28 +75,31 @@ Every shared service (network client, cache, connection pool) is managed as an `
 2. Open `runtime.py` and add a factory function decorated with `@lru_cache`. Use a **public** name (no leading underscore) — all existing factories follow this convention:
 
 ```python
+# Real pattern, from apps/access/src/unifi_access_mcp/runtime.py
 from functools import lru_cache
-from managers.domain_manager import DomainManager
+from managers.door_manager import DoorManager
+
 
 @lru_cache
-def get_domain_manager() -> DomainManager:
-    return DomainManager(get_connection_manager())   # pass your dependency via its getter
+def get_door_manager() -> DoorManager:
+    return DoorManager(get_connection_manager())  # pass your dependency via its getter
 ```
 
-3. Add a module-level alias in the **"Shorthand aliases"** section at the bottom of `runtime.py` so tool modules can import the singleton by name:
+3. Add a module-level alias in the **"Shorthand aliases"** section at the bottom of `runtime.py` so tool modules can import the singleton by name (e.g. `traffic_flow_manager = get_traffic_flow_manager()` in `apps/network/src/unifi_network_mcp/runtime.py`):
 
 ```python
 # runtime.py — shorthand aliases section (bottom of file)
-domain_manager = get_domain_manager()
+door_manager = get_door_manager()
 ```
 
-Tool modules then import: `from unifi_network_mcp.runtime import domain_manager`
+Tool modules then import: `from unifi_access_mcp.runtime import door_manager`
 
 4. Verify singleton identity in a quick test:
 
 ```python
-from unifi_network_mcp.runtime import get_domain_manager
-assert get_domain_manager() is get_domain_manager()
+from unifi_access_mcp.runtime import get_door_manager
+
+assert get_door_manager() is get_door_manager()
 ```
 
 **Adding a tool vs. adding a manager:**
@@ -128,10 +137,10 @@ from unifi_mcp_shared.permissioned_tool import setup_permissioned_tool
 
 setup_permissioned_tool(
     server=server,
-    category_map=category_map,           # maps tool category to permission category
-    server_prefix=server_prefix,         # used for env var resolution
-    register_tool_fn=register_tool,      # callback to add tool to tool_index
-    diagnostics_enabled_fn=lambda: diag, # callable returning bool
+    category_map=category_map,  # maps tool category to permission category
+    server_prefix=server_prefix,  # used for env var resolution
+    register_tool_fn=register_tool,  # callback to add tool to tool_index
+    diagnostics_enabled_fn=lambda: diag,  # callable returning bool
     wrap_tool_fn=wrap_with_diagnostics,  # diagnostics wrapper
     logger=logger,
 )
@@ -139,15 +148,17 @@ setup_permissioned_tool(
 
 After this call, the permission system is fully operational: callers will see preview/execute state machine (confirm mode) or immediate execution (bypass mode), and policy gates block entire tool categories.
 
-**Writing a tool unit test:**
+**Writing a tool unit test (real example from `apps/network/tests/unit/test_outlet_control.py`):**
 
 ```python
-# tests/tools/test_acl.py  (example — tool files are flat: tools/acl.py)
-from unifi_network_mcp.tools.acl import some_acl_function   # safe: stage 2 already stripped kwargs
+# tests/unit/test_outlet_control.py
+from unifi_network_mcp.tools.devices import set_outlet_state  # safe: stage 2 already stripped kwargs
 
-def test_acl_function_returns_expected(mock_manager):
-    result = some_acl_function(site_id="default")    # no permission kwargs needed
-    assert result["status"] == "ok"
+@pytest.mark.asyncio
+async def test_set_outlet_state_...(...):
+    # patches the manager method directly on the class so interception
+    # works regardless of singleton vs mock instance resolution
+    ...
 ```
 
 **Do not** pass `permission_category` or `permission_action` at test call sites — those kwargs are already gone after stage 2 and passing them will raise `TypeError: unexpected keyword argument`.
@@ -173,6 +184,8 @@ Domain tools are not registered at startup. Only meta-tools register during boot
 - `categories.py` builds `TOOL_MODULE_MAP` from `tools_manifest.json` at module load time
 - `setup_lazy_loading` installs a loader that imports the relevant `tools/<category>.py` module on demand when that tool is first called
 - Subsequent calls to the same category are already cached by Python's module system
+
+**Three registration modes, one shared dispatcher:** all three servers route through `register_tools_for_mode()` in `packages/unifi-mcp-shared/src/unifi_mcp_shared/tool_registration.py`, selected via `UNIFI_TOOL_REGISTRATION_MODE` (`lazy` default, `eager`, `meta_only`). `lazy` and `meta_only` both call `setup_lazy_loading()` against the same `tool_module_map` — they differ only in which meta-tools get registered (`meta_only` omits the `_load_tools` meta-tool, exposing just `_execute`). `eager` skips the lazy loader entirely and calls `auto_load_tools()` to register every tool up front, optionally filtered by `enabled_categories`/`enabled_tools` in server config. When changing lazy-loading behavior, verify the change holds across all three modes, not just the `lazy` default — a fix applied only inside `setup_lazy_loading` silently does not reach the `eager` path since `auto_load_tools()` is a separate code path.
 
 **`tools_manifest.json` — the visibility gate:**
 
@@ -233,6 +246,58 @@ Key invariant: **tools are always registered and visible regardless of policy ga
 2. **Gates fire on every call** — the policy gate check runs at the top of the `gated_func` wrapper, before any `confirm` branching.
 3. **Mode and gates are independent** — `permission_mode=bypass` does not override a policy gate.
 
+## Procedure F: Two-Tier Tool Discovery System (`tool_index`)
+
+`tool_index` is the meta-tool that enumerates the tools lazy-loaded in Procedure D. It exposes two fidelity tiers — compact (~38K chars, names+descriptions) and full (~127K chars, `include_schemas=true`, adds input schemas) — and has two implementation surfaces (local server + Worker cloud) that must be kept in parity.
+
+**One-unified-server rule:** `tool_index` must remain the single canonical discovery entry point. Do not add a second discovery handler in a plugin or subsystem — it fragments the index and breaks agents.
+
+**The FastMCP named-param wrapper pattern (critical):** FastMCP maps `tools/call` arguments to Python function parameters **by name**. A handler registered directly with `@tool_decorator` that takes `args: dict | None` will silently always receive `None` — no caller sends `{"args": {...}}`. The fix is a two-layer design. Layer 1, the FastMCP-registered wrapper, lives in the shared `packages/unifi-mcp-shared/src/unifi_mcp_shared/meta_tools.py` (`_tool_index_wrapper`, built per-server via a factory that closes over each app's handler); Layer 2, the backend `tool_index_handler`, lives in each app's per-app discovery module (e.g. `apps/access/src/unifi_access_mcp/tool_index.py`) plus the shared `get_tool_index()` implementation in `packages/unifi-mcp-shared/src/unifi_mcp_shared/tool_index.py`:
+
+```python
+# Layer 1 — packages/unifi-mcp-shared/src/unifi_mcp_shared/meta_tools.py (named params):
+async def _tool_index_wrapper(
+    category: str | None = None,
+    search: str | None = None,
+    include_schemas: bool = False,
+) -> dict:
+    args = {}
+    if category is not None:
+        args["category"] = category
+    if search is not None:
+        args["search"] = search
+    if include_schemas:
+        args["include_schemas"] = include_schemas
+    return await tool_index_handler(args or None)
+
+
+# Layer 2 — e.g. apps/access/src/unifi_access_mcp/tool_index.py (still takes assembled args dict):
+async def tool_index_handler(args=None) -> dict:
+    args = args or {}
+    return get_tool_index(
+        category=args.get("category"),
+        search=args.get("search"),
+        include_schemas=bool(args.get("include_schemas", False)),
+    )
+```
+
+This rule applies to every FastMCP-registered handler in the project, not just `tool_index`.
+
+**Adding/modifying a parameter — steps:**
+
+1. Add the param to `_tool_index_wrapper` in `packages/unifi-mcp-shared/src/unifi_mcp_shared/meta_tools.py` with a backwards-compatible default.
+2. Thread it into the `args` dict the wrapper assembles.
+3. Update each backend `tool_index_handler` (per-app, e.g. `apps/network/src/unifi_network_mcp/tool_index.py`, `apps/protect/src/unifi_protect_mcp/tool_index.py`, `apps/access/src/unifi_access_mcp/tool_index.py`) to read it and pass it to `get_tool_index()`.
+4. Implement the actual filtering/shaping logic in `get_tool_index()` in `packages/unifi-mcp-shared/src/unifi_mcp_shared/tool_index.py`.
+5. Update the `register_tool()` call's `input_schema` to document the new parameter.
+6. **Mirror the change in the Worker cloud path** (`apps/worker/worker/src/`) in the same PR — a stale Worker silently ignores new parameters with no error. Add/update Worker tests in `apps/worker/worker/test/`; run `make worker-check` or root `make check`.
+7. Update every `plugins/*/skills/*/SKILL.md` runtime manifest that documents `tool_index` params — across all four runtime paths: local monorepo (`.agents/plugins/*/skills/*/SKILL.md`), OpenClaw (`~/.codex-plugin/myco/skills/*/SKILL.md`), Claude desktop (mirrored `.agents/plugins/*/skills/*/SKILL.md`), and XDG runtimes (`~/.agents/plugins/*/skills/*/SKILL.md`). These are agent-readable runtime artifacts, not lagging documentation — update in the same PR. `grep -rl "tool_index" .agents/plugins/*/skills/*/SKILL.md` to find them.
+8. Bump `packages/unifi-mcp-shared/pyproject.toml` (minor bump for new optional param; major for removal/semantic change). Publish to PyPI before opening the Worker PR, then update the Worker's dependency pin and tag `worker/v*` for npm publish via OIDC.
+9. Include an independent plugin version bump whenever shipped skills change; see `monorepo-release-pipeline` for patch/minor/major rules and `make check-plugin-versions`. The release workflow updates server pins and bumps plugins on product tags; skill-only changes ship with their manifest bump and merge.
+10. Start the local server and call `tool_index` with and without the new parameter to confirm both tiers behave correctly before merging.
+
+**Two-tier response shape:** always include `name`/`description`; include `inputSchema` only when `include_schemas is True`. Keep the same keys present in both tiers so callers can use one parsing path.
+
 ## Cross-Cutting Gotchas
 
 **No CI gate for manifest or singleton gaps.** Both the `tools_manifest.json` omission and the missing `@lru_cache` factory are silent failures that pass CI. The manifest produces invisible tools; the missing singleton produces a new instance per call (functional but expensive, and breaks any stateful caching the manager relies on).
@@ -246,3 +311,15 @@ Key invariant: **tools are always registered and visible regardless of policy ga
 **DI violation in shared packages** — `unifi-mcp-shared` and `unifi-core` must never import application-level config. All context flows in via `setup_permissioned_tool()`. If you see `from app.settings import ...` inside these packages, that is a regression.
 
 **Missing `confirm` parameter breaks bypass mode.** Every mutating tool must declare `confirm: bool = False`. Bypass injection inspects the function signature; if the param is missing, bypass mode silently fails to inject `confirm=True`.
+
+**Worktree `uv sync --all-packages` requirement.** New git worktrees do not inherit the monorepo's installed package set. Before running focused pytest in a new worktree, run `uv sync --all-packages` from the worktree root; otherwise cross-package imports (`from unifi_core...`, `from unifi_mcp_shared...`) fail with `ModuleNotFoundError`. Note: `uv sync` (without `--all-packages`) installs only the current package and will not install workspace siblings.
+
+**The `args: dict` wrapper trap is a silent failure (tool_index).** Registering `tool_index_handler` directly with `@tool_decorator` (bypassing the named-param wrapper) produces no warning, no exception, no test failure — the handler just always receives `None` and returns unfiltered results. Always verify new/changed discovery params with a live call before merging.
+
+**`tools_manifest.json` can drift from Python docstrings.** After regenerating the manifest from live introspection, tool descriptions may lag actual parameter defaults in source (e.g., docstring says "default empty list" but code default is `None`). Update the docstring immediately when changing a default, regenerate the manifest, and inspect it for staleness before merging — this does not happen automatically.
+
+**Full-schema tier inference can drop Pydantic validation keywords.** The `include_schemas=true` tier builds `inputSchema` via a shared `_infer_input_schema` helper that independently derives a JSON schema from the tool's Python signature — this can silently diverge from and drop constraints that FastMCP's own internal schema derivation retains. When adding a parameter with Pydantic `Field` constraints, verify the full-schema tier output actually includes them; don't assume `_infer_input_schema` mirrors FastMCP's derivation.
+
+**MCP `max_response_bytes` cap alignment.** The two-tier design (compact default, full opt-in) is already aligned with the MCP spec's discussed response-size cap; `include_schemas` may become the enforcement mechanism when the standard lands. No breaking change expected.
+
+**Tool descriptions vs. Pydantic Field descriptions — keep the boundary.** `@server.tool(description=...)` text should describe what the tool does and how it relates to neighboring tools — never per-field semantic disambiguation. Field-by-field meaning belongs on the Pydantic `Field(description=...)`, surfaced via the full-schema tier. Every agent calling `tool_index` without `include_schemas` pays for whatever text is in tool descriptions on every call; per-field documentation there multiplies cost without benefit. Operational nuance that isn't a field meaning (e.g. "merges live /stat/sta with /rest/user snapshot") still belongs in the tool description.

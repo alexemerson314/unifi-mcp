@@ -1,8 +1,8 @@
 # Tool Catalog
 
-The UniFi Access MCP server exposes 29 tools, all prefixed with `access_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
+The UniFi Access MCP server exposes 37 tools, all prefixed with `access_`. Read-only tools are always available. Mutating tools are controlled by the [permission system](permissions.md).
 
-Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy/meta-only workflows, call the `access_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_access_mcp/tools_manifest.json`.
+Standard MCP clients should use `tools/list` for currently registered tools. For compact manifest-backed metadata in lazy workflows, call the `access_tool_index` compatibility meta-tool at runtime, or inspect `src/unifi_access_mcp/tools_manifest.json`. In `meta_only` mode, the index initially contains only meta-tools; executing a known domain tool lazily registers its module, so later index results can include those loaded tools.
 
 ## Meta-Tools
 
@@ -48,12 +48,12 @@ In lazy mode, an additional meta-tool is available:
 - `access_create_credential` -- Create NFC card, PIN, or mobile credential. Confirm required. Proxy session only.
 - `access_revoke_credential` -- Permanently revoke a credential. Confirm required. Proxy session only.
 
-## Visitors (3 tools)
+## Visitors (4 tools)
 
-- `access_list_visitors` -- List all visitor passes with name, status, time range, and doors
-- `access_get_visitor` -- Detailed visitor pass info: name, access period, doors, status
-- `access_create_visitor` -- Create a time-bounded visitor pass with optional doors and contact info. Confirm required. Proxy session only.
-- `access_delete_visitor` -- Permanently remove a visitor pass. Confirm required. Proxy session only.
+- `access_list_visitors` -- List Access Developer API visitor passes with family-scoped UUIDs, names, status, and time range
+- `access_get_visitor` -- Get Developer API visitor details by a UUID returned from the visitor family
+- `access_create_visitor` -- Create a time-bounded visitor with optional contact/company metadata. Confirm and Access API token required.
+- `access_delete_visitor` -- Revoke a Developer API visitor pass; Access retains a cancelled historical record. Confirm and Access API token required.
 
 ## Devices (3 tools)
 

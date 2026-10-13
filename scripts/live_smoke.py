@@ -17,6 +17,8 @@ import asyncio
 import importlib
 import json
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -27,8 +29,10 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from mcp.types import CallToolResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+API_ACTION_CATALOG = REPO_ROOT / "apps/api/src/unifi_api/action_catalog.json"
 RUN_PREFIX = "codex-smoke"
 
 
@@ -86,8 +90,21 @@ STREAM_OR_HEAVY_READS = {
     "protect_export_clip",
 }
 
+KNOWN_CONTROLLER_ISSUE_READS = {
+    "access_get_activity_summary": "Access activities histogram returns controller CODE_SYSTEM_ERROR -3",
+}
+
+KNOWN_CONTROLLER_ISSUE_MARKERS = {
+    "access_get_activity_summary": ("CODE_SYSTEM_ERROR", r"API code -3\b"),
+    "unifi_create_firewall_policy": (
+        "FirewallPolicyCreateRespondTrafficPolicyNotAllowed",
+        "Firewall policy create respond traffic not allowed",
+    ),
+}
+
 
 RISKY_OPERATION_NAMES = {
+    "unifi_update_threat_management_settings",
     "access_lock_door",
     "access_reboot_device",
     "access_revoke_credential",
@@ -120,6 +137,50 @@ RISKY_OPERATION_NAMES = {
 }
 
 
+def _compact_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _content_bytes(content: Any) -> int:
+    if not isinstance(content, list):
+        return 0
+
+    total = 0
+    for block in content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            total += len(text.encode("utf-8"))
+            continue
+        data = getattr(block, "data", None)
+        if isinstance(data, str):
+            total += len(data.encode("utf-8"))
+            continue
+        if hasattr(block, "model_dump"):
+            block = block.model_dump(mode="json", exclude_none=True)
+        total += _compact_json_bytes(block)
+    return total
+
+
+def measure_tool_result_sizes(raw: Any) -> dict[str, int]:
+    """Measure content and structured result sizes without altering the result."""
+    if isinstance(raw, CallToolResult):
+        content = raw.content
+        structured = raw.structured_content
+    elif isinstance(raw, tuple) and len(raw) == 2:
+        content, structured = raw
+    else:
+        content = raw if isinstance(raw, list) else []
+        structured = None
+
+    content_bytes = _content_bytes(content)
+    structured_bytes = _compact_json_bytes(structured) if structured is not None else 0
+    return {
+        "content_bytes": content_bytes,
+        "structured_bytes": structured_bytes,
+        "combined_response_bytes": content_bytes + structured_bytes,
+    }
+
+
 @dataclass
 class SmokeRecord:
     tool: str
@@ -130,6 +191,9 @@ class SmokeRecord:
     success: bool | None = None
     error: str | None = None
     summary: dict[str, Any] = field(default_factory=dict)
+    content_bytes: int | None = None
+    structured_bytes: int | None = None
+    combined_response_bytes: int | None = None
 
 
 @dataclass
@@ -161,6 +225,7 @@ def parse_args() -> argparse.Namespace:
             "lifecycle",
             "approved",
             "safe",
+            "support",
             "api-actions",
             "api-resources",
             "api-streams",
@@ -168,6 +233,8 @@ def parse_args() -> argparse.Namespace:
         default="safe",
         help=(
             "'safe' runs readonly, preview, and named safe lifecycles. "
+            "'support' explicitly authorizes read-only support connectivity probes over stdio "
+            "in all registration modes. "
             "'approved' runs explicitly approved mutations. "
             "'api-actions' is a manual-only phase: spins up unifi-api-server locally, "
             "registers the .env-configured controllers, exercises read-only tools "
@@ -186,7 +253,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tool", action="append", default=[], help="Restrict to one or more tool names.")
     parser.add_argument("--include-heavy-reads", action="store_true")
     parser.add_argument("--interactive-risky", action="store_true")
+    parser.add_argument(
+        "--support-plugin-root",
+        type=Path,
+        help="For support only: marketplace checkout root; launch its pinned plugin commands.",
+    )
     args = parser.parse_args()
+    if args.support_plugin_root and args.phase != "support":
+        parser.error("--support-plugin-root requires --phase support")
+    if args.phase == "support" and (args.tool or args.include_heavy_reads or args.interactive_risky):
+        parser.error("support runs its complete fixed read-only matrix; tool/risky/heavy filters are not supported")
     if args.phase not in {"api-actions", "api-resources", "api-streams"} and not args.server:
         parser.error(
             "--server is required unless --phase api-actions, --phase api-resources, or --phase api-streams is used"
@@ -412,6 +488,20 @@ class LiveSmokeRunner:
         self.server = runtime_mod.server
         self.connection_manager = runtime_mod.connection_manager
         self.report.connected = await self.connection_manager.initialize()
+        if not self.report.connected:
+            detail = getattr(self.connection_manager, "last_connection_error", None)
+            suffix = f": {detail}" if detail else ""
+            error = "Live smoke could not connect or authenticate; aborting before tool execution" + suffix
+            self.report.records.append(
+                SmokeRecord(
+                    tool="__setup__",
+                    phase="setup",
+                    status="failed",
+                    success=False,
+                    error=error,
+                )
+            )
+            raise ConnectionError(error)
 
         kwargs = {
             "mode": bootstrap_mod.UNIFI_TOOL_REGISTRATION_MODE,
@@ -426,6 +516,7 @@ class LiveSmokeRunner:
             "base_package": self.config["base_package"],
             "config": runtime_mod.config,
             "logger": bootstrap_mod.logger,
+            "support_bundle_handler": runtime_mod.support_bundle_service.generate,
         }
         if self.config.get("prefix"):
             kwargs["prefix"] = self.config["prefix"]
@@ -446,6 +537,10 @@ class LiveSmokeRunner:
         record = SmokeRecord(tool=tool, phase=phase, status="error", args=args)
         try:
             raw = await self.server.call_tool(tool, args)
+            sizes = measure_tool_result_sizes(raw)
+            record.content_bytes = sizes["content_bytes"]
+            record.structured_bytes = sizes["structured_bytes"]
+            record.combined_response_bytes = sizes["combined_response_bytes"]
             data = self.unwrap_result(raw)
             record.duration_ms = int((time.perf_counter() - started) * 1000)
             record.success = data.get("success") if isinstance(data, dict) else None
@@ -455,7 +550,9 @@ class LiveSmokeRunner:
                     record.error = str(data["error"])
                 record.summary = summarize_payload(data)
                 self.cache.remember(tool, data)
-                if self.expected_fixture_miss(tool, record.error):
+                if self.expected_fixture_miss(tool, record.error) or self.expected_known_controller_issue(
+                    tool, record.error
+                ):
                     record.status = "skipped"
                     record.success = None
         except Exception as exc:
@@ -472,14 +569,28 @@ class LiveSmokeRunner:
     def expected_fixture_miss(self, tool: str, error: str | None) -> bool:
         if tool == "unifi_get_pdu_outlets" and error and "not a Smart Power PDU" in error:
             return True
+        if tool == "protect_alarm_arm" and error and "No arm profiles found" in error:
+            return True
         return False
 
+    def expected_known_controller_issue(self, tool: str, error: str | None) -> bool:
+        markers = KNOWN_CONTROLLER_ISSUE_MARKERS.get(tool)
+        if not markers or not error:
+            return False
+        return all(re.search(marker, error) for marker in markers)
+
     def unwrap_result(self, raw: Any) -> dict[str, Any]:
+        if isinstance(raw, CallToolResult):
+            if isinstance(raw.structured_content, dict):
+                meta_result = raw.structured_content.get("result")
+                return meta_result if isinstance(meta_result, dict) else raw.structured_content
+            content = raw.content
+        else:
+            content = raw[0] if isinstance(raw, tuple) and raw else raw
         if isinstance(raw, tuple) and len(raw) > 1 and isinstance(raw[1], dict):
             meta_result = raw[1].get("result")
             if isinstance(meta_result, dict):
                 return meta_result
-        content = raw[0] if isinstance(raw, tuple) and raw else raw
         if isinstance(content, list) and content:
             text = getattr(content[0], "text", None)
             if text:
@@ -542,16 +653,36 @@ class LiveSmokeRunner:
         return "mutating_requires_review"
 
     async def seed_read_lists(self) -> None:
-        seed_tools = [
-            tool
-            for tool in self.selected_tools()
-            if is_read_only(tool)
-            and not required_params(tool)
-            and tool["name"] not in STREAM_OR_HEAVY_READS
-            and ("list_" in tool["name"] or tool["name"].endswith("_status") or tool["name"].endswith("_info"))
-        ]
+        seed_names = self.preview_seed_tool_names()
+        manifest_by_name = {tool["name"]: tool for tool in self.manifest["tools"]}
+        candidate_tools = list(self.selected_tools())
+        candidate_tools.extend(manifest_by_name[name] for name in sorted(seed_names) if name in manifest_by_name)
+        seed_tools = []
+        seen: set[str] = set()
+        for tool in candidate_tools:
+            name = tool["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            if not is_read_only(tool) or required_params(tool) or name in STREAM_OR_HEAVY_READS:
+                continue
+            if name in seed_names or "list_" in name or name.endswith("_status") or name.endswith("_info"):
+                seed_tools.append(tool)
         for tool in seed_tools:
             await self.call(tool["name"], {}, "seed")
+
+    def preview_seed_tool_names(self) -> set[str]:
+        selected_names = {tool["name"] for tool in self.selected_tools()}
+        dependencies = {
+            "protect_update_chime": {"protect_list_chimes"},
+            "protect_update_sensor_settings": {"protect_list_sensors"},
+            "protect_update_viewer": {"protect_list_viewers", "protect_list_liveviews"},
+        }
+        seed_names: set[str] = set()
+        for tool_name, names in dependencies.items():
+            if tool_name in selected_names:
+                seed_names.update(names)
+        return seed_names
 
     async def run_readonly(self) -> None:
         for tool in self.selected_tools():
@@ -588,9 +719,11 @@ class LiveSmokeRunner:
             await self.lifecycle_network_dns()
             await self.lifecycle_network_client_group()
             await self.lifecycle_network_firewall_group()
+            await self.lifecycle_network_gateway_settings()
         elif self.server_key == "access":
             await self.lifecycle_access_visitor()
         elif self.server_key == "protect":
+            await self.lifecycle_protect_alarm_rule()
             self.skip(
                 "protect_create_liveview/protect_delete_liveview",
                 "lifecycle",
@@ -602,11 +735,13 @@ class LiveSmokeRunner:
             await self.run_lifecycles()
             await self.lifecycle_network_acl_rule()
             await self.lifecycle_network_ap_group()
+            await self.lifecycle_network_network()
             await self.lifecycle_network_wlan()
             await self.lifecycle_network_port_profile()
             await self.lifecycle_network_firewall_policy()
             await self.lifecycle_network_oon_policy()
             await self.lifecycle_network_voucher()
+            await self.lifecycle_network_traffic_route()
         elif self.server_key == "protect":
             await self.approved_protect_physical()
         elif self.server_key == "access":
@@ -712,6 +847,8 @@ class LiveSmokeRunner:
             "liveview_id": ("liveviews",),
             "chime_id": ("chimes",),
             "light_id": ("lights",),
+            "sensor_id": ("sensors",),
+            "viewer_id": ("viewers",),
         }
         if param in collection_by_param:
             return self.cache.id_from(collection_by_param[param], ("id", "_id", "mac", "mac_address"))
@@ -730,14 +867,26 @@ class LiveSmokeRunner:
             },
             "unifi_create_client_group": {"name": f"{RUN_PREFIX}-{stamp}", "members": []},
             "unifi_create_firewall_group": {
-                "name": f"{RUN_PREFIX}-{stamp}",
-                "group_type": "address-group",
-                "group_members": ["192.0.2.123"],
+                "group_data": {
+                    "name": f"{RUN_PREFIX}-{stamp}",
+                    "group_type": "address-group",
+                    "members": ["192.0.2.123"],
+                },
             },
             "access_create_visitor": self.visitor_args(stamp),
+            # Every parameter on this tool is optional, so no argument is
+            # discoverable from the schema and the generic builder would call
+            # it empty — which the tool rightly rejects. Name a field so the
+            # preview still exercises the diff; run_previews forces
+            # confirm=False, so nothing is written.
+            "unifi_update_snmp_settings": {"enabled_v3": False},
         }
         if name in simple:
             return dict(simple[name]), ""
+        if name == "unifi_update_gateway_settings":
+            # Preview only (run_previews forces confirm=False): renders the
+            # current-vs-proposed diff + the security warning. No write.
+            return {"update_data": {"broadcast_ping": False}}, ""
         if name == "unifi_set_client_ip_settings":
             mac = self.cache.client_mac()
             if not mac:
@@ -752,7 +901,10 @@ class LiveSmokeRunner:
             route_id = self.value_for_param(name, "route_id")
             if not route_id:
                 return None, "could not discover required argument route_id"
-            return {"route_id": route_id, "enabled": True}, ""
+            # Exercise a widened match field (target_devices) in preview. run_previews
+            # forces confirm=False, so this only renders a current-vs-proposed diff and
+            # runs the tool's client-side target_devices validation — nothing is written.
+            return {"route_id": route_id, "target_devices": [{"type": "ALL_CLIENTS"}]}, ""
         if name == "unifi_update_usergroup":
             group_id = self.value_for_param(name, "group_id")
             if not group_id:
@@ -763,6 +915,12 @@ class LiveSmokeRunner:
                     current_name = item.get("name")
                     break
             return {"group_id": group_id, "name": current_name or f"{RUN_PREFIX}-preview"}, ""
+        if name == "protect_update_sensor_settings":
+            return self.protect_sensor_settings_preview_args()
+        if name == "protect_update_chime":
+            return self.protect_chime_preview_args()
+        if name == "protect_update_viewer":
+            return self.protect_viewer_preview_args()
         if name == "protect_update_known_face":
             face = self.protect_known_face()
             if not face:
@@ -780,12 +938,12 @@ class LiveSmokeRunner:
         return self.args_for_tool(name, required_params(next(t for t in self.manifest["tools"] if t["name"] == name)))
 
     def visitor_args(self, stamp: str) -> dict[str, Any]:
-        start = datetime.now(UTC) + timedelta(minutes=5)
+        start = (datetime.now(UTC) + timedelta(minutes=5)).replace(microsecond=0)
         end = start + timedelta(minutes=30)
         return {
             "name": f"{RUN_PREFIX}-{stamp}",
-            "access_start": start.isoformat().replace("+00:00", "Z"),
-            "access_end": end.isoformat().replace("+00:00", "Z"),
+            "valid_from": start.isoformat().replace("+00:00", "Z"),
+            "valid_until": end.isoformat().replace("+00:00", "Z"),
         }
 
     def protect_camera_id(self, prefer_ptz: bool = False) -> str | None:
@@ -801,6 +959,14 @@ class LiveSmokeRunner:
             value = first_value(camera, ("id", "_id", "camera_id", "uuid"))
             if value:
                 return str(value)
+        return None
+
+    def protect_camera_scope_id(self) -> str | None:
+        cameras = self.cache.items_from_tool("protect_list_cameras", "cameras") or self.cache.items("cameras")
+        for camera in cameras:
+            value = first_value(camera, ("mac", "mac_address", "id", "_id", "camera_id", "uuid"))
+            if value:
+                return str(value).replace(":", "").upper()
         return None
 
     def protect_preset_slot(self, camera_id: str) -> int | None:
@@ -824,6 +990,72 @@ class LiveSmokeRunner:
             return mode not in {"never", "disabled", "off"}
         value = detail.get("is_recording")
         return value if isinstance(value, bool) else None
+
+    def protect_has_api_key(self) -> bool:
+        cm = getattr(self, "connection_manager", None)
+        if cm is None:
+            return True
+        return bool(getattr(cm, "has_api_key", True))
+
+    def protect_sensor_settings_preview_args(self) -> tuple[dict[str, Any] | None, str]:
+        if not self.protect_has_api_key():
+            return None, "requires UNIFI_PROTECT_API_KEY or UNIFI_API_KEY"
+        sensors = self.cache.items_from_tool("protect_list_sensors", "sensors") or self.cache.items("sensors")
+        for sensor in sensors:
+            sensor_id = first_value(sensor, ("id", "_id", "sensor_id", "uuid"))
+            current_name = sensor.get("name")
+            if sensor_id and current_name:
+                return {"sensor_id": sensor_id, "settings": {"name": current_name}}, ""
+        return None, "could not discover sensor with current name"
+
+    def protect_chime_preview_args(self) -> tuple[dict[str, Any] | None, str]:
+        chimes = self.cache.items_from_tool("protect_list_chimes", "chimes") or self.cache.items("chimes")
+        for chime in chimes:
+            chime_id = first_value(chime, ("id", "_id", "chime_id", "uuid"))
+            if not chime_id:
+                continue
+            if self.protect_has_api_key():
+                ring_settings = chime.get("ring_settings") or []
+                if isinstance(ring_settings, dict):
+                    ring_settings = list(ring_settings.values())
+                iterable_ring_settings = ring_settings if isinstance(ring_settings, list) else []
+                for setting in iterable_ring_settings:
+                    if not isinstance(setting, dict):
+                        continue
+                    camera_id = first_value(setting, ("camera_id", "cameraId"))
+                    volume = first_value(setting, ("volume",))
+                    repeat_times = first_value(setting, ("repeat_times", "repeatTimes"))
+                    if camera_id and volume is not None:
+                        return {"chime_id": chime_id, "settings": {"camera_id": camera_id, "volume": volume}}, ""
+                    if camera_id and repeat_times is not None:
+                        return {
+                            "chime_id": chime_id,
+                            "settings": {"camera_id": camera_id, "repeat_times": repeat_times},
+                        }, ""
+            current_name = chime.get("name")
+            if current_name:
+                return {"chime_id": chime_id, "settings": {"name": current_name}}, ""
+            volume = first_value(chime, ("volume",))
+            if volume is not None:
+                return {"chime_id": chime_id, "settings": {"volume": volume}}, ""
+            repeat_times = first_value(chime, ("repeat_times", "repeatTimes"))
+            if repeat_times is not None:
+                return {"chime_id": chime_id, "settings": {"repeat_times": repeat_times}}, ""
+        return None, "could not discover chime with safe current setting"
+
+    def protect_viewer_preview_args(self) -> tuple[dict[str, Any] | None, str]:
+        if not self.protect_has_api_key():
+            return None, "requires UNIFI_PROTECT_API_KEY or UNIFI_API_KEY"
+        viewers = self.cache.items_from_tool("protect_list_viewers", "viewers") or self.cache.items("viewers")
+        for viewer in viewers:
+            viewer_id = first_value(viewer, ("id", "_id", "viewer_id", "uuid"))
+            current_name = viewer.get("name")
+            if viewer_id and current_name:
+                return {"viewer_id": viewer_id, "settings": {"name": current_name}}, ""
+            liveview_id = first_value(viewer, ("liveview_id", "liveviewId", "liveview"))
+            if viewer_id and liveview_id:
+                return {"viewer_id": viewer_id, "settings": {"liveview_id": liveview_id}}, ""
+        return None, "could not discover viewer with safe current setting"
 
     def protect_known_face(self) -> dict[str, Any] | None:
         for face in self.cache.items_from_tool("protect_list_known_faces", "faces") or self.cache.items("faces"):
@@ -860,6 +1092,30 @@ class LiveSmokeRunner:
                 return str(value)
         return None
 
+    def traffic_route_detail(self) -> dict[str, Any]:
+        """Full route dict from the most recent unifi_get_traffic_route_details call."""
+        payload = self.cache.by_tool.get("unifi_get_traffic_route_details", {})
+        detail = payload.get("details") if isinstance(payload, dict) else None
+        return detail if isinstance(detail, dict) else {}
+
+    def record_check(self, tool: str, phase: str, ok: bool, detail: str) -> None:
+        """Append a pass/fail verification record (a re-read content assertion).
+
+        Unlike WLAN/AP-group updates, the traffic-route manager does not verify-
+        after-write, so the lifecycle re-reads the route and records whether the
+        change actually persisted/reverted. A failed record fails the run.
+        """
+        self.report.records.append(
+            SmokeRecord(
+                tool=tool,
+                phase=phase,
+                status="ok" if ok else "failed",
+                success=ok,
+                summary={"check": detail},
+            )
+        )
+        print(f"{self.server_key} {phase} {'ok' if ok else 'failed'}: {tool} - {detail}", flush=True)
+
     async def lifecycle_network_dns(self) -> None:
         stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         key = f"{RUN_PREFIX}-{stamp}.test"
@@ -879,6 +1135,20 @@ class LiveSmokeRunner:
             "lifecycle:update",
         )
         await self.call("unifi_get_dns_record_details", {"record_id": record_id}, "lifecycle:get")
+        preview = await self.call(
+            "unifi_delete_dns_record",
+            {"record_id": record_id, "confirm": False},
+            "lifecycle:preview-delete",
+        )
+        self.record_check(
+            "unifi_delete_dns_record",
+            "lifecycle:verify-preview",
+            preview.success is True
+            and preview.summary.get("action") == "delete"
+            and preview.summary.get("resource_id") == record_id
+            and "will_delete" in preview.summary.get("preview_keys", []),
+            "delete preview identifies the disposable DNS record",
+        )
         delete = await self.call(
             "unifi_delete_dns_record",
             {"record_id": record_id, "confirm": True},
@@ -886,6 +1156,69 @@ class LiveSmokeRunner:
         )
         if delete.success:
             self.report.cleaned_resources.append({"type": "dns_record", "id": record_id, "name": key})
+
+    async def lifecycle_network_gateway_settings(self) -> None:
+        """Apply -> re-read -> verify -> revert a low-risk field on the usg singleton.
+
+        Toggles ``broadcast_ping`` (a benign, instantly-reversible setting), confirms
+        the change persisted, asserts no sibling keys were dropped and the nested
+        ``dns_verification`` object survived the partial update, then reverts. This
+        exercises the full fetch-merge-put-verify path against the live controller.
+        """
+        import copy
+
+        from unifi_network_mcp import runtime
+
+        mgr = runtime.gateway_settings_manager
+        before = copy.deepcopy(await mgr.get_gateway_settings())
+        if not before:
+            self.skip("unifi_update_gateway_settings", "lifecycle", "could not read current gateway settings")
+            return
+
+        field = "broadcast_ping"
+        original = bool(before.get(field, False))
+        target = not original
+
+        apply_rec = await self.call(
+            "unifi_update_gateway_settings",
+            {"update_data": {field: target}, "confirm": True},
+            "lifecycle:apply",
+        )
+        if not apply_rec.success:
+            self.record_check(
+                "unifi_update_gateway_settings", "lifecycle:apply", False, f"apply failed: {apply_rec.error}"
+            )
+            return
+
+        after = copy.deepcopy(await mgr.get_gateway_settings())
+        self.record_check(
+            "unifi_update_gateway_settings",
+            "lifecycle:verify-changed",
+            after.get(field) == target,
+            f"{field} {original} -> {target}",
+        )
+
+        # Sibling preservation: no keys dropped (incl. controller-only fields the
+        # model never maps) and the nested dns_verification object is byte-identical.
+        dropped = sorted(k for k in before if k != field and k not in after)
+        dns_intact = after.get("dns_verification") == before.get("dns_verification")
+        ok_siblings = not dropped and dns_intact
+        self.record_check(
+            "unifi_update_gateway_settings",
+            "lifecycle:verify-siblings-preserved",
+            ok_siblings,
+            "no keys dropped; dns_verification intact" if ok_siblings else f"dropped={dropped} dns_intact={dns_intact}",
+        )
+
+        revert_rec = await self.call(
+            "unifi_update_gateway_settings",
+            {"update_data": {field: original}, "confirm": True},
+            "lifecycle:revert",
+        )
+        restored = bool(revert_rec.success) and (await mgr.get_gateway_settings()).get(field) == original
+        self.record_check(
+            "unifi_update_gateway_settings", "lifecycle:revert", restored, f"{field} restored to {original}"
+        )
 
     async def lifecycle_network_client_group(self) -> None:
         stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
@@ -909,6 +1242,20 @@ class LiveSmokeRunner:
             {"group_id": group_id, "group_data": {"name": f"{name}-updated"}, "confirm": True},
             "lifecycle:update",
         )
+        preview = await self.call(
+            "unifi_delete_client_group",
+            {"group_id": group_id, "confirm": False},
+            "lifecycle:preview-delete",
+        )
+        self.record_check(
+            "unifi_delete_client_group",
+            "lifecycle:verify-preview",
+            preview.success is True
+            and preview.summary.get("action") == "delete"
+            and preview.summary.get("resource_id") == group_id
+            and "will_delete" in preview.summary.get("preview_keys", []),
+            "delete preview identifies the disposable client group",
+        )
         delete = await self.call(
             "unifi_delete_client_group",
             {"group_id": group_id, "confirm": True},
@@ -922,7 +1269,14 @@ class LiveSmokeRunner:
         name = f"{RUN_PREFIX}-fw-group-{stamp}"
         create = await self.call(
             "unifi_create_firewall_group",
-            {"name": name, "group_type": "address-group", "group_members": ["192.0.2.123"], "confirm": True},
+            {
+                "group_data": {
+                    "name": name,
+                    "group_type": "address-group",
+                    "members": ["192.0.2.123"],
+                },
+                "confirm": True,
+            },
             "lifecycle:create",
         )
         group_id = create.summary.get("resource_id")
@@ -934,14 +1288,46 @@ class LiveSmokeRunner:
             )
             return
         self.report.created_resources.append({"type": "firewall_group", "id": group_id, "name": name})
+        updated_name = f"{name}-updated"
+        updated_members = ["192.0.2.124"]
         await self.call(
             "unifi_update_firewall_group",
             {
                 "group_id": group_id,
-                "group_data": {"name": f"{name}-updated", "group_members": ["192.0.2.124"]},
+                "update_data": {"name": updated_name, "members": updated_members},
                 "confirm": True,
             },
             "lifecycle:update",
+        )
+        await self.call(
+            "unifi_get_firewall_group_details",
+            {"group_id": group_id},
+            "lifecycle:get",
+        )
+        details_payload = self.cache.by_tool.get("unifi_get_firewall_group_details", {})
+        details = details_payload.get("details") if isinstance(details_payload, dict) else None
+        self.record_check(
+            "unifi_update_firewall_group",
+            "lifecycle:verify-update",
+            isinstance(details, dict)
+            and details.get("name") == updated_name
+            and details.get("members") == updated_members
+            and details.get("group_type") == "address-group",
+            "name and members persisted; group_type preserved",
+        )
+        preview = await self.call(
+            "unifi_delete_firewall_group",
+            {"group_id": group_id, "confirm": False},
+            "lifecycle:preview-delete",
+        )
+        self.record_check(
+            "unifi_delete_firewall_group",
+            "lifecycle:verify-preview",
+            preview.success is True
+            and preview.summary.get("action") == "delete"
+            and preview.summary.get("resource_id") == group_id
+            and "will_delete" in preview.summary.get("preview_keys", []),
+            "delete preview identifies the disposable firewall group",
         )
         delete = await self.call(
             "unifi_delete_firewall_group",
@@ -995,9 +1381,108 @@ class LiveSmokeRunner:
             self.skip("unifi_delete_ap_group", "approved", "AP group create did not return an id")
             return
         self.report.created_resources.append({"type": "ap_group", "id": group_id, "name": name})
+        # Exercise update_ap_group: with verify-after-write, a silently dropped
+        # change surfaces as a failed record instead of a phantom success.
+        await self.call(
+            "unifi_update_ap_group",
+            {"group_id": group_id, "update_data": {"name": f"{name}-upd"}, "confirm": True},
+            "approved:update",
+        )
         delete = await self.call("unifi_delete_ap_group", {"group_id": group_id, "confirm": True}, "approved:delete")
         if delete.success:
             self.report.cleaned_resources.append({"type": "ap_group", "id": group_id, "name": name})
+
+    async def lifecycle_network_network(self) -> None:
+        networks = self.cache.items_from_tool("unifi_list_networks", "networks")
+        used_vlans = {
+            int(item["vlan"]) for item in networks if isinstance(item, dict) and str(item.get("vlan", "")).isdigit()
+        }
+        # UniFi reserves the top of the VLAN range (>=4010) for internal use and
+        # rejects creates there with a detail-less api.err.InvalidValue; scan
+        # below 4000 for a disposable ID.
+        vlan = next((candidate for candidate in range(3999, 3899, -1) if candidate not in used_vlans), None)
+        if vlan is None:
+            self.skip("unifi_create_network/unifi_delete_network", "approved", "no disposable VLAN ID available")
+            return
+
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        name = f"{RUN_PREFIX}-network-{stamp}-{secrets.token_hex(4)}"
+        create = await self.call(
+            "unifi_create_network",
+            {
+                "network_data": {
+                    "name": name,
+                    "purpose": "vlan-only",
+                    "vlan": vlan,
+                    "vlan_enabled": True,
+                    "enabled": False,
+                },
+                "confirm": True,
+            },
+            "approved:create",
+        )
+        network_id = create.summary.get("resource_id")
+        if not network_id and create.summary.get("mutation_applied") is True:
+            await self.call(
+                "unifi_list_networks",
+                {"search": name, "limit": 100},
+                "approved:recover-created-id",
+            )
+            matches = [
+                item
+                for item in self.cache.items_from_tool("unifi_list_networks", "networks")
+                if item.get("name") == name
+            ]
+            if len(matches) == 1:
+                network_id = first_value(matches[0], ("_id", "id"))
+        if not network_id:
+            reason = "network create did not return or uniquely expose an id"
+            if create.summary.get("mutation_applied") is True:
+                self.record_check("unifi_delete_network", "approved:cleanup", False, reason)
+            self.skip("unifi_delete_network", "approved", reason)
+            return
+
+        self.report.created_resources.append({"type": "network", "id": network_id, "name": name})
+        try:
+            if not create.success:
+                self.record_check(
+                    "unifi_create_network",
+                    "approved:verify-create",
+                    False,
+                    "create applied but exact verification failed; cleaning up disposable network",
+                )
+                return
+            update_name = f"{name}-upd"
+            update = await self.call(
+                "unifi_update_network",
+                {"network_id": network_id, "update_data": {"name": update_name}, "confirm": True},
+                "approved:update",
+            )
+            await self.call(
+                "unifi_get_network_details",
+                {"network_id": network_id},
+                "approved:verify",
+            )
+            details_payload = self.cache.by_tool.get("unifi_get_network_details", {})
+            details = details_payload.get("details", {}) if isinstance(details_payload, dict) else {}
+            self.record_check(
+                "unifi_update_network",
+                "approved:verify-persisted",
+                update.success is True
+                and details.get("name") == update_name
+                and details.get("enabled") is False
+                and details.get("purpose") == "vlan-only"
+                and str(details.get("vlan")) == str(vlan),
+                f"name={update_name}, enabled=false, purpose=vlan-only, vlan={vlan} persisted",
+            )
+        finally:
+            delete = await self.call(
+                "unifi_delete_network",
+                {"network_id": network_id, "confirm": True},
+                "approved:delete",
+            )
+            if delete.success:
+                self.report.cleaned_resources.append({"type": "network", "id": network_id, "name": name})
 
     async def lifecycle_network_wlan(self) -> None:
         ap_group_id = self.cache.id_from_tool("unifi_list_ap_groups", "ap_groups", ("_id", "id"))
@@ -1005,8 +1490,27 @@ class LiveSmokeRunner:
             self.skip("unifi_create_wlan/unifi_delete_wlan", "approved", "could not discover AP group id")
             return
 
-        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        name = f"{RUN_PREFIX}-ssid-{stamp}"
+        # SSIDs are capped at 32 bytes; use a compact stamp so the disposable
+        # name stays inside the limit while remaining unique and recognizable.
+        name = f"{RUN_PREFIX}-ssid-{datetime.now(UTC).strftime('%H%M%S')}-{secrets.token_hex(3)}"
+        initial_schedule = [
+            {
+                "duration_minutes": 60,
+                "name": "smoke window",
+                "start_days_of_week": ["mon"],
+                "start_hour": 1,
+                "start_minute": 0,
+            }
+        ]
+        updated_schedule = [
+            {
+                "duration_minutes": 90,
+                "name": "smoke window updated",
+                "start_days_of_week": ["tue", "thu"],
+                "start_hour": 2,
+                "start_minute": 15,
+            }
+        ]
         create = await self.call(
             "unifi_create_wlan",
             {
@@ -1015,22 +1519,102 @@ class LiveSmokeRunner:
                     "security": "open",
                     "enabled": False,
                     "hide_ssid": True,
-                    "guest_policy": True,
                     "ap_group_ids": [ap_group_id],
                     "ap_group_mode": "groups",
+                    "schedule_enabled": True,
+                    "schedule_reversed": True,
+                    "schedule_with_duration": initial_schedule,
                 },
                 "confirm": True,
             },
             "approved:create",
         )
         wlan_id = create.summary.get("resource_id")
+        if not wlan_id and create.summary.get("mutation_applied") is True:
+            await self.call(
+                "unifi_list_wlans",
+                {"search": name, "limit": 100},
+                "approved:recover-created-id",
+            )
+            matches = [
+                item for item in self.cache.items_from_tool("unifi_list_wlans", "wlans") if item.get("name") == name
+            ]
+            if len(matches) == 1:
+                wlan_id = first_value(matches[0], ("_id", "id"))
         if not wlan_id:
-            self.skip("unifi_delete_wlan", "approved", "WLAN create did not return an id")
+            reason = "WLAN create did not return or uniquely expose an id"
+            if create.summary.get("mutation_applied") is True:
+                self.record_check("unifi_delete_wlan", "approved:cleanup", False, reason)
+            self.skip("unifi_delete_wlan", "approved", reason)
             return
         self.report.created_resources.append({"type": "wlan", "id": wlan_id, "name": name})
-        delete = await self.call("unifi_delete_wlan", {"wlan_id": wlan_id, "confirm": True}, "approved:delete")
-        if delete.success:
-            self.report.cleaned_resources.append({"type": "wlan", "id": wlan_id, "name": name})
+        try:
+            if not create.success:
+                self.record_check(
+                    "unifi_create_wlan",
+                    "approved:verify-create",
+                    False,
+                    "create applied but exact verification failed; cleaning up disposable WLAN",
+                )
+                return
+            # Exercise update_wlan: the WLAN is created hidden, so flipping hide_ssid
+            # is a real change. With verify-after-write a controller that silently
+            # ignores the legacy /rest/wlanconf PUT now yields a failed record here.
+            visibility_update = await self.call(
+                "unifi_update_wlan",
+                {"wlan_id": wlan_id, "update_data": {"hide_ssid": False}, "confirm": True},
+                "approved:update",
+            )
+            # Exercise the manual min-rate coupling: a freshly created WLAN is in auto
+            # rate mode, so a rate-only update persists only if the manager also flips
+            # minrate_setting_preference=manual and enables the band. verify-after-write
+            # turns a silent recompute into a failed record here.
+            rate_update = await self.call(
+                "unifi_update_wlan",
+                {"wlan_id": wlan_id, "update_data": {"minrate_ng_data_rate_kbps": 6000}, "confirm": True},
+                "approved:update",
+            )
+            schedule_update = await self.call(
+                "unifi_update_wlan",
+                {
+                    "wlan_id": wlan_id,
+                    "update_data": {
+                        "schedule": ["mon-fri|0100-0700"],
+                        "schedule_reversed": False,
+                        "schedule_with_duration": updated_schedule,
+                    },
+                    "confirm": True,
+                },
+                "approved:update",
+            )
+            await self.call("unifi_get_wlan_details", {"wlan_id": wlan_id}, "approved:verify")
+            details_payload = self.cache.by_tool.get("unifi_get_wlan_details", {})
+            details = details_payload.get("details", {}) if isinstance(details_payload, dict) else {}
+            self.record_check(
+                "unifi_update_wlan",
+                "approved:verify-persisted",
+                visibility_update.success is True
+                and rate_update.success is True
+                and schedule_update.success is True
+                and details.get("name") == name
+                and details.get("enabled") is False
+                and details.get("security") == "open"
+                and details.get("hide_ssid") is False
+                and details.get("minrate_ng_data_rate_kbps") == 6000
+                and details.get("schedule_enabled") is True
+                and details.get("schedule_reversed") is False
+                and details.get("schedule") == ["mon-fri|0100-0700"]
+                and details.get("schedule_with_duration") == updated_schedule,
+                "name/security preserved; visibility, minrate, and non-default schedule fields persisted",
+            )
+        finally:
+            delete = await self.call(
+                "unifi_delete_wlan",
+                {"wlan_id": wlan_id, "confirm": True},
+                "approved:delete",
+            )
+            if delete.success:
+                self.report.cleaned_resources.append({"type": "wlan", "id": wlan_id, "name": name})
 
     async def lifecycle_network_port_profile(self) -> None:
         stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
@@ -1155,6 +1739,173 @@ class LiveSmokeRunner:
         if revoke.success:
             self.report.cleaned_resources.append({"type": "voucher", "id": voucher_id, "name": note})
 
+    async def lifecycle_network_traffic_route(self) -> None:
+        # Traffic routes can't be created via MCP (they require a VPN policy), so the
+        # widened-update path (PR #377: target_devices/domains/ip_addresses/ip_ranges/
+        # regions/next_hop) is exercised against an EXISTING route in a fully
+        # reversible way: read current domains, append a throwaway non-resolving
+        # domain, apply, re-read to prove it persisted, then revert to the original
+        # list and re-read to prove it reverted. An operator can pin the target route
+        # via UNIFI_SMOKE_TRAFFIC_ROUTE_ID; otherwise the first DOMAIN route is used.
+        await self.call("unifi_list_traffic_routes", {}, "approved:seed")
+        routes = self.cache.items_from_tool("unifi_list_traffic_routes", "traffic_routes") or self.cache.items(
+            "traffic_routes"
+        )
+        pinned = os.environ.get("UNIFI_SMOKE_TRAFFIC_ROUTE_ID")
+        route_id: Any = None
+        if pinned:
+            if not any(first_value(r, ("_id", "id")) == pinned for r in routes):
+                self.skip("unifi_update_traffic_route", "approved", f"pinned route {pinned} not found")
+                return
+            route_id = pinned
+        else:
+            for r in routes:
+                if str(r.get("matching_target", "")).upper() == "DOMAIN":
+                    route_id = first_value(r, ("_id", "id"))
+                    break
+        if not route_id:
+            self.skip("unifi_update_traffic_route", "approved", "no DOMAIN traffic route to exercise")
+            return
+
+        await self.call("unifi_get_traffic_route_details", {"route_id": route_id}, "approved:get")
+        detail = self.traffic_route_detail()
+        original_domains = detail.get("domains")
+        if not isinstance(original_domains, list) or not original_domains:
+            self.skip("unifi_update_traffic_route", "approved", "route has no domains list to exercise")
+            return
+        route_name = detail.get("description", route_id)
+
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        # Use the IANA documentation domain (example.com) so the controller accepts it
+        # as a valid domain — a reserved TLD like .invalid is rejected (api.err.InvalidDomain).
+        probe_domain = f"{RUN_PREFIX}-{stamp}.example.com"
+        new_domains = [*original_domains, {"domain": probe_domain, "ports": [], "port_ranges": []}]
+
+        # Preview the widened-field change (confirm=False → no mutation).
+        await self.call(
+            "unifi_update_traffic_route",
+            {"route_id": route_id, "domains": new_domains, "confirm": False},
+            "approved:preview",
+        )
+
+        # Apply the reversible change.
+        self.report.created_resources.append(
+            {"type": "traffic_route_domain_probe", "id": route_id, "name": probe_domain}
+        )
+        await self.call(
+            "unifi_update_traffic_route",
+            {"route_id": route_id, "domains": new_domains, "confirm": True},
+            "approved:update",
+        )
+        # Re-read and prove the probe domain persisted.
+        await self.call("unifi_get_traffic_route_details", {"route_id": route_id}, "approved:verify")
+        persisted = any(d.get("domain") == probe_domain for d in self.traffic_route_detail().get("domains", []))
+        self.record_check(
+            "unifi_update_traffic_route",
+            "approved:verify",
+            persisted,
+            f"probe domain {probe_domain} present on '{route_name}' after update",
+        )
+
+        # Revert to the original domains list.
+        await self.call(
+            "unifi_update_traffic_route",
+            {"route_id": route_id, "domains": original_domains, "confirm": True},
+            "approved:revert",
+        )
+        await self.call("unifi_get_traffic_route_details", {"route_id": route_id}, "approved:verify-revert")
+        reverted_domains = self.traffic_route_detail().get("domains", [])
+        reverted = all(d.get("domain") != probe_domain for d in reverted_domains)
+        self.record_check(
+            "unifi_update_traffic_route",
+            "approved:verify-revert",
+            reverted,
+            f"probe domain removed; '{route_name}' domains restored to {len(original_domains)} entries",
+        )
+        if reverted:
+            self.report.cleaned_resources.append(
+                {"type": "traffic_route_domain_probe", "id": route_id, "name": probe_domain}
+            )
+
+    async def lifecycle_protect_alarm_rule(self) -> None:
+        if not self.cache.items_from_tool("protect_list_cameras", "cameras"):
+            await self.call("protect_list_cameras", {}, "lifecycle:seed")
+
+        camera_scope_id = self.protect_camera_scope_id()
+        if not camera_scope_id:
+            self.skip(
+                "protect_alarm_create_rule/protect_alarm_delete_rule",
+                "lifecycle",
+                "could not discover camera scope id",
+            )
+            return
+
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        title = f"{RUN_PREFIX}-alarm-{stamp}"
+        updated_title = f"{title}-updated"
+        body = {
+            "title": title,
+            "triggers": [
+                {
+                    "trigger_id": "protect:ai.nls",
+                    "data": {
+                        "nlsSentence": f"{RUN_PREFIX} validation token {stamp}",
+                        "nlsThreshold": 50,
+                    },
+                }
+            ],
+            "actions": [
+                {
+                    "action_id": "protect:notify",
+                    "data": {
+                        "default_channels": ["push"],
+                        "is_critical": False,
+                        "receivers": ["ALL_ITEMS"],
+                    },
+                }
+            ],
+            "scope": {"mode": "include", "data": {"scope_all_cameras": [camera_scope_id]}},
+        }
+
+        create = await self.call("protect_alarm_create_rule", {"body": body, "confirm": True}, "lifecycle:create")
+        rule_id = create.summary.get("resource_id")
+        if not rule_id:
+            self.skip(
+                "protect_alarm_update_rule/protect_alarm_delete_rule",
+                "lifecycle",
+                "alarm rule create did not return an id",
+            )
+            return
+
+        self.report.created_resources.append({"type": "protect_alarm_rule", "id": rule_id, "name": title})
+        await self.call(
+            "protect_alarm_update_rule",
+            {"rule_id": rule_id, "fields": {"title": updated_title}, "confirm": True},
+            "lifecycle:update",
+        )
+        await self.call("protect_alarm_get_rule", {"rule_id": rule_id}, "lifecycle:get")
+        preview = await self.call(
+            "protect_alarm_delete_rule",
+            {"rule_id": rule_id, "confirm": False},
+            "lifecycle:preview-delete",
+        )
+        self.record_check(
+            "protect_alarm_delete_rule",
+            "lifecycle:verify-preview",
+            preview.success is True
+            and preview.summary.get("action") == "delete"
+            and preview.summary.get("resource_id") == rule_id
+            and "will_delete" in preview.summary.get("preview_keys", []),
+            "delete preview identifies the disposable alarm rule",
+        )
+        delete = await self.call(
+            "protect_alarm_delete_rule",
+            {"rule_id": rule_id, "confirm": True},
+            "lifecycle:delete",
+        )
+        if delete.success:
+            self.report.cleaned_resources.append({"type": "protect_alarm_rule", "id": rule_id, "name": title})
+
     async def approved_protect_physical(self) -> None:
         camera_id = self.protect_camera_id()
         if not camera_id:
@@ -1233,13 +1984,71 @@ class LiveSmokeRunner:
             self.skip("access_delete_visitor", "lifecycle", "visitor create did not return an id")
             return
         self.report.created_resources.append({"type": "visitor", "id": visitor_id, "name": args["name"]})
+        await self.call("access_list_visitors", {}, "lifecycle:list")
+        listed = any(
+            str(visitor.get("id")) == visitor_id
+            for visitor in self.cache.items_from_tool("access_list_visitors", "visitors")
+        )
+        self.record_check(
+            "access_list_visitors",
+            "lifecycle:verify-list",
+            listed,
+            "disposable visitor is visible in the Developer API family",
+        )
+        detail_call = await self.call(
+            "access_get_visitor",
+            {"visitor_id": visitor_id},
+            "lifecycle:get",
+        )
+        detail_payload = self.cache.by_tool.get("access_get_visitor", {})
+        detail = detail_payload.get("data", {}) if isinstance(detail_payload, dict) else {}
+        fields_match = (
+            detail_call.success is True
+            and detail.get("id") == visitor_id
+            and detail.get("name") == args["name"]
+            and detail.get("valid_from") == args["valid_from"]
+            and detail.get("valid_until") == args["valid_until"]
+        )
+        self.record_check(
+            "access_get_visitor",
+            "lifecycle:verify-fields",
+            fields_match,
+            "name and ISO-8601 validity fields round-trip through the Developer API",
+        )
+        preview = await self.call(
+            "access_delete_visitor",
+            {"visitor_id": visitor_id, "confirm": False},
+            "lifecycle:preview-delete",
+        )
+        self.record_check(
+            "access_delete_visitor",
+            "lifecycle:verify-preview",
+            preview.success is True
+            and preview.summary.get("action") == "delete"
+            and preview.summary.get("resource_id") == visitor_id
+            and "will_delete" in preview.summary.get("preview_keys", []),
+            "delete preview identifies the disposable visitor",
+        )
         delete = await self.call(
             "access_delete_visitor",
             {"visitor_id": visitor_id, "confirm": True},
             "lifecycle:delete",
         )
         if delete.success:
-            self.report.cleaned_resources.append({"type": "visitor", "id": visitor_id, "name": args["name"]})
+            after = await self.call(
+                "access_get_visitor",
+                {"visitor_id": visitor_id},
+                "lifecycle:verify-cleanup",
+            )
+            cancelled = after.success is True and after.summary.get("resource_status") == "cancelled"
+            self.record_check(
+                "access_delete_visitor",
+                "lifecycle:verify-cleanup-status",
+                cancelled,
+                "Developer API DELETE revokes access and retains the visitor as cancelled history",
+            )
+            if cancelled:
+                self.report.cleaned_resources.append({"type": "visitor", "id": visitor_id, "name": args["name"]})
 
 
 def summarize_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -1250,25 +2059,58 @@ def summarize_payload(data: dict[str, Any]) -> dict[str, Any]:
         "site",
         "message",
         "requires_confirmation",
+        "mutation_applied",
+        "partial_success",
         "action",
         "resource_type",
         "resource_name",
+        "summary_mode",
+        "history_seconds",
+        "omitted_sections",
+        "returned_count",
+        "total_count",
+        "limit",
+        "offset",
+        "next_offset",
+        "has_more",
     ):
         if key in data:
             summary[key] = data[key]
     resource_id = find_resource_id(data)
     if resource_id:
         summary["resource_id"] = resource_id
+    resource_status = find_resource_status(data)
+    if resource_status:
+        summary["resource_status"] = resource_status
     for collection, items in collection_items(data).items():
         summary[f"{collection}_count"] = len(items)
+    preview = data.get("preview")
+    if isinstance(preview, dict):
+        summary["preview_keys"] = sorted(preview)
     if "error" in data:
         summary["error"] = data["error"]
+    if "_meta" in data:
+        summary["_meta"] = data["_meta"]
     return summary
+
+
+def find_resource_status(data: Any) -> str | None:
+    """Find a bounded scalar resource status in a nested tool response."""
+    if isinstance(data, dict):
+        status = data.get("status")
+        if isinstance(status, (str, int)):
+            return str(status).lower()
+        for key in ("details", "data", "result"):
+            value = find_resource_status(data.get(key))
+            if value:
+                return value
+    return None
 
 
 def find_resource_id(data: Any) -> str | None:
     if isinstance(data, dict):
         for key in (
+            "resource_id",
             "id",
             "_id",
             "record_id",
@@ -1278,13 +2120,26 @@ def find_resource_id(data: Any) -> str | None:
             "profile_id",
             "voucher_id",
             "visitor_id",
+            "network_id",
             "wlan_id",
+            "client_id",
+            "server_id",
+            "vpn_id",
             "liveview_id",
         ):
             value = data.get(key)
             if value:
                 return str(value)
-        for key in ("details", "group", "policy", "profile", "rule", "data", "result"):
+        for key in (
+            "details",
+            "details_after_attempt",
+            "group",
+            "policy",
+            "profile",
+            "rule",
+            "data",
+            "result",
+        ):
             value = find_resource_id(data.get(key))
             if value:
                 return value
@@ -1303,12 +2158,24 @@ async def run_one(args: argparse.Namespace) -> int:
         await runner.run()
     finally:
         runner.report.finished_at = datetime.now(UTC).isoformat()
-        await runner.close()
-        report_dir = REPO_ROOT / args.report_dir
-        stamp = runner.report.started_at.replace(":", "").replace("+0000", "Z")
-        path = report_dir / f"{runner.server_key}-{stamp}.json"
-        write_json(path, asdict(runner.report))
-        print(f"\nReport: {path}", flush=True)
+        try:
+            await runner.close()
+        except Exception as exc:
+            runner.report.records.append(
+                SmokeRecord(
+                    tool="__cleanup__",
+                    phase="cleanup",
+                    status="failed",
+                    success=False,
+                    error=f"Live smoke cleanup failed: {exc}",
+                )
+            )
+        finally:
+            report_dir = REPO_ROOT / args.report_dir
+            stamp = runner.report.started_at.replace(":", "").replace("+0000", "Z")
+            path = report_dir / f"{runner.server_key}-{stamp}.json"
+            write_json(path, asdict(runner.report))
+            print(f"\nReport: {path}", flush=True)
     failed = [record for record in runner.report.records if record.status in {"failed", "exception"}]
     return 1 if failed else 0
 
@@ -1338,7 +2205,130 @@ API_ACTIONS_SAMPLE: list[tuple[str, str, dict[str, Any]]] = [
     ("protect", "protect_list_lights", {}),
     ("access", "access_list_doors", {}),
     ("access", "access_list_users", {}),
+    ("access", "access_list_visitors", {}),
 ]
+
+# Non-default, read-only probes derive a guaranteed match from the corresponding
+# default read. A missing seed is inconclusive and therefore cannot make this
+# release-readiness phase green.
+API_ACTION_READ_CONTRACT_PROBES: list[tuple[str, str]] = [
+    ("network", "unifi_list_clients"),
+]
+
+API_ACTION_SENTINELS: dict[str, str] = {
+    "network": "unifi_list_clients",
+    "protect": "protect_list_cameras",
+    "access": "access_list_doors",
+}
+
+API_CONFIRMATION_PREVIEW_CONTROLS: dict[str, tuple[str, dict[str, Any]]] = {
+    "network": ("unifi_reboot_device", {"mac_address": "00:00:00:00:00:00"}),
+    "protect": ("protect_reboot_camera", {"camera_id": "__confirmation_probe__"}),
+    "access": ("access_unlock_door", {"door_id": "__confirmation_probe__", "duration": 2}),
+}
+
+
+def _validate_api_action_catalog(response: object) -> dict[str, Any]:
+    expected_payload = json.loads(API_ACTION_CATALOG.read_text())
+    expected = {item["name"] for item in expected_payload["actions"]}
+    if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+        raise ValueError("catalog response must contain an items array")
+    actual: set[str] = set()
+    for index, item in enumerate(response["items"]):
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError(f"catalog items[{index}].name must be a string")
+        actual.add(item["name"])
+    return {
+        "expected_count": len(expected),
+        "actual_count": len(actual),
+        "missing": sorted(expected - actual),
+        "unexpected": sorted(actual - expected),
+        "sentinels": {product: name in actual for product, name in API_ACTION_SENTINELS.items()},
+    }
+
+
+def _classify_confirmation_preview_control(
+    status: int,
+    response: object,
+    *,
+    expected_tool: str,
+) -> dict[str, Any]:
+    tool = str(response.get("tool") or "") if isinstance(response, dict) else ""
+    passed = (
+        status == 200
+        and isinstance(response, dict)
+        and response.get("success") is True
+        and response.get("requires_confirmation") is True
+        and response.get("action") in {"create", "update", "delete"}
+        and isinstance(response.get("preview"), dict)
+        and tool == expected_tool
+    )
+    return {"passed": passed, "tool_returned": tool, "response": response}
+
+
+def _classify_api_action_result(success: bool | None, shape_match: bool) -> str:
+    """Require current live success; historical baselines are diagnostic only."""
+    return "pass" if success is True and shape_match else "regression"
+
+
+def _validate_api_read_contract_probe(
+    response: object,
+    *,
+    expected_meta: dict[str, Any],
+    projected_fields: set[str] | None,
+    require_non_empty: bool = False,
+    expected_empty: bool = False,
+    expected_item_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a non-default read response without assuming live inventory."""
+    errors: list[str] = []
+    if not isinstance(response, dict) or response.get("success") is not True:
+        return {"passed": False, "errors": ["response was not a successful action envelope"]}
+
+    data = response.get("data")
+    meta = response.get("meta")
+    if not isinstance(data, list):
+        errors.append("response data was not a list")
+    if not isinstance(meta, dict):
+        errors.append("response meta was not an object")
+        meta = {}
+
+    for key, expected in expected_meta.items():
+        actual = meta.get(key)
+        if actual != expected:
+            errors.append(f"meta.{key} expected {expected!r}, got {actual!r}")
+
+    limit = expected_meta.get("limit")
+    if isinstance(data, list) and isinstance(limit, int) and len(data) > limit:
+        errors.append(f"data length {len(data)} exceeds limit {limit}")
+
+    if isinstance(data, list):
+        if require_non_empty and not data:
+            errors.append("positive control returned no rows")
+        if expected_empty and data:
+            errors.append(f"negative control returned {len(data)} rows")
+        returned_count = meta.get("returned_count")
+        if returned_count != len(data):
+            errors.append(f"meta.returned_count expected {len(data)}, got {returned_count!r}")
+        if "count" in meta and meta["count"] != len(data):
+            errors.append(f"meta.count expected {len(data)}, got {meta['count']!r}")
+        total_count = meta.get("total_count")
+        if not isinstance(total_count, int) or total_count < len(data):
+            errors.append(f"meta.total_count must be an integer >= {len(data)}, got {total_count!r}")
+
+    if isinstance(data, list) and projected_fields is not None:
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                errors.append(f"data[{index}] was not an object")
+                continue
+            unexpected = sorted(set(item) - projected_fields)
+            if unexpected:
+                errors.append(f"data[{index}] contains fields outside projection: {', '.join(unexpected)}")
+            for key, expected in (expected_item_values or {}).items():
+                if item.get(key) != expected:
+                    errors.append(f"data[{index}].{key} expected {expected!r}, got {item.get(key)!r}")
+
+    return {"passed": not errors, "errors": errors}
 
 
 def _api_actions_baseline_dirs() -> dict[str, str]:
@@ -1531,9 +2521,8 @@ def _live_count(summary: dict[str, Any]) -> int | None:
 def run_api_actions_phase(args: argparse.Namespace) -> int:
     """Manual-only phase: exercise read-only tools through POST /v1/actions/{name}.
 
-    Returns 0 on parity (every exercised tool succeeds AND matches the baseline
-    success flag). Returns non-zero when a NEW failure is observed compared to
-    the MCP-direct baseline.
+    Returns 0 only when every exercised tool succeeds. Baselines provide
+    comparison context, but can never convert a live API failure into a pass.
     """
     print("\n=== api-actions: spinning up unifi-api-server locally ===", flush=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="unifi-api-smoke-"))
@@ -1556,12 +2545,18 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
         "base_url": base_url,
         "db_path": str(db_path),
         "controllers": [],
+        "catalog_probe": None,
+        "confirmation_preview_controls": [],
+        "read_contract_probes": [],
         "results": [],
         "summary": {
+            "preview_controls_exercised": 0,
+            "preview_controls_passed": 0,
+            "read_contract_probes_exercised": 0,
+            "read_contract_probes_passed": 0,
             "tools_exercised": 0,
             "passed": 0,
             "regressions": 0,
-            "preexisting_failures": 0,
         },
     }
 
@@ -1595,6 +2590,41 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
 
         auth_headers = {"Authorization": f"Bearer {admin_key}"}
 
+        catalog_status, catalog_response = _http_request(
+            "GET",
+            f"{base_url}/v1/catalog/tools",
+            headers=auth_headers,
+        )
+        try:
+            catalog_probe = _validate_api_action_catalog(catalog_response)
+        except (OSError, json.JSONDecodeError, ValueError, KeyError) as exc:
+            catalog_probe = {
+                "expected_count": None,
+                "actual_count": None,
+                "missing": [],
+                "unexpected": [],
+                "sentinels": {},
+                "error": str(exc),
+            }
+        catalog_probe["http_status"] = catalog_status
+        catalog_probe["passed"] = (
+            catalog_status == 200
+            and not catalog_probe.get("error")
+            and not catalog_probe["missing"]
+            and not catalog_probe["unexpected"]
+            and all(catalog_probe["sentinels"].values())
+        )
+        artifact["catalog_probe"] = catalog_probe
+        print(
+            "  catalog probe: "
+            f"passed={catalog_probe['passed']} expected={catalog_probe['expected_count']} "
+            f"actual={catalog_probe['actual_count']}",
+            flush=True,
+        )
+        if not catalog_probe["passed"]:
+            artifact["summary"]["regressions"] += 1
+            return 1
+
         # Step 1: register controllers from .env
         controller_payloads = _api_actions_controllers_from_env()
         if not controller_payloads:
@@ -1620,6 +2650,47 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
             )
             print(f"  registered controller: {product} -> {body['id']}", flush=True)
 
+        for product in ("network", "protect", "access"):
+            controller_id = product_to_controller_id.get(product)
+            if controller_id is None:
+                continue
+            tool_name, tool_args = API_CONFIRMATION_PREVIEW_CONTROLS[product]
+            if args.tool and tool_name not in args.tool:
+                continue
+            preview_status, preview_response = _http_request(
+                "POST",
+                f"{base_url}/v1/actions/{tool_name}",
+                headers=auth_headers,
+                body={
+                    "site": os.environ.get("UNIFI_NETWORK_SITE") or "default",
+                    "controller": controller_id,
+                    "args": tool_args,
+                    "confirm": False,
+                },
+            )
+            preview_result = _classify_confirmation_preview_control(
+                preview_status,
+                preview_response,
+                expected_tool=tool_name,
+            )
+            artifact["confirmation_preview_controls"].append(
+                {
+                    "product": product,
+                    "tool": tool_name,
+                    "http_status": preview_status,
+                    **preview_result,
+                }
+            )
+            print(
+                f"  confirmation preview control: {tool_name} passed={preview_result['passed']}",
+                flush=True,
+            )
+            artifact["summary"]["preview_controls_exercised"] += 1
+            if preview_result["passed"]:
+                artifact["summary"]["preview_controls_passed"] += 1
+            else:
+                artifact["summary"]["regressions"] += 1
+
         # Step 2: exercise the sample, comparing to baselines
         baselines = {p: _load_api_actions_baseline(p) for p in product_to_controller_id}
         site_for_product: dict[str, str] = {
@@ -1627,9 +2698,12 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
             "protect": "default",
             "access": "default",
         }
+        live_action_responses: dict[str, dict[str, Any]] = {}
 
         for product, tool_name, tool_args in API_ACTIONS_SAMPLE:
             if product not in product_to_controller_id:
+                continue
+            if args.tool and tool_name not in args.tool:
                 continue
             controller_id = product_to_controller_id[product]
             site = site_for_product[product]
@@ -1661,6 +2735,8 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
                 if success is False:
                     error = str(response.get("error") or "")
                 summary = _summarize_action_response(response)
+                if success is True:
+                    live_action_responses[tool_name] = response
             else:
                 success = False
                 error = f"HTTP {status}: {response!r}"
@@ -1675,17 +2751,9 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
             if isinstance(baseline_count, int) and isinstance(live_count, int):
                 count_delta = live_count - baseline_count
 
-            # Classification:
-            #   pass:          live success matches baseline (both True), shape matches.
-            #   preexisting:   baseline already failed (success != True). Not a regression.
-            #   regression:    baseline succeeded, but live failed.
-            classification: str
-            if success is True and (baseline_success is True or baseline_success is None):
-                classification = "pass"
-            elif baseline_success in (False, None) and success is not True:
-                classification = "preexisting" if baseline_success is False else "no_baseline"
-            else:
-                classification = "regression"
+            # A historical baseline is diagnostic context, not an exemption:
+            # every live API action exercised in this phase must work now.
+            classification = _classify_api_action_result(success, shape_match)
 
             artifact["results"].append(
                 {
@@ -1712,8 +2780,6 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
                 artifact["summary"]["passed"] += 1
             elif classification == "regression":
                 artifact["summary"]["regressions"] += 1
-            elif classification in {"preexisting", "no_baseline"}:
-                artifact["summary"]["preexisting_failures"] += 1
 
             print(
                 f"  api-actions {classification}: {tool_name} "
@@ -1723,6 +2789,129 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
             )
             if args.delay:
                 time.sleep(args.delay)
+
+        # Step 3: prove representative non-default read behavior through the
+        # running action endpoint. The positive control derives an exact search
+        # key from the default read; the negative control proves filtering is
+        # actually applied. Neither call mutates controller state.
+        for product, tool_name in API_ACTION_READ_CONTRACT_PROBES:
+            if product not in product_to_controller_id:
+                continue
+            if args.tool and tool_name not in args.tool:
+                continue
+            controller_id = product_to_controller_id[product]
+            site = site_for_product[product]
+            seed = live_action_responses.get(tool_name, {})
+            seed_rows = seed.get("data") if isinstance(seed, dict) else None
+            candidate = next(
+                (
+                    row
+                    for row in seed_rows or []
+                    if isinstance(row, dict) and isinstance(row.get("mac"), str) and row["mac"]
+                ),
+                None,
+            )
+            if candidate is None:
+                error = "default live read returned no client with a MAC; contract probe is inconclusive"
+                artifact["read_contract_probes"].append(
+                    {
+                        "product": product,
+                        "tool": tool_name,
+                        "controller_id": controller_id,
+                        "site": site,
+                        "control": "seed",
+                        "passed": False,
+                        "errors": [error],
+                    }
+                )
+                artifact["summary"]["read_contract_probes_exercised"] += 1
+                artifact["summary"]["regressions"] += 1
+                print(f"  api-actions read contract: {tool_name} inconclusive ({error})", flush=True)
+                continue
+
+            mac = candidate["mac"]
+            connection_type = str(candidate.get("connection_type") or "Wireless")
+            filter_type = "wired" if connection_type.lower() == "wired" else "wireless"
+            common_args = {
+                "filter_type": filter_type,
+                "include_offline": True,
+                "limit": 1,
+                "fields": "mac,connection_type",
+            }
+            controls = [
+                (
+                    "positive",
+                    {**common_args, "search": mac},
+                    {**common_args, "search": mac},
+                    True,
+                    False,
+                    {"mac": mac, "connection_type": connection_type},
+                ),
+                (
+                    "negative",
+                    {**common_args, "search": "__unifi_live_smoke_no_match__"},
+                    {**common_args, "search": "__unifi_live_smoke_no_match__"},
+                    False,
+                    True,
+                    None,
+                ),
+            ]
+            for control, tool_args, expected_meta, require_non_empty, expected_empty, item_values in controls:
+                expected_meta.pop("include_offline")
+                t0 = time.perf_counter()
+                try:
+                    status, response = _http_request(
+                        "POST",
+                        f"{base_url}/v1/actions/{tool_name}",
+                        headers=auth_headers,
+                        body={
+                            "site": site,
+                            "controller": controller_id,
+                            "args": tool_args,
+                            "confirm": False,
+                        },
+                        timeout=120.0,
+                    )
+                except Exception as exc:
+                    status = 0
+                    response = f"{type(exc).__name__}: {exc}"
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                validation = _validate_api_read_contract_probe(
+                    response,
+                    expected_meta=expected_meta,
+                    projected_fields={"mac", "connection_type"},
+                    require_non_empty=require_non_empty,
+                    expected_empty=expected_empty,
+                    expected_item_values=item_values,
+                )
+                passed = status == 200 and validation["passed"]
+                artifact["read_contract_probes"].append(
+                    {
+                        "product": product,
+                        "tool": tool_name,
+                        "controller_id": controller_id,
+                        "site": site,
+                        "control": control,
+                        "args": tool_args,
+                        "http_status": status,
+                        "passed": passed,
+                        "errors": validation["errors"],
+                        "duration_ms": duration_ms,
+                        "summary": _summarize_action_response(response),
+                    }
+                )
+                artifact["summary"]["read_contract_probes_exercised"] += 1
+                if passed:
+                    artifact["summary"]["read_contract_probes_passed"] += 1
+                else:
+                    artifact["summary"]["regressions"] += 1
+                print(
+                    f"  api-actions read contract {control}: {tool_name} "
+                    f"passed={passed} http={status} ({duration_ms}ms)",
+                    flush=True,
+                )
+                if args.delay:
+                    time.sleep(args.delay)
 
     finally:
         artifact["finished_at"] = datetime.now(UTC).isoformat()
@@ -1767,7 +2956,7 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
 # Manual-only phase. Same bootstrap as api-actions (spins up unifi-api-server locally,
 # registers .env-configured controllers), then exercises the GET resource
 # endpoints (clients, devices, networks, wlans, firewall rules, cameras,
-# recordings, events, doors, users, credentials). For each resource that has a
+# recordings, events, doors, users, credentials, visitors). For each resource that has a
 # tool equivalent, also calls the matching action endpoint and compares the
 # data payloads — the resource version wraps in {items, next_cursor,
 # render_hint} and the action version wraps in {success: true, data,
@@ -1790,7 +2979,14 @@ def run_api_actions_phase(args: argparse.Namespace) -> int:
 # - parity_collection_keys: the keys under the action's data payload that hold
 #   the item collection — we look at each in order and use the first present.
 API_RESOURCES_SAMPLE: list[tuple[str, str, dict[str, Any], str | None, dict[str, Any] | None, tuple[str, ...]]] = [
-    ("network", "/v1/sites/{site}/clients", {"limit": 10}, "unifi_list_clients", {}, ("clients", "items")),
+    (
+        "network",
+        "/v1/sites/{site}/clients",
+        {"limit": 10},
+        "unifi_list_clients",
+        {"limit": 1000},
+        ("clients", "items"),
+    ),
     ("network", "/v1/sites/{site}/devices", {"limit": 10}, "unifi_list_devices", {}, ("devices", "items")),
     ("network", "/v1/sites/{site}/networks", {"limit": 10}, None, None, ()),
     ("network", "/v1/sites/{site}/wlans", {"limit": 10}, None, None, ()),
@@ -1798,7 +2994,24 @@ API_RESOURCES_SAMPLE: list[tuple[str, str, dict[str, Any], str | None, dict[str,
     ("protect", "/v1/sites/{site}/cameras", {"limit": 10}, "protect_list_cameras", {}, ("cameras", "items")),
     ("access", "/v1/sites/{site}/doors", {"limit": 10}, "access_list_doors", {}, ("doors", "items")),
     ("access", "/v1/sites/{site}/users", {"limit": 10}, "access_list_users", {}, ("users", "items")),
+    (
+        "access",
+        "/v1/sites/{site}/visitors",
+        {"limit": 10},
+        "access_list_visitors",
+        {},
+        ("visitors", "items"),
+    ),
 ]
+
+# Network resource types intentionally expose MAC addresses as their public
+# identities, while the matching action rows can also carry private controller
+# ``id``/``_id`` values. Comparing the generic identifiers mixes namespaces and
+# reports false parity failures even when both surfaces contain the same device.
+API_RESOURCE_PARITY_ID_KEYS: dict[str, tuple[str, ...]] = {
+    "/v1/sites/{site}/clients": ("mac",),
+    "/v1/sites/{site}/devices": ("mac",),
+}
 
 
 def _items_id_set(items: Any, id_keys: tuple[str, ...] = ("id", "_id", "mac", "uuid")) -> set[str]:
@@ -2031,8 +3244,12 @@ def run_api_resources_phase(args: argparse.Namespace) -> int:
 
                 if a_status == 200 and isinstance(a_response, dict) and a_response.get("success"):
                     action_collection = _action_collection(a_response, parity_keys)
-                    resource_ids = _items_id_set(items)
-                    action_ids = _items_id_set(action_collection)
+                    parity_id_keys = API_RESOURCE_PARITY_ID_KEYS.get(
+                        path_tpl,
+                        ("id", "_id", "mac", "uuid"),
+                    )
+                    resource_ids = _items_id_set(items, parity_id_keys)
+                    action_ids = _items_id_set(action_collection, parity_id_keys)
                     is_subset = resource_ids.issubset(action_ids) if resource_ids else True
                     parity = {
                         "tool": parity_tool,
@@ -2509,6 +3726,13 @@ def run_api_streams_phase(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.phase == "support":
+        from support_smoke import run_support_phase
+
+        report = asyncio.run(run_support_phase(args.server, REPO_ROOT, args.support_plugin_root))
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        write_json(REPO_ROOT / args.report_dir / f"support-{stamp}.json", report)
+        return 0 if report["success"] else 1
     if args.phase == "api-actions":
         return run_api_actions_phase(args)
     if args.phase == "api-resources":

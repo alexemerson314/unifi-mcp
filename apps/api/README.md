@@ -1,8 +1,8 @@
 # unifi-api-server
 
-REST + GraphQL HTTP API for UniFi controllers — a standalone HTTP service for
-desktop apps, web dashboards, Pi extensions, and any consumer that wants typed
-read access to UniFi Network, Protect, and Access without speaking MCP.
+REST + GraphQL HTTP API for UniFi controllers. Run it as a standalone HTTP
+service for desktop apps, web dashboards, Pi extensions, automation services,
+and MCP adapters that need typed access to UniFi Network, Protect, and Access.
 
 ## Quickstart
 
@@ -56,6 +56,11 @@ Once you're signed in:
   - GraphQL playground: `/v1/graphql`
   - OpenAPI spec: `/v1/openapi.json`
   - Health: `/v1/health`
+
+Current Network and Protect read surfaces include Network Traffic Flows
+(`GET /v1/sites/{site_id}/traffic-flows`, `network.trafficFlows`) and Protect
+Find Anything detection search (`GET /v1/sites/{site_id}/detection-search`,
+`protect.searchDetections`).
 
 First GraphQL query:
 
@@ -115,6 +120,59 @@ The HTTP layer is FastAPI; GraphQL is Strawberry on top of the same projection
 types REST uses, so consumer-facing field names are identical across the two
 surfaces. Pagination is cursor-based on REST, slice-based on GraphQL.
 
+The REST action surface is loaded from the packaged
+`unifi_api/action_catalog.json`. Product MCP manifests and tool source are
+inputs only when that catalog is generated in a repository checkout; at
+runtime the API depends on the shared managers and models in `unifi-core`, not
+on the Network, Protect, or Access MCP app packages.
+
+### Custom orchestration and MCP adapters
+
+Use the API server as the backend when an application needs dependent calls,
+joins, filtering, loops, branching, or an isolated code-execution runtime:
+
+1. Use GraphQL for typed, paginated reads when the application needs field
+   selection, or use REST for typed resource reads.
+2. Process intermediate results inside the application's own runtime and
+   resource limits.
+3. Call `POST /v1/actions/{tool_name}` for supported controller operations.
+4. Subscribe to the SSE endpoints for live events instead of polling an MCP
+   event resource.
+
+An MCP adapter can expose its own tools while using `unifi-api-server` as its
+backend. The API and MCP applications share the `unifi-core` manager behavior,
+but the adapter defines its outward tool contract. The API server does not
+sandbox generated code or set CPU, memory, or execution-time limits for caller
+logic. The application must enforce those limits.
+
+Keep mutation approval as two requests. First send the JSON request body with
+`"confirm": false` and present the returned preview to the user. After approval,
+resend the same body with `"confirm": true`. Do not preview and execute a mutation
+inside one code-execution request.
+
+For V2 NAT actions, the generic API preview shows the validated partial
+request, without a fresh merged controller document. Confirmation performs
+the fresh merge and persistence check in Core. NAT GraphQL remains read-only.
+
+Regenerate all product manifests and the API projection together:
+
+```bash
+make manifest
+```
+
+Check the committed catalog without rewriting it:
+
+```bash
+uv run python scripts/generate_api_action_catalog.py --check
+```
+
+Do not edit the catalog directly. Root generation and CI fail when its safety
+metadata, manager bindings, exclusions, or bytes drift from the product source.
+
+### Sensitive response fields
+
+REST, GraphQL, and action responses redact known controller secret fields by default. Disable redaction for a trusted local API process with `UNIFI_API_REDACT_SENSITIVE_FIELDS=false` or the global `UNIFI_REDACT_SENSITIVE_FIELDS=false` policy flag when raw values are required. The action endpoint (`POST /v1/actions/{tool}`) rejects `include_sensitive`; response redaction is process policy, not a request argument.
+
 ## Distribution
 
 `unifi-api-server` is published to:
@@ -159,6 +217,8 @@ This is the same constraint the MCP servers (`unifi-network-mcp`,
 
 ## Documentation
 
+- [MAC parameter migration](../network/docs/mac-parameter-migration.md) for Network MCP and API action calls.
+
 - **Reference docs** are auto-generated and drift-gated. Browse them in-repo or
   via the live exploration UIs:
   - [REST OpenAPI spec (JSON)](openapi.json)
@@ -168,10 +228,6 @@ This is the same constraint the MCP servers (`unifi-network-mcp`,
   - **Live exploration:** Swagger UI at `/v1/docs`, GraphiQL at `/v1/graphql`
 - [`docs/README.md`](docs/README.md) — index linking all artifacts plus
   deployment patterns
-- [`docs/release-smoke-checklist.md`](docs/release-smoke-checklist.md) — manual
-  release smoke checks
-- [`docs/release-coverage.md`](docs/release-coverage.md) — coverage matrix
-  (live smoke / fixture e2e / known gaps)
 - [`docs/graphql-versioning.md`](docs/graphql-versioning.md) — schema
   versioning policy
 

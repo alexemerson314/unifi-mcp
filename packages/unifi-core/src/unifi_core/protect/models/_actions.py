@@ -12,7 +12,7 @@ validate kwargs via ``ToolInput(**kwargs)`` at the top of the body.
 
 from __future__ import annotations
 
-from typing import ClassVar, Optional
+from typing import ClassVar, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -64,6 +64,19 @@ class ToggleRecordingInput(BaseModel):
     enabled: bool = Field(description="True enables recording (always); False disables (never)")
 
 
+class ToggleRtspInput(BaseModel):
+    """Input for ``protect_toggle_rtsp``."""
+
+    __action_input__: ClassVar[bool] = True
+
+    camera_id: str = Field(description="Camera UUID")
+    enabled: bool = Field(description="True publishes an RTSP/RTSPS stream on the channel; False stops publishing it")
+    quality: Literal["high", "medium", "low"] = Field(
+        default="high",
+        description="Channel quality to toggle: high, medium, or low",
+    )
+
+
 class AlarmArmInput(BaseModel):
     """Input for ``protect_alarm_arm``."""
 
@@ -79,6 +92,65 @@ class AlarmDisarmInput(BaseModel):
     """Input for ``protect_alarm_disarm`` (no parameters)."""
 
     __action_input__: ClassVar[bool] = True
+
+
+class AlarmGetRuleInput(BaseModel):
+    """Input for ``protect_alarm_get_rule``."""
+
+    __action_input__: ClassVar[bool] = True
+
+    rule_id: str = Field(description="Alarm rule (automation) id")
+
+
+class AlarmUpdateRuleInput(BaseModel):
+    """Input for ``protect_alarm_update_rule``.
+
+    Protect's PATCH endpoint requires the full rule payload, so ``body``
+    is the complete rule dict (typically produced by reading via
+    ``protect_alarm_get_rule`` and mutating the returned dict).
+    """
+
+    __action_input__: ClassVar[bool] = True
+
+    rule_id: str = Field(description="Alarm rule (automation) id")
+    body: dict = Field(
+        description=(
+            "Full rule payload (Protect rejects partial bodies). "
+            "Read-modify-write: call protect_alarm_get_rule, mutate, pass back here."
+        )
+    )
+
+
+class AlarmCreateRuleInput(BaseModel):
+    """Input for ``protect_alarm_create_rule``.
+
+    The tool layer translates snake_case keys in ``body`` (as returned by
+    ``protect_alarm_get_rule``) to the camelCase shape the controller
+    requires on POST, so a natural read-modify-write flow works for clone-
+    style creates. Both casings of a field are accepted; the camelCase
+    value wins if both are present.
+    """
+
+    __action_input__: ClassVar[bool] = True
+
+    body: dict = Field(
+        description=(
+            "Full rule payload matching the Protect automations schema "
+            "(name, enable, sources, conditions, actions, cooldown). "
+            "Server assigns the id and returns the created rule. "
+            "``actions`` MUST be a non-empty list -- the controller accepts "
+            "an empty actions list but the resulting rule cannot be opened "
+            "in the Protect UI."
+        )
+    )
+
+
+class AlarmDeleteRuleInput(BaseModel):
+    """Input for ``protect_alarm_delete_rule``."""
+
+    __action_input__: ClassVar[bool] = True
+
+    rule_id: str = Field(description="Alarm rule (automation) id to delete")
 
 
 class TriggerChimeInput(BaseModel):
@@ -144,3 +216,11 @@ class DeleteKnownFaceInput(BaseModel):
     __action_input__: ClassVar[bool] = True
 
     face_id: str = Field(description="Face group UUID to remove")
+
+
+class DeleteKnownLicensePlateInput(BaseModel):
+    """Input for ``protect_delete_known_license_plate``."""
+
+    __action_input__: ClassVar[bool] = True
+
+    plate_id: str = Field(description="License-plate group id to remove")

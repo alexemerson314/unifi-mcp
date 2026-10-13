@@ -150,7 +150,7 @@ def test_snmp_settings_detail_first_item_unwrap() -> None:
     out = SnmpSettings.from_manager_output(sample).to_dict()
     assert SnmpSettings.render_hint("detail")["kind"] == "detail"
     assert out["enabled"] is True
-    assert out["community"] == "public"
+    assert out["community"] == "***REDACTED***"
     assert out["port"] == 161
     assert out["version"] == "v2c"
 
@@ -160,13 +160,22 @@ def test_snmp_settings_detail_first_item_unwrap() -> None:
 
 def test_event_types_detail_serializer_shape() -> None:
     sample = [
-        {"prefix": "EVT_WU_", "description": "Wireless user events"},
-        {"prefix": "EVT_SW_", "description": "Switch events"},
+        {
+            "key": "CLIENT_CONNECTED_WIRELESS_2",
+            "prefix": "CLIENT_CONNECTED_WIRELESS_2",
+            "description": "Exact event key observed in the sample",
+            "observed_count": 4,
+        },
+        {
+            "key": "CLIENT_ROAMED_2",
+            "prefix": "CLIENT_ROAMED_2",
+            "description": "Exact event key observed in the sample",
+            "observed_count": 9,
+        },
     ]
     out = EventTypes.from_manager_output(sample).to_dict()
     assert EventTypes.render_hint("detail")["kind"] == "detail"
-    assert out["event_types"][0]["prefix"] == "EVT_WU_"
-    assert out["event_types"][1]["prefix"] == "EVT_SW_"
+    assert out["event_types"] == sample
 
 
 # ---- Auto-backup settings ----
@@ -232,3 +241,38 @@ def test_create_backup_returns_dict_passthrough() -> None:
     sample = {"filename": "backup.unf", "url": "/dl/backup/backup.unf"}
     out = s.serialize_action(sample, tool_name="unifi_create_backup")
     assert out["data"]["filename"] == "backup.unf"
+
+
+def test_snmp_settings_detail_exposes_v3_fields_and_redacts_the_password() -> None:
+    sample = [{"enabled": False, "community": "public", "enabledV3": True, "username": "monitor", "x_password": "p"}]
+    out = SnmpSettings.from_manager_output(sample).to_dict()
+    assert out["enabled_v3"] is True
+    assert out["username"] == "monitor"
+    assert out["x_password"] == "***REDACTED***"
+    raw = SnmpSettings.from_manager_output(sample, redact_sensitive=False).to_dict()
+    assert raw["x_password"] == "p"
+
+
+def test_mgmt_settings_detail_unwraps_and_never_carries_credentials_or_keys() -> None:
+    from unifi_api.graphql.types.network.system import MgmtSettings
+
+    sample = [
+        {
+            "x_ssh_enabled": True,
+            "x_ssh_username": "ubnt",
+            "x_ssh_password": "clear",
+            "x_ssh_sha512passwd": "$6$hash",
+            "x_mgmt_key": "0123456789abcdef",
+            "x_ssh_keys": [{"name": "laptop", "type": "ssh-ed25519", "key": "AAAA"}],
+            "auto_upgrade_hour": 3,
+        }
+    ]
+    out = MgmtSettings.from_manager_output(sample).to_dict()
+    assert out["x_ssh_enabled"] is True and out["x_ssh_username"] == "ubnt"
+    assert out["ssh_password_set"] is True and out["ssh_password_hash_set"] is True
+    assert out["mgmt_key_set"] is True and out["api_token_set"] is False
+    assert out["ssh_keys_present"] is True and out["ssh_keys_count"] == 1
+    for secret in ("clear", "$6$hash", "0123456789abcdef", "AAAA", "laptop"):
+        assert secret not in repr(out)
+    assert MgmtSettings.from_manager_output(None).to_dict() == {}
+    assert MgmtSettings.from_manager_output([]).to_dict() == {}

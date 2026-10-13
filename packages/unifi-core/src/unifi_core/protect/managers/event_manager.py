@@ -15,9 +15,69 @@ from typing import Any, Callable
 
 from uiprotect.data import Event, EventType, ModelType, SmartDetectObjectType, WSAction, WSSubscriptionMessage
 
-from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.exceptions import UniFiConnectionError, UniFiMalformedResponseError, UniFiNotFoundError
+from unifi_core.protect.errors import safe_protect_error
+from unifi_core.protect.models.detection_search import from_controller as detection_search_from_controller
+from unifi_core.protect.models.events import smart_detection_from_controller
+from unifi_core.request_budget import RequestBudgetSpent, charged_request_middleware
+from unifi_core.source_page import SourcePage
+from unifi_core.support_transport import no_retry_support_request
 
 logger = logging.getLogger(__name__)
+
+# Allowed label prefixes for the detection-search endpoint. Each label is a
+# ``prefix:value`` token; the prefix selects which filter category the value
+# applies to (e.g. ``vehicleType:truck``).
+_VALID_DETECTION_LABEL_PREFIXES = frozenset(
+    {
+        "vehicleType",
+        "color",
+        "smartDetectType",
+        "eventType",
+        "groupType",
+        "camera",
+        "zone",
+        "line",
+        "loiterZone",
+        "doorAccess",
+    }
+)
+
+# Sort directions accepted by detection-search (lowercased on input, sent uppercased).
+_VALID_DETECTION_ORDERS = frozenset({"asc", "desc"})
+
+# Inclusive bounds for the detection-search result limit.
+_DETECTION_LIMIT_MIN = 1
+_DETECTION_LIMIT_MAX = 1000
+
+# Inclusive bounds for the detection-search minimum-confidence filter (percent).
+_DETECTION_CONFIDENCE_MIN = 0
+_DETECTION_CONFIDENCE_MAX = 100
+
+
+def _page(
+    rows: list[dict[str, Any]],
+    *,
+    raw_count: int | None,
+    limit: int,
+    start: datetime | None,
+    end: datetime | None,
+    post_filtered: bool = False,
+) -> SourcePage:
+    """A page whose unfiltered read ran short of ``limit`` is the NVR saying it ran out.
+
+    ``raw_count`` is ``None`` when the rows the NVR returned were never seen.
+    """
+    submitted = (
+        (int(start.timestamp() * 1000), int(end.timestamp() * 1000)) if start is not None and end is not None else None
+    )
+    return SourcePage(
+        rows=rows,
+        has_more=False if raw_count is not None and 0 < limit and raw_count < limit else None,
+        cap=max(limit, 0),
+        submitted_window_ms=submitted,
+        post_filtered=post_filtered,
+    )
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -95,6 +155,8 @@ class EventBuffer:
         cutoff = time.time() - self._ttl
         results: list[dict[str, Any]] = []
         for event in reversed(self._buffer):
+            if limit is not None and len(results) >= limit:
+                break
             if event.get("_buffered_at", 0) < cutoff:
                 continue
             if event_type and event.get("type") != event_type:
@@ -104,8 +166,6 @@ class EventBuffer:
             if min_confidence is not None and event.get("score", 100) < min_confidence:
                 continue
             results.append(event)
-            if limit and len(results) >= limit:
-                break
         return results
 
     def clear(self) -> None:
@@ -165,8 +225,11 @@ class EventManager:
         """Subscribe to the pyunifiprotect websocket for real-time events.
 
         The ``subscribe_websocket`` method on the API client returns an
-        unsubscribe callable which we store for clean shutdown.
+        unsubscribe callable which we store for clean shutdown. A second call
+        while subscribed keeps the existing subscription.
         """
+        if self._ws_unsub is not None:
+            return
         self._ws_unsub = self._cm.client.subscribe_websocket(self._on_ws_message)
         logger.info("[event-mgr] Websocket subscription started.")
 
@@ -318,6 +381,68 @@ class EventManager:
             fields["detected_thumbnail_id"] = detected_thumbnail_id
         return fields
 
+    def _license_plate_recognition_fields(self, event: Event) -> dict[str, Any]:
+        """Extract recognized license-plate identity metadata from detected thumbnails.
+
+        Mirrors :meth:`_face_recognition_fields` but targets LPR detections. The
+        Protect API delivers the recognized plate text on the ``vehicle`` (or
+        occasionally ``licensePlate``) thumbnail inside ``event.metadata.detected_thumbnails``;
+        when present, it appears as ``thumbnail.name`` and/or
+        ``thumbnail.group.matched_name``. The plate's group UUID and the
+        recognition confidence are on the same ``group`` sub-object.
+        """
+        thumbnails = self._detected_thumbnails(event)
+        if not thumbnails:
+            return {}
+
+        smart_detect_types = set(_enum_values(_get_any(event, "smart_detect_types", "smartDetectTypes")))
+        if "licensePlate" not in smart_detect_types:
+            return {}
+
+        def _plate_text(thumb: Any) -> str | None:
+            group = _get(thumb, "group")
+            return _get_any(group, "matched_name", "matchedName", "name") or _get_any(
+                thumb, "matched_name", "matchedName", "name"
+            )
+
+        # On LPR events the carrying thumbnail.type is usually "vehicle", but
+        # accept "licensePlate" defensively; either way it must have a plate
+        # string to be considered a recognition payload.
+        candidates = [
+            thumb for thumb in thumbnails if _get(thumb, "type") in ("vehicle", "licensePlate") and _plate_text(thumb)
+        ]
+        if not candidates:
+            return {}
+
+        def _score(thumb: Any) -> tuple[int, int]:
+            group = _get(thumb, "group")
+            confidence = _coerce_int(
+                _get_any(group, "confidence", "matched_group_confidence", "matchedGroupConfidence")
+                or _get_any(thumb, "confidence", "matched_group_confidence", "matchedGroupConfidence")
+            )
+            group_id = _get_any(group, "id", "group_id", "groupId") or _get_any(thumb, "group_id", "groupId")
+            return (1 if group_id else 0, confidence or 0)
+
+        thumbnail = max(candidates, key=_score)
+        group = _get(thumbnail, "group")
+        plate_text = _plate_text(thumbnail)
+        plate_group_id = _stringify(
+            _get_any(group, "id", "group_id", "groupId") or _get_any(thumbnail, "group_id", "groupId")
+        )
+        plate_confidence = _coerce_int(
+            _get_any(group, "confidence", "matched_group_confidence", "matchedGroupConfidence")
+            or _get_any(thumbnail, "confidence", "matched_group_confidence", "matchedGroupConfidence")
+        )
+
+        fields: dict[str, Any] = {}
+        if plate_text:
+            fields["recognized_plate_text"] = str(plate_text)
+        if plate_group_id:
+            fields["recognized_plate_group_id"] = plate_group_id
+        if plate_confidence is not None:
+            fields["recognized_plate_confidence"] = plate_confidence
+        return fields
+
     async def _lookup_event_recognition_fields(self, event: Event) -> dict[str, Any]:
         """Fetch the same face event from the list/search path when detail drops group metadata."""
         if "face" not in set(_enum_values(_get(event, "smart_detect_types"))):
@@ -343,6 +468,36 @@ class EventManager:
         for candidate in events:
             if candidate.id == event.id:
                 return self._face_recognition_fields(candidate)
+        return {}
+
+    async def _lookup_event_plate_recognition_fields(self, event: Event) -> dict[str, Any]:
+        """Fetch the same LPR event from the list/search path when the detail
+        endpoint drops the plate group metadata (it keeps the plate text and
+        confidence but not the stable group id). Mirrors
+        :meth:`_lookup_event_recognition_fields` for license plates."""
+        if "licensePlate" not in set(_enum_values(_get(event, "smart_detect_types"))):
+            return {}
+
+        kwargs: dict[str, Any] = {
+            "limit": 100,
+            "sorting": "desc",
+            "types": [EventType.SMART_DETECT, EventType.SMART_DETECT_LINE],
+            "smart_detect_types": [SmartDetectObjectType.LICENSE_PLATE],
+        }
+        if event.start:
+            kwargs["start"] = event.start - timedelta(seconds=5)
+            end = event.end or event.start
+            kwargs["end"] = end + timedelta(minutes=1)
+
+        try:
+            events: list[Event] = await self._cm.client.get_events(**kwargs)
+        except Exception:
+            logger.debug("[event-mgr] Unable to backfill plate metadata for event %s", event.id, exc_info=True)
+            return {}
+
+        for candidate in events:
+            if candidate.id == event.id:
+                return self._license_plate_recognition_fields(candidate)
         return {}
 
     async def _known_face_names_by_id(self) -> dict[str, str]:
@@ -406,6 +561,7 @@ class EventManager:
             "smart_detect_types": _enum_values(event.smart_detect_types),
         }
         result.update(self._face_recognition_fields(event))
+        result.update(self._license_plate_recognition_fields(event))
         if not compact:
             result["thumbnail_id"] = event.thumbnail_id
             result["category"] = event.category
@@ -458,12 +614,10 @@ class EventManager:
             "score": _get(raw, "score"),
             "smart_detect_types": sdt,
         }
-        # Existing face convenience extractor (relies on _get/_get_any which
-        # handle both Event objects and dicts) keeps working untouched.
-        # Note: PR-4 introduces _license_plate_recognition_fields on a separate
-        # branch. This PR does not depend on PR-4; when both merge an integration
-        # commit will add the parallel call here.
+        # Face + license-plate convenience extractors (rely on _get/_get_any,
+        # which read both parsed Event objects and raw camelCase dicts).
         result.update(self._face_recognition_fields(raw))
+        result.update(self._license_plate_recognition_fields(raw))
 
         if not compact:
             result["thumbnail_id"] = _get(raw, "thumbnail") or _get(raw, "thumbnail_id")
@@ -507,6 +661,11 @@ class EventManager:
         """Current number of events in the buffer."""
         return len(self._buffer)
 
+    @property
+    def smart_detection_min_confidence(self) -> int:
+        """Confidence threshold smart-detection listings apply when the caller gives none."""
+        return self._min_confidence
+
     def add_subscriber(self, cb: Callable[[dict], None]) -> Callable[[], None]:
         """Register *cb* to receive every buffered event. Returns unsub."""
         self._subscribers.append(cb)
@@ -533,7 +692,29 @@ class EventManager:
         compact: bool = False,
         metadata_fields: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Query events from the NVR via the REST API.
+        """Query events from the NVR via the REST API (see :meth:`list_events_page`)."""
+        page = await self.list_events_page(
+            start=start,
+            end=end,
+            event_type=event_type,
+            camera_id=camera_id,
+            limit=limit,
+            compact=compact,
+            metadata_fields=metadata_fields,
+        )
+        return page.rows
+
+    async def list_events_page(
+        self,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        event_type: str | None = None,
+        camera_id: str | None = None,
+        limit: int = 30,
+        compact: bool = False,
+        metadata_fields: list[str] | None = None,
+    ) -> SourcePage:
+        """Query events from the NVR via the REST API, with the facts evidence needs.
 
         When camera_id or metadata_fields is set, bypasses uiprotect's
         get_events() (which has no camera filter and drops several metadata
@@ -541,6 +722,11 @@ class EventManager:
         delegates to the existing uiprotect path for full backwards
         compatibility.
         """
+        # The controller requires limit=1..100 when no time range is supplied.
+        # Zero requests no results and must not turn into an invalid or uncapped
+        # remote query on either the SDK or raw metadata path.
+        if limit == 0:
+            return SourcePage(rows=[], cap=0)
         use_raw_path = bool(camera_id) or bool(metadata_fields)
 
         if use_raw_path:
@@ -564,7 +750,7 @@ class EventManager:
             for raw in raw_events:
                 results.append(self._raw_event_to_dict(raw, compact=compact, metadata_fields=metadata_fields))
             await self._apply_known_face_names(results)
-            return results
+            return _page(results, raw_count=len(raw_events), limit=limit, start=start, end=end)
 
         # ----- existing uiprotect path (unchanged) -----
         kwargs: dict[str, Any] = {"limit": limit, "sorting": "desc"}
@@ -596,7 +782,79 @@ class EventManager:
             results.append(self._event_to_dict(ev, compact=compact))
 
         await self._apply_known_face_names(results)
-        return results
+        # uiprotect drops unknown, non-device and low-score events after the NVR
+        # applied the limit, so how many rows the NVR returned is unknown.
+        return _page(results, raw_count=None, limit=limit, start=start, end=end, post_filtered=True)
+
+    async def list_events_raw_page(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+        offset: int = 0,
+        camera_id: str | None = None,
+    ) -> SourcePage:
+        """One bounded read of raw NVR event rows, for incident evidence.
+
+        One GET to the private ``events`` endpoint with explicit bounds, limit
+        and offset, newest first. Every attempt uiprotect makes for it (status
+        retries, the retry after a re-login) passes the request-local charge. Unlike :meth:`list_events_page`
+        it never uses the SDK's ``get_events``, which pages through every event
+        after ``start`` when no type filter is given and drops event types it
+        does not know. Rows are returned exactly as the NVR sent them, with no
+        camera-name or Known Face enrichment. Failures are raised with fixed
+        text that keeps the error class and HTTP status.
+        """
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+        offset = max(offset, 0)
+        if limit <= 0:
+            return SourcePage(rows=[], offset=offset, cap=0, submitted_window_ms=(start_ms, end_ms))
+        params: dict[str, Any] = {
+            "orderDirection": "DESC",
+            "limit": limit,
+            "offset": offset,
+            "withoutDescriptions": "true",
+            "start": start_ms,
+            "end": end_ms,
+        }
+        if camera_id:
+            params["cameras"] = [camera_id]
+        try:
+            client = self._cm.client
+        except UniFiConnectionError:
+            # Join the manager's shared connect attempt, within its bound and this
+            # read's deadline. The attempt runs in its own task, so its login and
+            # bootstrap are never charged to this read; a connection still missing
+            # raises the manager's classified, fixed-text error.
+            await self._cm.ensure_connected()
+            client = self._cm.client
+        try:
+            # Request-local: each attempt (uiprotect's status and reconnect retries
+            # included) is charged to a bounded read, and aiohttp's own idempotent
+            # retry is suppressed, so no attempt goes uncounted.
+            rows = await client.api_request(
+                "events",
+                method="get",
+                params=params,
+                middlewares=(charged_request_middleware, no_retry_support_request),
+            )
+        except RequestBudgetSpent:
+            raise
+        except Exception as exc:
+            logger.error("[event-mgr] Raw events read failed: %s", type(exc).__name__)
+            raise safe_protect_error("Protect events read", exc) from None
+        if not isinstance(rows, list):
+            raise UniFiMalformedResponseError("Unexpected response shape from events")
+        return SourcePage(
+            rows=rows,
+            # A page shorter than the limit sent is the NVR saying it ran out.
+            has_more=False if len(rows) < limit else None,
+            offset=offset,
+            cap=limit,
+            submitted_window_ms=(start_ms, end_ms),
+        )
 
     async def get_event(
         self,
@@ -628,6 +886,8 @@ class EventManager:
         result = self._event_to_dict(event)
         if not result.get("recognized_person_id") and not result.get("recognized_person_name"):
             result.update(await self._lookup_event_recognition_fields(event))
+        if not result.get("recognized_plate_group_id"):
+            result.update(await self._lookup_event_plate_recognition_fields(event))
         await self._apply_known_face_names([result])
         return result
 
@@ -699,7 +959,34 @@ class EventManager:
         compact: bool = False,
         metadata_fields: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """List smart detection events with optional filtering.
+        """List smart detection events with optional filtering (see :meth:`list_smart_detections_page`)."""
+        page = await self.list_smart_detections_page(
+            start=start,
+            end=end,
+            camera_id=camera_id,
+            detection_type=detection_type,
+            min_confidence=min_confidence,
+            limit=limit,
+            compact=compact,
+            metadata_fields=metadata_fields,
+        )
+        return page.rows
+
+    async def list_smart_detections_page(
+        self,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        camera_id: str | None = None,
+        detection_type: str | None = None,
+        min_confidence: int | None = None,
+        limit: int = 30,
+        compact: bool = False,
+        metadata_fields: list[str] | None = None,
+    ) -> SourcePage:
+        """List smart detection events with optional filtering, with the facts evidence needs.
+
+        Confidence filtering runs after the NVR applies ``limit``; the page
+        reports whether the unfiltered read reached the end.
 
         Queries for ``smartDetectZone`` and ``smartDetectLine`` event types,
         then filters by detection type and confidence score.
@@ -736,7 +1023,9 @@ class EventManager:
                     continue
                 results.append(self._raw_event_to_dict(raw, compact=compact, metadata_fields=metadata_fields))
             await self._apply_known_face_names(results)
-            return results
+            return _page(
+                results, raw_count=len(raw_events), limit=limit, start=start, end=end, post_filtered=min_conf > 0
+            )
 
         # ----- existing uiprotect path (unchanged) -----
         kwargs: dict[str, Any] = {
@@ -773,7 +1062,113 @@ class EventManager:
             uiprotect_results.append(self._event_to_dict(ev, compact=compact))
 
         await self._apply_known_face_names(uiprotect_results)
-        return uiprotect_results
+        # uiprotect filters after the NVR's limit too, so the raw row count is unknown.
+        return _page(uiprotect_results, raw_count=None, limit=limit, start=start, end=end, post_filtered=True)
+
+    def _build_detection_search_params(
+        self,
+        *,
+        labels: list[str],
+        limit: int,
+        order: str,
+        exclude_motion: bool,
+        min_confidence: int | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[tuple[str, str]]:
+        """Validate inputs and build the detection-search query params.
+
+        Returns a list of ``(key, value)`` tuples with stringified values so the
+        ``labels`` key is repeated once per label by the underlying HTTP client
+        (the controller applies the labels conjunctively).
+        """
+        normalized_labels = [label.strip() for label in labels if label and label.strip()]
+        if not normalized_labels:
+            raise ValueError("At least one label is required.")
+        for label in normalized_labels:
+            prefix = label.split(":", 1)[0] if ":" in label else ""
+            if prefix not in _VALID_DETECTION_LABEL_PREFIXES:
+                raise ValueError(
+                    f"Invalid label {label!r}. Labels must be 'prefix:value' with prefix "
+                    f"in {sorted(_VALID_DETECTION_LABEL_PREFIXES)}."
+                )
+
+        if not (_DETECTION_LIMIT_MIN <= limit <= _DETECTION_LIMIT_MAX):
+            raise ValueError(f"limit must be between {_DETECTION_LIMIT_MIN} and {_DETECTION_LIMIT_MAX}, got {limit}.")
+
+        normalized_order = order.strip().lower()
+        if normalized_order not in _VALID_DETECTION_ORDERS:
+            raise ValueError(f"Invalid order {order!r}. Valid orders: {sorted(_VALID_DETECTION_ORDERS)}.")
+
+        if min_confidence is not None and not (
+            _DETECTION_CONFIDENCE_MIN <= min_confidence <= _DETECTION_CONFIDENCE_MAX
+        ):
+            raise ValueError(
+                f"min_confidence must be between {_DETECTION_CONFIDENCE_MIN} and "
+                f"{_DETECTION_CONFIDENCE_MAX}, got {min_confidence}."
+            )
+
+        params: list[tuple[str, str]] = [("excludeMotion", "true" if exclude_motion else "false")]
+        params.extend(("labels", label) for label in normalized_labels)
+        params.append(("limit", str(limit)))
+        params.append(("orderDirection", normalized_order.upper()))
+        if min_confidence is not None:
+            params.append(("minConfidence", str(min_confidence)))
+        # The controller's detection-search endpoint expects epoch-millisecond bounds.
+        if start is not None:
+            params.append(("start", str(int(start.timestamp() * 1000))))
+        if end is not None:
+            params.append(("end", str(int(end.timestamp() * 1000))))
+        return params
+
+    async def search_detections(
+        self,
+        *,
+        labels: list[str],
+        limit: int,
+        order: str,
+        exclude_motion: bool,
+        min_confidence: int | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Search detections via the controller's detection-search endpoint.
+
+        The ``labels`` query key is repeated once per label so the controller
+        applies them conjunctively. Returns a ``{"detections": [...], "count": n}``
+        envelope of :class:`SmartDetection` items parsed from the
+        ``{"events": [...]}`` response shape.
+
+        Optional ``min_confidence`` (0-100) maps to the ``minConfidence`` query
+        param; ``start``/``end`` map to the ``start``/``end`` epoch-millisecond
+        bounds. All three are omitted from the request when ``None``.
+        """
+        params = self._build_detection_search_params(
+            labels=labels,
+            limit=limit,
+            order=order,
+            exclude_motion=exclude_motion,
+            min_confidence=min_confidence,
+            start=start,
+            end=end,
+        )
+        data = await self._cm.client.api_request("detection-search", method="get", params=params)
+        if not isinstance(data, dict):
+            data = {}
+        events = data.get("events") or []
+        detections = [smart_detection_from_controller(event) for event in events]
+        return {"detections": detections, "count": len(detections)}
+
+    async def get_detection_search_labels(self) -> dict[str, Any]:
+        """Return the detection-search filter vocabulary from the controller.
+
+        Wraps the ``detection-search/labels`` endpoint, which lists the legal
+        filter values (colors, vehicle types, smart-detect types, ...) the
+        "Find Anything" panel offers. The raw response is normalised through
+        :func:`detection_search_from_controller` into snake_case group lists.
+        """
+        raw = await self._cm.client.api_request("detection-search/labels", method="get")
+        return detection_search_from_controller(raw).model_dump(exclude_none=True)
 
     async def acknowledge_event(self, event_id: str) -> dict[str, Any]:
         """Mark an event as acknowledged/favorite on the NVR.
@@ -804,17 +1199,12 @@ class EventManager:
         except Exception as exc:
             raise UniFiNotFoundError("event", event_id) from exc
 
-        # The Protect API uses is_favorite as the closest analog to
-        # "acknowledged".  We set it to True.
-        # Note: the exact mutation API depends on the uiprotect version.
-        # Some versions expose event.set_is_favorite() or similar.
-        # Fall back to a generic save approach.
-        try:
-            event.is_favorite = True
-            await event.save_device()
-        except AttributeError:
-            # Older API versions may not have save_device on events
-            logger.warning("[event-mgr] Event save_device not available; acknowledge may not persist.")
+        # Protect uses is_favorite as the closest analog to "acknowledged".
+        # Events are not SDK-updatable models, so use Protect's dedicated
+        # favorite endpoint. It returns an empty success body, which requires
+        # api_request_raw rather than the JSON-decoding api_request helper.
+        if event.is_favorite is not True:
+            await self._cm.client.api_request_raw(f"favorite-events/{event_id}", method="post")
 
         return {
             "event_id": event_id,

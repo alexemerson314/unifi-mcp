@@ -73,6 +73,21 @@ def test_firewall_zone_list_serializer_shape() -> None:
     assert FirewallZone.render_hint("list")["kind"] == "list"
 
 
+def test_firewall_policy_ordering_detail_shape() -> None:
+    from unifi_api.graphql.types.network.firewall import FirewallPolicyOrdering
+
+    sample = {
+        "orderedFirewallPolicyIds": {
+            "beforeSystemDefined": ["policy-a"],
+            "afterSystemDefined": ["policy-b"],
+        },
+    }
+    out = FirewallPolicyOrdering.from_manager_output(sample).to_dict()
+    assert out["ordering"]["beforeSystemDefined"] == ["policy-a"]
+    assert out["ordering"]["afterSystemDefined"] == ["policy-b"]
+    assert FirewallPolicyOrdering.render_hint("detail")["kind"] == "detail"
+
+
 # ---- Firewall mutation acks ----
 
 
@@ -83,13 +98,39 @@ def test_firewall_mutation_ack_dispatches_for_all_mutations() -> None:
         "unifi_update_firewall_policy",
         "unifi_delete_firewall_policy",
         "unifi_toggle_firewall_policy",
+        "unifi_reorder_firewall_policies",
         "unifi_create_firewall_group",
         "unifi_update_firewall_group",
         "unifi_delete_firewall_group",
+        "unifi_create_firewall_zone",
+        "unifi_update_firewall_zone",
+        "unifi_delete_firewall_zone",
     ):
         s = reg.serializer_for_tool(tool)
         out = s.serialize_action(True, tool_name=tool)
         assert out["render_hint"]["kind"] == "detail"
+
+
+def test_create_firewall_zone_ack_uses_canonical_v2_shape() -> None:
+    serializer = _registry().serializer_for_tool("unifi_create_firewall_zone")
+
+    out = serializer.serialize_action(
+        {
+            "_id": "v2-zone",
+            "external_id": "integration-zone-uuid",
+            "name": "IoT",
+            "network_ids": ["v2-network"],
+            "default_policy": "BLOCK",
+        },
+        tool_name="unifi_create_firewall_zone",
+    )
+
+    assert out["data"] == {
+        "id": "v2-zone",
+        "name": "IoT",
+        "networks": ["v2-network"],
+        "default_policy": "BLOCK",
+    }
 
 
 # ---- QoS rules ----
@@ -263,6 +304,37 @@ def test_acl_rule_detail_serializer_shape() -> None:
     assert out["action"] == "ALLOW"
     assert out["enabled"] is False
     assert AclRule.render_hint("detail")["kind"] == "detail"
+
+
+def test_acl_rule_netmask_projection() -> None:
+    """The GraphQL type derives source/destination netmask + raw mask from the
+    controller's mac_mask, on the correct side, and degrades non-contiguous to null."""
+    from unifi_api.graphql.types.network.acl import AclRule
+
+    sample = {
+        "_id": "acl3",
+        "name": "multicast",
+        "enabled": True,
+        "action": "ALLOW",
+        "traffic_source": {"type": "CLIENT_MAC", "specific_mac_addresses": ["aa:bb:cc:dd:ee:ff"]},
+        "traffic_destination": {
+            "type": "CLIENT_MAC",
+            "specific_mac_addresses": ["01:00:5e:00:00:00"],
+            "mac_mask": "ff:ff:ff:00:00:00",
+        },
+    }
+    out = AclRule.from_manager_output(sample).to_dict()
+    # mask is on the destination side only — must not bleed onto source
+    assert out["destination_netmask"] == 24
+    assert out["destination_mac_mask"] == "ff:ff:ff:00:00:00"
+    assert out["source_netmask"] is None
+    assert out["source_mac_mask"] is None
+
+    # non-contiguous mask: netmask null but the raw mask stays visible
+    sample["traffic_destination"]["mac_mask"] = "ff:00:ff:00:00:00"
+    out = AclRule.from_manager_output(sample).to_dict()
+    assert out["destination_netmask"] is None
+    assert out["destination_mac_mask"] == "ff:00:ff:00:00:00"
 
 
 def test_acl_mutation_ack_dispatches_for_all_mutations() -> None:

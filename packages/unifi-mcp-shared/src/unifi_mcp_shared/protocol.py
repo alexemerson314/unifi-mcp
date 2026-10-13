@@ -18,13 +18,22 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MCP_PROTOCOL_REVISION = "2025-11-25"
+FUTURE_MCP_PROTOCOL_REVISION = "2026-07-28"
+STRUCTURED_CONTENT_PROTOCOL_REVISION = "2025-06-18"
 
 _KNOWN_REVISIONS = frozenset({DEFAULT_MCP_PROTOCOL_REVISION})
+_KNOWN_PROTOCOL_TARGETS = frozenset(
+    {
+        DEFAULT_MCP_PROTOCOL_REVISION,
+        FUTURE_MCP_PROTOCOL_REVISION,
+    }
+)
 _LEGACY_PROTOCOL_VERSION_ALIASES = {
     "v1": DEFAULT_MCP_PROTOCOL_REVISION,
 }
@@ -62,6 +71,35 @@ def get_protocol_revision() -> str:
     return DEFAULT_MCP_PROTOCOL_REVISION
 
 
+def is_known_protocol_target(value: str) -> bool:
+    """Return whether a revision is tracked as a current or future MCP target."""
+    return _normalize_protocol_revision(value) in _KNOWN_PROTOCOL_TARGETS
+
+
+def structured_content_supported(protocol_revision: str | None) -> bool:
+    """Return whether a negotiated MCP revision supports structured tool results."""
+    if not protocol_revision:
+        return False
+    try:
+        parsed_revision = date.fromisoformat(protocol_revision)
+        if parsed_revision.isoformat() != protocol_revision:
+            return False
+        return parsed_revision >= date.fromisoformat(STRUCTURED_CONTENT_PROTOCOL_REVISION)
+    except ValueError:
+        return False
+
+
+def get_request_protocol_revision(context: Any | None) -> str | None:
+    """Read the protocol revision negotiated for the current SDK v2 request."""
+    if context is None:
+        return None
+    try:
+        revision = context.request_context.protocol_version
+        return str(revision) if revision else None
+    except (AttributeError, LookupError, RuntimeError, ValueError):
+        return None
+
+
 def create_mcp_tool_adapter(
     fastmcp_tool_decorator: Callable[..., Any],
     *,
@@ -85,14 +123,15 @@ def create_mcp_tool_adapter(
     else:
         revision = get_protocol_revision()
 
-    if revision not in _KNOWN_REVISIONS:
-        raise ValueError(
-            f"Unsupported MCP protocol revision: '{revision}'. Known revisions: {sorted(_KNOWN_REVISIONS)}"
+    if revision not in _KNOWN_PROTOCOL_TARGETS:
+        logger.warning(
+            "[protocol] Ignoring legacy process-level MCP protocol target %s; "
+            "SDK v2 negotiates the protocol per client",
+            revision,
         )
-
-    if revision == DEFAULT_MCP_PROTOCOL_REVISION:
-        logger.debug("[protocol] Using MCP %s adapter (passthrough)", revision)
-        return fastmcp_tool_decorator
-
-    # Unreachable, but satisfies type checkers
-    raise ValueError(f"Unhandled MCP protocol revision: {revision}")
+    else:
+        logger.debug(
+            "[protocol] Legacy process-level MCP protocol target %s is informational; SDK v2 negotiates per client",
+            revision,
+        )
+    return fastmcp_tool_decorator

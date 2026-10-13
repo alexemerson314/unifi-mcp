@@ -6,25 +6,36 @@ construction prevents concurrent-cache-miss races.
 
 Public surface:
 - ManagerFactory(sessionmaker, cipher)
-- get_connection_manager(session, controller_id, product) -> ConnectionManager
-- get_domain_manager(session, controller_id, product, attr_name) -> domain manager
+- get_connection_manager(session, controller_id, product, site=...) -> ConnectionManager
+- get_domain_manager(session, controller_id, product, attr_name, site=...) -> domain manager
 - invalidate_controller(controller_id)
+
+Network connection and domain-manager caches include the site. A cached
+Network manager therefore never changes site after construction, so
+concurrent requests for different sites cannot race through mutable shared
+ConnectionManager state. Protect and Access have no Network site namespace;
+their cache identity remains controller + product.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Coroutine
 from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from unifi_core.request_budget import create_uncharged_task
 
 from unifi_api.db.crypto import ColumnCipher
 from unifi_api.db.models import Controller
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownProduct(Exception):
@@ -43,7 +54,7 @@ class UnknownManager(Exception):
 # product-specific modules at startup unless the product is actually used.
 
 
-def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
+def _build_network_managers() -> dict[str, Callable[..., Any]]:
     from unifi_core.network.managers.acl_manager import AclManager
     from unifi_core.network.managers.client_group_manager import ClientGroupManager
     from unifi_core.network.managers.client_manager import ClientManager
@@ -51,9 +62,12 @@ def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
     from unifi_core.network.managers.device_manager import DeviceManager
     from unifi_core.network.managers.dns_manager import DnsManager
     from unifi_core.network.managers.dpi_manager import DpiManager
+    from unifi_core.network.managers.dynamic_dns_manager import DynamicDnsManager
     from unifi_core.network.managers.event_manager import EventManager
     from unifi_core.network.managers.firewall_manager import FirewallManager
+    from unifi_core.network.managers.gateway_settings_manager import GatewaySettingsManager
     from unifi_core.network.managers.hotspot_manager import HotspotManager
+    from unifi_core.network.managers.nat_manager import NatManager
     from unifi_core.network.managers.network_manager import NetworkManager
     from unifi_core.network.managers.oon_manager import OonManager
     from unifi_core.network.managers.qos_manager import QosManager
@@ -61,6 +75,7 @@ def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
     from unifi_core.network.managers.stats_manager import StatsManager
     from unifi_core.network.managers.switch_manager import SwitchManager
     from unifi_core.network.managers.system_manager import SystemManager
+    from unifi_core.network.managers.traffic_flow_manager import TrafficFlowManager
     from unifi_core.network.managers.traffic_route_manager import TrafficRouteManager
     from unifi_core.network.managers.usergroup_manager import UsergroupManager
     from unifi_core.network.managers.vpn_manager import VpnManager
@@ -77,10 +92,20 @@ def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
         # API token is configured for the controller, the auth is unset
         # internally and DpiManager returns None with a clear log line.
         "dpi_manager": lambda cm: DpiManager(cm, getattr(cm, "unifi_auth", None)),
+        "dynamic_dns_manager": lambda cm: DynamicDnsManager(cm),
         "event_manager": lambda cm: EventManager(cm),
-        "firewall_manager": lambda cm: FirewallManager(cm),
+        # FirewallManager uses both V2 session auth and the public Integration
+        # API. Pass the connection's UniFiAuth so zone CRUD and policy ordering
+        # can supply X-API-Key when an API token is configured.
+        "firewall_manager": lambda cm, *, traffic_route_manager=None: FirewallManager(
+            cm,
+            getattr(cm, "unifi_auth", None),
+            traffic_route_manager=traffic_route_manager,
+        ),
+        "gateway_settings_manager": lambda cm: GatewaySettingsManager(cm),
         "hotspot_manager": lambda cm: HotspotManager(cm),
         "network_manager": lambda cm: NetworkManager(cm),
+        "nat_manager": lambda cm: NatManager(cm),
         "oon_manager": lambda cm: OonManager(cm),
         "qos_manager": lambda cm: QosManager(cm),
         "routing_manager": lambda cm: RoutingManager(cm),
@@ -89,13 +114,18 @@ def _build_network_managers() -> dict[str, Callable[[Any], Any]]:
         "stats_manager": lambda cm: StatsManager(cm, ClientManager(cm)),
         "switch_manager": lambda cm: SwitchManager(cm),
         "system_manager": lambda cm: SystemManager(cm),
-        "traffic_route_manager": lambda cm: TrafficRouteManager(cm),
+        "traffic_flow_manager": lambda cm: TrafficFlowManager(
+            cm,
+            DpiManager(cm, getattr(cm, "unifi_auth", None)),
+        ),
+        "traffic_route_manager": lambda cm, *, network_manager=None: TrafficRouteManager(cm, network_manager),
         "usergroup_manager": lambda cm: UsergroupManager(cm),
         "vpn_manager": lambda cm: VpnManager(cm),
     }
 
 
-def _build_protect_managers() -> dict[str, Callable[[Any], Any]]:
+def _build_protect_managers() -> dict[str, Callable[..., Any]]:
+    from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
     from unifi_core.protect.managers.alarm_manager import AlarmManager
     from unifi_core.protect.managers.camera_manager import CameraManager
     from unifi_core.protect.managers.chime_manager import ChimeManager
@@ -109,6 +139,7 @@ def _build_protect_managers() -> dict[str, Callable[[Any], Any]]:
 
     return {
         "alarm_manager": lambda cm: AlarmManager(cm),
+        "alarm_facade": lambda cm: AlarmRulesFacade.from_connection(cm),
         "camera_manager": lambda cm: CameraManager(cm),
         "chime_manager": lambda cm: ChimeManager(cm),
         "event_manager": lambda cm: EventManager(cm),
@@ -121,7 +152,7 @@ def _build_protect_managers() -> dict[str, Callable[[Any], Any]]:
     }
 
 
-def _build_access_managers() -> dict[str, Callable[[Any], Any]]:
+def _build_access_managers() -> dict[str, Callable[..., Any]]:
     from unifi_core.access.managers.credential_manager import CredentialManager
     from unifi_core.access.managers.device_manager import DeviceManager
     from unifi_core.access.managers.door_manager import DoorManager
@@ -141,7 +172,7 @@ def _build_access_managers() -> dict[str, Callable[[Any], Any]]:
     }
 
 
-_PRODUCT_BUILDERS: dict[str, Callable[[], dict[str, Callable[[Any], Any]]]] = {
+_PRODUCT_BUILDERS: dict[str, Callable[[], dict[str, Callable[..., Any]]]] = {
     "network": _build_network_managers,
     "protect": _build_protect_managers,
     "access": _build_access_managers,
@@ -161,16 +192,168 @@ class ManagerFactory:
         self,
         sessionmaker: async_sessionmaker[AsyncSession],
         cipher: ColumnCipher,
+        *,
+        on_manager_discard: Callable[[Any], None] | None = None,
     ) -> None:
         self._sm = sessionmaker
         self._cipher = cipher
-        self._connection_cache: dict[tuple[str, str], Any] = {}
-        self._domain_cache: dict[tuple[str, str, str], Any] = {}
+        self._connection_cache: dict[tuple[str, str, str | None], Any] = {}
+        self._domain_cache: dict[tuple[str, str, str, str | None], Any] = {}
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._builder_cache: dict[str, dict[str, Callable[[Any], Any]]] = {}
+        self._builder_cache: dict[str, dict[str, Callable[..., Any]]] = {}
+        self._listener_tasks: dict[int, asyncio.Task[None]] = {}
+        self._on_manager_discard = on_manager_discard
 
-    async def get_connection_manager(self, session: AsyncSession, controller_id: str, product: str) -> Any:
-        key = (controller_id, product)
+    @staticmethod
+    def _site_scope(product: str, site: str | None) -> str | None:
+        """Return the cache scope for a product.
+
+        Only Network has a controller-side site namespace. Treat an omitted
+        Network site as ``default`` so existing non-site-specific control
+        paths keep their historical behavior without sharing an instance
+        with an explicitly selected site.
+        """
+        if product == "network":
+            return site or "default"
+        return None
+
+    @staticmethod
+    def _connection_key_for(domain_key: tuple[str, str, str, str | None]) -> tuple[str, str, str | None]:
+        """The connection-cache key the domain manager at ``domain_key`` was built on."""
+        controller_id, product, _attr_name, site_scope = domain_key
+        return (controller_id, product, site_scope)
+
+    async def _stop_domain_managers(self, managers: list[Any]) -> None:
+        """Stop any dropped domain manager that owns a background task.
+
+        The Network EventManager runs a reconnecting websocket task; left
+        running after its connection manager is discarded it would keep
+        logging in with the old credentials.
+        """
+
+        async def _stop_all() -> None:
+            deferred_cancellation: asyncio.CancelledError | None = None
+            for manager in managers:
+                if self._on_manager_discard is not None:
+                    self._on_manager_discard(manager)
+                task = self._listener_tasks.pop(id(manager), None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                stop = getattr(manager, "stop_listening", None)
+                if stop is None:
+                    continue
+                try:
+                    result = stop()
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError as exc:
+                    deferred_cancellation = deferred_cancellation or exc
+                except Exception as exc:
+                    logger.warning("Failed to stop %s listener: %s", type(manager).__name__, type(exc).__name__)
+            if deferred_cancellation is not None:
+                raise deferred_cancellation
+
+        await self._finish_cleanup_before_cancellation(_stop_all())
+
+    async def _start_listener(self, manager: Any) -> None:
+        try:
+            await manager.start_listening()
+        except Exception as exc:
+            logger.warning("Failed to start event listener: %s", type(exc).__name__)
+
+    @staticmethod
+    async def _close_connection_manager(cm: Any) -> None:
+        close = getattr(cm, "close", None) or getattr(cm, "aclose", None) or getattr(cm, "cleanup", None)
+        if close is None:
+            return
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+
+    @staticmethod
+    async def _finish_cleanup_before_cancellation(cleanup: Coroutine[Any, Any, None]) -> None:
+        """Let cleanup finish, then preserve cancellation of its caller."""
+        cleanup_task = asyncio.create_task(cleanup)
+        caller_cancellation: asyncio.CancelledError | None = None
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    caller_cancellation = caller_cancellation or exc
+                if cleanup_task.done():
+                    break
+
+        try:
+            cleanup_task.result()
+        except asyncio.CancelledError:
+            if caller_cancellation is not None:
+                raise caller_cancellation
+            raise
+        if caller_cancellation is not None:
+            raise caller_cancellation
+
+    async def _close_connection_managers(self, managers: list[Any], description: str) -> None:
+        """Close every removed connection before propagating cancellation."""
+
+        async def _close_all() -> None:
+            deferred_cancellation: asyncio.CancelledError | None = None
+            for cm in managers:
+                try:
+                    await self._close_connection_manager(cm)
+                except asyncio.CancelledError as exc:
+                    deferred_cancellation = deferred_cancellation or exc
+                except Exception as exc:
+                    logger.warning("Failed to close %s connection: %s", description, type(exc).__name__)
+            if deferred_cancellation is not None:
+                raise deferred_cancellation
+
+        await self._finish_cleanup_before_cancellation(_close_all())
+
+    @classmethod
+    async def _require_initialized(cls, cm: Any, product: str) -> Any:
+        try:
+            initialized = await cm.initialize()
+        except BaseException:
+            try:
+                await asyncio.shield(cls._close_connection_manager(cm))
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Failed to close %s connection after initialization error: %s",
+                    product,
+                    type(cleanup_error).__name__,
+                )
+            raise
+        if initialized is True:
+            return cm
+        # A fixed-text failure that keeps its category (auth, permission, timeout) and status.
+        failure = getattr(cm, "initialization_failure", None)
+        detail = getattr(cm, "last_connection_error", None)
+        try:
+            await cls._close_connection_manager(cm)
+        except Exception as cleanup_error:
+            logger.warning(
+                "Failed to close %s connection after unsuccessful initialization: %s",
+                product,
+                type(cleanup_error).__name__,
+            )
+        if isinstance(failure, ConnectionError):
+            raise failure
+        suffix = f": {detail}" if detail else ""
+        raise ConnectionError(f"Failed to initialize {product} controller connection{suffix}")
+
+    async def get_connection_manager(
+        self,
+        session: AsyncSession,
+        controller_id: str,
+        product: str,
+        *,
+        site: str | None = None,
+    ) -> Any:
+        site_scope = self._site_scope(product, site)
+        key = (controller_id, product, site_scope)
         cm = self._connection_cache.get(key)
         if cm is not None:
             return cm
@@ -178,11 +361,23 @@ class ManagerFactory:
             cm = self._connection_cache.get(key)
             if cm is not None:
                 return cm
-            cm = await self._construct_connection_manager(session, controller_id, product)
+            cm = await self._construct_connection_manager(
+                session,
+                controller_id,
+                product,
+                site=site_scope,
+            )
             self._connection_cache[key] = cm
             return cm
 
-    async def _construct_connection_manager(self, session: AsyncSession, controller_id: str, product: str) -> Any:
+    async def _construct_connection_manager(
+        self,
+        session: AsyncSession,
+        controller_id: str,
+        product: str,
+        *,
+        site: str | None = None,
+    ) -> Any:
         controller = await session.get(Controller, controller_id)
         if controller is None:
             raise ValueError(f"controller {controller_id} not found")
@@ -211,19 +406,15 @@ class ManagerFactory:
 
             cm: Any = NetCM(
                 host=host,
-                username=creds["username"],
-                password=creds["password"],
+                username=creds.get("username") or "",
+                password=creds.get("password") or "",
                 port=port,
+                site=site or "default",
                 verify_ssl=controller.verify_tls,
+                auth=UniFiAuth(api_key=creds.get("api_token") or None),
             )
-            # Stash a UniFiAuth carrying the controller's API token (if any)
-            # so managers that hit the official integration API (DPI today,
-            # potentially others later) can authenticate. None when the
-            # operator hasn't provided a token; consuming managers handle
-            # that case with a clear error rather than crashing.
-            cm.unifi_auth = UniFiAuth(api_key=creds.get("api_token") or None)
-            await cm.initialize()
-            return cm
+            # Negotiate the same independent auth routes as the MCP runtime.
+            return await self._require_initialized(cm, product)
         if product == "protect":
             from unifi_core.protect.managers.connection_manager import (
                 ProtectConnectionManager as ProtectCM,
@@ -237,8 +428,7 @@ class ManagerFactory:
                 verify_ssl=controller.verify_tls,
                 api_key=creds.get("api_token"),
             )
-            await cm.initialize()
-            return cm
+            return await self._require_initialized(cm, product)
         if product == "access":
             from unifi_core.access.managers.connection_manager import (
                 AccessConnectionManager as AccessCM,
@@ -252,11 +442,10 @@ class ManagerFactory:
                 verify_ssl=controller.verify_tls,
                 api_key=creds.get("api_token"),
             )
-            await cm.initialize()
-            return cm
+            return await self._require_initialized(cm, product)
         raise UnknownProduct(f"unknown product '{product}'")
 
-    def _builders_for(self, product: str) -> dict[str, Callable[[Any], Any]]:
+    def _builders_for(self, product: str) -> dict[str, Callable[..., Any]]:
         """Lazy-load (and cache) the per-product domain manager builder map."""
         cached = self._builder_cache.get(product)
         if cached is not None:
@@ -274,23 +463,27 @@ class ManagerFactory:
         controller_id: str,
         product: str,
         attr_name: str,
+        *,
+        site: str | None = None,
     ) -> Any:
         """Resolve a per-controller domain manager by its runtime attribute name.
 
         ``attr_name`` matches the singleton attribute used by the MCP runtime
         modules (e.g. ``client_manager`` from ``unifi_network_mcp.runtime``).
 
-        Cached on (controller_id, product, attr_name). Does NOT take the
-        per-controller lock here — get_connection_manager already serializes
-        the slow path (initialize()), and the rest of this function is a
-        synchronous builder call where a brief race on first-use produces
-        last-writer-wins on the cache, which is harmless because builders
-        are pure and share the cached connection manager.
+        Network managers are cached on
+        (controller_id, product, attr_name, site). Other products use a null
+        site scope. Does NOT take the per-controller lock here —
+        get_connection_manager already serializes the slow path
+        (initialize()), and the rest of this function is a synchronous builder
+        call. Recheck the domain cache after awaiting the connection so concurrent
+        first-use callers share one manager and one listener startup task.
 
         Acquiring the lock here would deadlock — it's non-reentrant and
         get_connection_manager acquires the same lock.
         """
-        key = (controller_id, product, attr_name)
+        site_scope = self._site_scope(product, site)
+        key = (controller_id, product, attr_name, site_scope)
         cached = self._domain_cache.get(key)
         if cached is not None:
             return cached
@@ -298,17 +491,89 @@ class ManagerFactory:
         builder = builders.get(attr_name)
         if builder is None:
             raise UnknownManager(f"product '{product}' has no domain manager named '{attr_name}'")
-        cm = await self.get_connection_manager(session, controller_id, product)
-        instance = builder(cm)
+        cm = await self.get_connection_manager(
+            session,
+            controller_id,
+            product,
+            site=site_scope,
+        )
+        # Another waiter may have populated the domain cache while connection
+        # initialization yielded. Reuse it before creating a background owner.
+        cached = self._domain_cache.get(key)
+        if cached is not None:
+            return cached
+        if product == "network" and attr_name == "firewall_manager":
+            # Legacy firewall route methods delegate to the guarded manager. Reuse
+            # the factory-cached instance so its network dependency and cache policy
+            # match all other route entry points for this controller/site.
+            traffic_route_manager = await self.get_domain_manager(
+                session,
+                controller_id,
+                product,
+                "traffic_route_manager",
+                site=site_scope,
+            )
+            # Awaiting the dependency yielded, so another caller may now own this
+            # manager. Preserve the single-instance factory contract.
+            cached = self._domain_cache.get(key)
+            if cached is not None:
+                return cached
+            instance = builder(cm, traffic_route_manager=traffic_route_manager)
+        elif product == "network" and attr_name == "traffic_route_manager":
+            network_manager = await self.get_domain_manager(
+                session,
+                controller_id,
+                product,
+                "network_manager",
+                site=site_scope,
+            )
+            cached = self._domain_cache.get(key)
+            if cached is not None:
+                return cached
+            instance = builder(cm, network_manager=network_manager)
+        else:
+            instance = builder(cm)
         self._domain_cache[key] = instance
+        if attr_name == "event_manager" and callable(getattr(instance, "start_listening", None)):
+            # Uncharged: a listener started while a bounded read runs must never draw on its budget.
+            self._listener_tasks[id(instance)] = create_uncharged_task(
+                self._start_listener(instance), name="api-event-listener"
+            )
         return instance
+
+    async def get_event_reader(
+        self,
+        session: AsyncSession,
+        controller_id: str,
+        product: str,
+        *,
+        site: str | None = None,
+    ) -> Any:
+        """An event manager for one bounded, one-shot read, never starting a listener.
+
+        Reuses the cached event manager when a route already built one (its
+        listener is already owned by the factory). Otherwise builds an uncached
+        instance on the cached connection: bounded evidence collection must not
+        leave a background websocket listener behind.
+        """
+        site_scope = self._site_scope(product, site)
+        key = (controller_id, product, "event_manager", site_scope)
+        cached = self._domain_cache.get(key)
+        if cached is not None:
+            return cached
+        builder = self._builders_for(product).get("event_manager")
+        if builder is None:
+            raise UnknownManager(f"product '{product}' has no domain manager named 'event_manager'")
+        cm = await self.get_connection_manager(session, controller_id, product, site=site_scope)
+        # A route may have built the cached manager while the connection initialized.
+        return self._domain_cache.get(key) or builder(cm)
 
     async def probe_controller(self, controller_id: str) -> dict:
         """Live connectivity probe across all products the controller advertises.
 
-        Invalidates any cached connection for the controller, then reconstructs
-        each product's ConnectionManager (which calls initialize() — the network
-        round-trip). Per-product latency + success/failure.
+        Constructs an isolated ConnectionManager for each product (including
+        initialize() and the network round-trip), then closes it without touching
+        cached production request sessions. Per-product latency + success/failure.
 
         Returns:
             {
@@ -323,9 +588,11 @@ class ManagerFactory:
             {"ok": False, "error_kind": "not_found", "products": {},
              "latency_ms": 0, "last_probed_at": iso8601}
 
-        This method does NOT cache the constructed connection. After the probe,
-        the controller's connection cache is empty. The next normal request
-        will reconstruct cleanly. This is intentional (probe = fresh handshake).
+        This method does NOT cache the constructed connection and leaves
+        healthy cached sessions untouched — a health probe must not interrupt
+        in-flight production requests. The one exception: cached connections
+        whose auth circuit latched are dropped after their product probes ok,
+        so production traffic recovers as soon as credentials work again.
         """
         async with self._sm() as session:
             controller = await session.get(Controller, controller_id)
@@ -339,17 +606,17 @@ class ManagerFactory:
                 }
             products = [p for p in controller.product_kinds.split(",") if p]
 
-        # Drop cached connections so we exercise the slow path.
-        await self.invalidate_controller(controller_id)
-
+        # Probes construct isolated managers and must not disrupt cached
+        # production request sessions.
         per_product: dict[str, dict] = {}
         total_latency = 0
         all_ok = True
         for product in products:
             start = time.perf_counter()
+            cm = None
             try:
                 async with self._sm() as session:
-                    await self._construct_connection_manager(session, controller_id, product)
+                    cm = await self._construct_connection_manager(session, controller_id, product)
                 latency = int((time.perf_counter() - start) * 1000)
                 per_product[product] = {"ok": True, "latency_ms": latency, "error": None}
                 total_latency += latency
@@ -358,6 +625,21 @@ class ManagerFactory:
                 per_product[product] = {"ok": False, "latency_ms": latency, "error": str(exc)}
                 total_latency += latency
                 all_ok = False
+            finally:
+                if cm is not None:
+                    try:
+                        await self._close_connection_manager(cm)
+                    except Exception as exc:
+                        logger.warning("Failed to close %s probe connection: %s", product, exc)
+                        previous = per_product.get(product, {})
+                        per_product[product] = {
+                            "ok": False,
+                            "latency_ms": previous.get("latency_ms", 0),
+                            "error": f"Probe cleanup failed: {exc}",
+                        }
+                        all_ok = False
+
+        await self._heal_blocked_connections(controller_id, per_product)
 
         return {
             "ok": all_ok,
@@ -367,19 +649,57 @@ class ManagerFactory:
             "last_probed_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    async def _heal_blocked_connections(self, controller_id: str, per_product: dict[str, dict]) -> None:
+        """Drop cached connections whose auth circuit latched once a probe proves auth works.
+
+        A successful isolated probe means credentials and reachability are good
+        again; keeping a cached connection that latched its reconnect block
+        would leave production requests failing until the block's cool-down
+        expires. Healthy cached connections are left untouched.
+        """
+        async with self._locks[controller_id]:
+            healable = [
+                key
+                for key, cached in self._connection_cache.items()
+                if key[0] == controller_id
+                and getattr(cached, "reconnect_blocked", False)
+                and per_product.get(key[1], {}).get("ok")
+            ]
+            if not healable:
+                return
+            # A controller id covers every product and site on one console, so
+            # sweeping by it alone would stop a healthy Protect listener to heal a
+            # blocked Network one. Sweep synchronously with the pops, same
+            # invariant as invalidate_controller.
+            healed = set(healable)
+            dropped = [
+                self._domain_cache.pop(k)
+                for k in [k for k in self._domain_cache if self._connection_key_for(k) in healed]
+            ]
+            removed = [self._connection_cache.pop(k) for k in healable]
+            try:
+                await self._stop_domain_managers(dropped)
+            finally:
+                await self._close_connection_managers(removed, "auth-blocked")
+            logger.info(
+                "Probe succeeded; dropping %d auth-blocked cached connection(s) for controller %s",
+                len(removed),
+                controller_id,
+            )
+
     async def invalidate_controller(self, controller_id: str) -> None:
         """Drop all cached managers for a controller and dispose their sessions."""
-        keys_conn = [k for k in self._connection_cache if k[0] == controller_id]
-        for k in keys_conn:
-            cm = self._connection_cache.pop(k)
-            close = getattr(cm, "close", None) or getattr(cm, "aclose", None)
-            if close is not None:
-                try:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception:
-                    pass
-        keys_domain = [k for k in self._domain_cache if k[0] == controller_id]
-        for k in keys_domain:
-            self._domain_cache.pop(k, None)
+        async with self._locks[controller_id]:
+            # Sweep both caches synchronously (no awaits between the sweeps) so
+            # the lock-free read paths can never observe a half-invalidated
+            # state: a domain-cache miss followed by a connection-cache hit on
+            # an entry still awaiting close would rebuild a domain manager
+            # around a disposed session and its pre-rotation credentials.
+            dropped = [self._domain_cache.pop(k) for k in [k for k in self._domain_cache if k[0] == controller_id]]
+            removed = [
+                self._connection_cache.pop(k) for k in [k for k in self._connection_cache if k[0] == controller_id]
+            ]
+            try:
+                await self._stop_domain_managers(dropped)
+            finally:
+                await self._close_connection_managers(removed, "invalidated controller")

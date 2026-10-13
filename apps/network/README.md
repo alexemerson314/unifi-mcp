@@ -5,7 +5,17 @@
   <img src="../../assets/hero-network.svg" alt="UniFi Network MCP Server" width="720">
 </p>
 
-MCP server exposing 169 UniFi Network Controller tools for LLMs, agents, and automation platforms. Query clients, devices, firewall rules, VLANs, VPNs, stats, and more — with safe-by-default permissions and preview-before-confirm for all mutations.
+MCP server exposing 210 UniFi Network Controller tools for AI assistants and
+other MCP-capable clients. Query clients, devices, firewall rules, VLANs, VPNs,
+Traffic Flows, stats, and more with safe-by-default permissions and
+preview-before-confirm for all mutations.
+
+Use this server when an existing AI assistant or other MCP-capable client needs
+UniFi Network tools. Software integrating over HTTP, including automation
+services, code-execution runtimes, and MCP adapters, should use
+[`unifi-api-server`](../api/) for REST and GraphQL reads, actions, and SSE
+events. The calling application must sandbox generated code and enforce its
+resource limits.
 
 ## Install
 
@@ -21,10 +31,12 @@ The plugin installs the MCP server, an agent skill for tool discovery, and a gui
 Then run the interactive setup to configure your controller connection:
 
 ```
-/unifi-network:setup
+/unifi-network:unifi-network-setup
 ```
 
-This walks you through entering your controller host, credentials, and permission preferences — then writes everything to `.claude/settings.local.json` so it persists across sessions. Restart Claude Code after setup to connect.
+This walks you through entering your controller host, credentials, and permission preferences. Credentials are given as a file or command provider, never typed into chat. Setup saves the result as the plugin's Claude Code options, which apply in every project; a password or API key entered as an option is stored in the system keychain. Start a new Claude Code session after setup to connect.
+
+Upgrading from a plugin version before 1.0.0, which kept settings in the project's `.claude/settings.local.json`? Follow the [plugin upgrade guide](../../docs/plugin-upgrade.md).
 
 ### Codex
 
@@ -34,7 +46,7 @@ Register the marketplace, then install `unifi-network` from Codex's `/plugins` U
 codex plugin marketplace add sirkirby/unifi-mcp
 ```
 
-After installing, ask Codex to use the UniFi Network setup skill. The setup flow registers the MCP server with `codex mcp add`, stores your controller environment values in Codex's MCP configuration, and prompts you to restart Codex.
+After installing, ask Codex to use the UniFi Network setup skill. Setup saves a version-pinned MCP server entry with your controller settings in Codex's `config.toml` and prompts you to restart Codex. After each plugin upgrade, re-run setup with `--refresh`.
 
 ### PyPI / Docker
 
@@ -53,6 +65,9 @@ cd unifi-mcp && uv sync
 
 ## Usage Examples
 
+For the approved breaking MAC argument rename in the next minor release, see the
+[MAC parameter migration guide](docs/mac-parameter-migration.md).
+
 Once connected, just ask your AI agent in natural language:
 
 > "Show me all clients on the Guest VLAN with their signal strength and data usage"
@@ -67,11 +82,45 @@ Once connected, just ask your AI agent in natural language:
 
 > "What changed on my network in the last 24 hours? Show me new clients and config changes."
 
+> "Show me the largest traffic flows from the last hour and summarize who talked to what."
+
 All mutations (firewall rules, device changes, client blocking) use a **preview-then-confirm** flow — you see exactly what will change before anything is applied.
+
+### V2 NAT rules
+
+`unifi_list_nat_rules` and `unifi_get_nat_rule` read V2 NAT rules. The create,
+update, delete, and toggle tools require Network session credentials and use
+V2 NAT rule IDs; port-forward and Integration API IDs are different. Public
+writes cover DNAT, SNAT, and MASQUERADE with IPv4, `tcp_udp` or `all`, and
+`NONE` or `ADDRESS_AND_PORT` filters. Creates default to `enabled=false`.
+Created rules are marked manual and non-predefined, and both values are checked
+on readback. Existing rules with missing or non-manual origin are not editable
+through these tools.
+SNAT rules with a translated `port` require `source_filter.port`; the controller
+validates port correspondence. Existing rules missing that source port must be
+corrected in the same update before they can be edited through these tools.
+Toggle takes an explicit `enabled` boolean, so repeating the same request is
+a no-op. IPv6, PPPoE, inverted/excluded matching, and other filter variants
+are not verified for public writes.
+Selector edits on a stored rule with an unverified type are refused, even when
+the same request changes its type to a verified one.
+
+The MCP update preview shows a fresh before/after merge. Confirmation reads
+fresh state again, sends at most one full replacement, then checks persistence;
+delete checks fresh absence. If the controller reply or readback is uncertain,
+list rules before retrying. A concurrent controller edit between fetch and PUT
+can be overwritten because V2 NAT has no conditional replacement. These checks
+prove stored configuration, not packet-level enforcement. Existing Core NAT
+methods retain their return shapes; controller mutation exceptions now carry
+safe fixed guidance instead of raw response text.
+
+For an approved packet test, use the [IPv4 DNS redirect recipe](../../plugins/unifi-network/skills/firewall-auditor/references/dns-redirect.md). It covers a single client and synthetic destination, including same-subnet return traffic and cleanup.
 
 ## Configure
 
-Set these environment variables (or create a `.env` file). If you used `/unifi-network:setup`, this is already done.
+Set these variables in the server's process environment. The plugin setup skill already does this for Codex and OpenClaw; in Claude Code the plugin maps its options onto these variables. The server does not automatically load `.env` or working-directory YAML files; load a trusted env file explicitly in your launcher (Docker `env_file:` is supported), or select custom YAML with an absolute `CONFIG_PATH`. See [configuration](docs/configuration.md) for migration examples.
+
+With no controller host configured, the server still starts in setup mode: it tells the client how to configure it, offers only the read-only `unifi_setup_status` tool, and makes no controller connections.
 
 ```bash
 # Server-specific variables (recommended)
@@ -79,13 +128,63 @@ UNIFI_NETWORK_HOST=192.168.1.1      # Controller IP or hostname
 UNIFI_NETWORK_USERNAME=admin         # Local admin username
 UNIFI_NETWORK_PASSWORD=your-password # Admin password
 # Optional:
-# UNIFI_NETWORK_API_KEY=             # UniFi API key (experimental — read-only, subset of tools)
+# UNIFI_NETWORK_API_KEY=             # UniFi API key (inventory and explicit Integration API tools)
 # UNIFI_NETWORK_PORT=443             # Controller HTTPS port
 # UNIFI_NETWORK_SITE=default         # UniFi site name
 # UNIFI_NETWORK_VERIFY_SSL=false     # SSL certificate verification
+# UNIFI_NETWORK_WEBSOCKET_ENABLED=true   # Real-time event listener feeding unifi_recent_events
+# UNIFI_NETWORK_EVENT_BUFFER_SIZE=100    # Positive ring buffer capacity; invalid values prevent startup
+# UNIFI_NETWORK_EVENT_BUFFER_TTL=300     # Positive lifetime in seconds; invalid values prevent startup
 ```
 
 **Fallback:** Existing `UNIFI_*` variables (e.g., `UNIFI_HOST`) continue to work. The server checks for `UNIFI_NETWORK_*` first and falls back to `UNIFI_*` if the server-specific variable is not set. For single-controller setups, the shared variables are all you need.
+
+### API-key inventory and session authentication
+
+Configure `UNIFI_NETWORK_API_KEY` without a username/password for device,
+active-client, network, and WLAN lists. The same tools select the available
+read path; no duplicate API-key tools are needed. When valid session credentials
+are also configured, the existing session path remains preferred.
+
+On controllers accepting API keys on legacy inventory endpoints, the usual IDs
+and fields are preserved. This was verified on Network 10.6.106 with a UniFi OS
+proxy; the minimum supported firmware is not established. Other controllers
+can use the public Integration inventory fallback when that API is available.
+Public inventory has narrower fields and network coverage (for example, WAN/VPN
+networks may be absent). Results identify `source_api=integration` and expose
+the public UUID as `integration_id`, never as a legacy resource ID. Do not pass
+these UUIDs to legacy details/update tools. Missing legacy fields are unknown.
+API GraphQL projections therefore allow null for unavailable enabled, wired,
+and guest flags; clients must handle those nulls.
+
+Historical clients (`include_offline=true`), full details, legacy mutations,
+and the Network websocket still require their supported legacy/session paths.
+API-key legacy transport is restricted to verified inventory GET requests;
+successful reads do not imply permission to write. Explicit Integration tools
+such as DPI lookup and firewall ordering retain their own API-key contracts
+(legacy zone-ID resolution also needs a session). Protect still requires session
+bootstrap, with an additional API key for public setters; Access retains its
+independent API-token and proxy-session paths. Discovery reports `local_only`,
+`api_key_only`, `either`, or `both`; these describe requirements, not proof that
+a configured credential has authenticated successfully.
+
+### MCP response size
+
+For tool results that already provide structured output, `adaptive` is the default response mode. It classifies each request by the canonical date-based `protocolVersion` advertised during MCP initialization, not by the client's product name or application version. Requests advertising MCP `2025-06-18` or later receive concise `content` plus the full result once in `structuredContent`; requests advertising an earlier revision (such as `2024-11-05` or `2025-03-26`), or whose revision metadata is missing or malformed, keep full compatibility JSON in `content`. Set `UNIFI_NETWORK_MCP_CONTENT_MODE` to `compat` to force the duplicated compatibility form, or to `compact` to force concise text plus full structured output outside a negotiated request. This server-specific variable overrides `UNIFI_MCP_CONTENT_MODE`; use `compat` for any client that consumes the full result only from `content`, regardless of its advertised revision.
+
+The lazy-loading meta-tools (`*_tool_index`, `*_execute`, `*_batch`, `*_batch_status`, and lazy-only `*_load_tools`) remain content-only; they are not the pre-`2025-06-18` protocol category described above. For structured inner results, `*_execute` and `*_batch_status` expose one normalized JSON payload in `content` rather than a nested transport pair; content-only execute results remain unchanged. Response modes do not convert these meta-tools to `structuredContent`.
+
+Network also bounds two large source responses by default: `unifi_get_dashboard` uses `summary=true`, and `unifi_list_rogue_aps` returns a summarized page of at most 100 records. Pass `summary=false` to request the full selected dashboard or rogue-AP data.
+
+### Sensitive response fields
+
+Network tools redact known secret-bearing fields by default before returning data to MCP clients. This includes WLAN passphrases, VPN key material, whole VPN config blobs, SNMP community strings, SNMPv3 passwords, and device-SSH credentials and the management key in raw/detail responses and mutation previews. Disable redaction for a trusted local administration process with `UNIFI_NETWORK_REDACT_SENSITIVE_FIELDS=false` or the global `UNIFI_REDACT_SENSITIVE_FIELDS=false` policy flag when raw values are required.
+
+Confirmed Network/WLAN and VPN-state writes are re-read from the controller and report exact `persisted_fields`, `unchanged_fields`, `dropped_fields`, and `coerced_fields`. Already-satisfied no-op fields appear under `unchanged_fields` and do not make a failed write partially successful. A response with `success: false` and `mutation_applied: true` means the controller accepted the mutation but did not persist it exactly; it may be a partial write, not a rollback. Inspect `partial_success` and `details_after_attempt` before retrying or applying a compensating change.
+
+`unifi_update_vpn_server_alternate_address` updates a WireGuard server's advertised address using `server_id`, a partial `update_data` object, and `confirm` (default `false`). The accepted fields are `alternate_address_enabled` (boolean) and `alternate_address` (hostname or IPv4 address, without a URI, port, or path). Enabling requires a valid address in the merged configuration. Disabling preserves the stored address unless you also supply a replacement. Null and unknown fields are rejected. Server reads expose these same names, with `null` for absent controller values.
+
+This operation requires Network session credentials and the `VPN_SERVERS` UPDATE policy gate. MCP previews show fresh before/after values; API action previews show only submitted arguments, with effective-state validation at execution. The confirmed update fetches the full record again, preserves unrelated fields, and verifies the requested fields after writing. Full-record PUTs can still race with concurrent edits. An uncertain transport or readback outcome returns `mutation_applied: null`; inspect the server before trying again. Previews and results contain only the two public alternate-address fields. Other VPN server types are outside this verified write scope.
 
 ## Run
 
@@ -213,9 +312,9 @@ Each device record now includes additional fields alongside the existing MAC, na
 
 - [Configuration](docs/configuration.md) — Full env var reference, YAML config, controller type detection
 - [Permissions](docs/permissions.md) — Permission system, category defaults, how to enable high-risk tools
-- [Tool Catalog](docs/tools.md) — All 169 tools organized by category
+- [Tool Catalog](docs/tools.md) — All 210 tools organized by category
 - [Transports](docs/transports.md) — stdio, Streamable HTTP, and SSE setup
-- [Troubleshooting](docs/troubleshooting.md) — Connection issues, SSL, missing tools
+- [Troubleshooting and support bundles](docs/troubleshooting.md) — Reviewed support evidence, connection issues, SSL, missing tools
 
 ## Development
 

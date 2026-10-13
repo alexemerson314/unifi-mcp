@@ -22,12 +22,17 @@ router = APIRouter()
 def _wlan_key(obj) -> tuple:
     """Sort by (0, id) — id-stable order, no time component."""
     raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
-    return (0, raw.get("_id") or raw.get("id") or "")
+    return (0, raw.get("_id") or raw.get("id") or raw.get("integration_id") or "")
+
+
+def _redact_sensitive(request: Request) -> bool:
+    return request.app.state.config.policy.response.redact_sensitive_fields
 
 
 @router.get(
     "/sites/{site_id}/wlans",
     response_model=Page[to_pydantic_model(Wlan)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/wlans"],
 )
@@ -48,10 +53,8 @@ async def list_wlans(
             controller.id,
             "network",
             "network_manager",
+            site=site_id,
         )
-        cm = await factory.get_connection_manager(session, controller.id, "network")
-        if cm.site != site_id:
-            await cm.set_site(site_id)
         all_wlans = await mgr.get_wlans()
 
     cursor_obj = None
@@ -69,7 +72,8 @@ async def list_wlans(
     )
 
     type_class = request.app.state.type_registry.lookup("network", "wlans")
-    items = [type_class.from_manager_output(w).to_dict() for w in page]
+    redact_sensitive = _redact_sensitive(request)
+    items = [type_class.from_manager_output(w, redact_sensitive=redact_sensitive).to_dict() for w in page]
     hint = type_class.render_hint("list")
 
     return {
@@ -82,6 +86,7 @@ async def list_wlans(
 @router.get(
     "/sites/{site_id}/wlans/{wlan_id}",
     response_model=Detail[to_pydantic_model(Wlan)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/wlans"],
 )
@@ -101,10 +106,8 @@ async def get_wlan(
                 controller.id,
                 "network",
                 "network_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             wlan = await mgr.get_wlan_details(wlan_id)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -112,7 +115,7 @@ async def get_wlan(
         raise HTTPException(status_code=404, detail="wlan not found")
 
     type_class = request.app.state.type_registry.lookup("network", "wlans/{id}")
-    data = type_class.from_manager_output(wlan).to_dict()
+    data = type_class.from_manager_output(wlan, redact_sensitive=_redact_sensitive(request)).to_dict()
     hint = type_class.render_hint("detail")
     return {
         "data": data,

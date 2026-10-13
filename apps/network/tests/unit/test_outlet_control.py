@@ -131,6 +131,14 @@ def mock_connection():
     conn.controller.devices.update = AsyncMock()
     conn.controller.devices.values = MagicMock(return_value=[])
     conn.ensure_connected = AsyncMock(return_value=True)
+
+    # ConnectionManager.refresh_handler() is how the managers refresh a
+    # handler collection now; delegate to the same ``update()`` these
+    # tests already stub so their setup keeps its meaning.
+    async def _refresh_handler(name, _c=conn):
+        return await getattr(_c.controller, name).update()
+
+    conn.refresh_handler = _refresh_handler
     return conn
 
 
@@ -271,6 +279,17 @@ class TestSetOutletState:
         result = await device_manager.set_outlet_state(pdu.mac, outlet_index=99, relay_state=True)
 
         assert result is None
+        mock_connection.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_outlet_without_controllable_relay(self, device_manager, mock_connection):
+        pdu = _make_pdu_device()
+        pdu.raw["outlet_table"][0]["has_relay"] = False
+        mock_connection.controller.devices.values.return_value = [pdu]
+
+        with pytest.raises(ValueError, match="does not have a controllable relay"):
+            await device_manager.set_outlet_state(pdu.mac, outlet_index=1, relay_state=False)
+
         mock_connection.request.assert_not_called()
 
     @pytest.mark.asyncio

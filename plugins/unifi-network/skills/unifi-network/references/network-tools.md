@@ -1,21 +1,25 @@
-# Network Server Tool Reference (174 tools)
+# Network Server Tool Reference (210 tools)
 
-Complete reference for `unifi_*` tools. All read tools are always available. Mutating tools require permissions (see main skill for details).
+Complete reference for `unifi_*` tools. All read tools are always available. Mutating tools require permissions (see main skill for details). Permission variables use the server's config keys (`CLIENT_GROUPS`, `FIREWALL_POLICIES`, `OON_POLICIES`), not the `permission_category` shorthand in `tools_manifest.json` (`client_group`, `firewall`, `oon_policy`); a denied tool's error names the exact variable to set.
 
 ## Table of Contents
 - [Meta-Tools](#meta-tools)
 - [Clients](#clients)
 - [Devices](#devices)
 - [Firewall](#firewall)
+- [Gateway Settings](#gateway-settings)
 - [Networks & WLANs](#networks--wlans)
 - [DNS Records](#dns-records)
 - [Port Forwarding](#port-forwarding)
+- [NAT Rules](#nat-rules)
 - [QoS / Traffic Shaping](#qos--traffic-shaping)
+- [Traffic Flows](#traffic-flows)
 - [Traffic Routes](#traffic-routes)
 - [VPN](#vpn)
 - [Routing](#routing)
 - [MAC ACL Rules](#mac-acl-rules)
 - [Events & Alarms](#events--alarms)
+- [Incident Evidence](#incident-evidence)
 - [Statistics](#statistics)
 - [Hotspot / Vouchers](#hotspot--vouchers)
 - [User Groups](#user-groups)
@@ -40,19 +44,20 @@ Always available, regardless of registration mode.
 ## Clients
 
 <!-- AUTO:tools:clients -->
-12 tools.
+13 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `unifi_get_client_details` | Read | Returns the full raw client object for one client by MAC address — includes all controller-reported fields: IP, hostname, connection stat... |
-| `unifi_list_blocked_clients` | Read | List clients/devices that are currently blocked from the network |
-| `unifi_list_clients` | Read | Returns connected clients with MAC, name, hostname, IP, connection type (wired/wireless), and for wireless clients: SSID, signal dBm, cha... |
-| `unifi_lookup_by_ip` | Read | Quick IP-to-hostname lookup. |
+| `unifi_get_client_details` | Read | Returns client data for one client by MAC address. |
+| `unifi_list_blocked_clients` | Read | Lists clients/devices currently blocked from the network. |
+| `unifi_list_clients` | Read | Returns connected clients with mac, name, hostname, ip, status (online/offline), connection type (wired/wireless), and for wireless clien... |
+| `unifi_lookup_by_ip` | Read | Quick IP-to-client lookup. |
 | `unifi_authorize_guest` | Mutate | Authorize a guest client to access the guest network by MAC address |
 | `unifi_block_client` | Mutate | Block a client/device from the network by MAC address |
 | `unifi_force_reconnect_client` | Mutate | Force a client to reconnect to the network (kick) by MAC address |
 | `unifi_forget_client` | Mutate | Remove/forget a client from the controller's known client history by MAC address. |
 | `unifi_rename_client` | Mutate | Rename a client/device in the Unifi Network controller by MAC address |
+| `unifi_set_client_fixed_ap` | Mutate | Enable or disable a wireless client's fixed access-point association. |
 | `unifi_set_client_ip_settings` | Mutate | Set fixed IP address and/or local DNS record for a client device. |
 | `unifi_unauthorize_guest` | Mutate | Revoke authorization for a guest client by MAC address |
 | `unifi_unblock_client` | Mutate | Unblock a previously blocked client/device by MAC address |
@@ -72,8 +77,8 @@ Always available, regardless of registration mode.
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `unifi_get_device_details` | Read | Returns the full raw device object for one device by MAC address — includes radio tables, port tables, system stats, WAN info, firmware d... |
-| `unifi_get_device_radio` | Read | Get radio configuration and live statistics for an access point. |
+| `unifi_get_device_details` | Read | Returns device data for one device by MAC address. |
+| `unifi_get_device_radio` | Read | Get radio configuration and live statistics for a device with radios (AP, or UDM/gateway with built-in WiFi). |
 | `unifi_get_pdu_outlets` | Read | Return per-outlet state for a UniFi Smart Power PDU (UP6 / USP-Strip). |
 | `unifi_get_rf_scan_results` | Read | Get RF spectrum scan results for an access point. |
 | `unifi_get_speedtest_status` | Read | Check the status of a running speedtest on the gateway. |
@@ -91,7 +96,7 @@ Always available, regardless of registration mode.
 | `unifi_toggle_device` | Mutate | Enable or disable a device without unadopting it. |
 | `unifi_trigger_rf_scan` | Mutate | Trigger an RF spectrum scan on an access point. |
 | `unifi_trigger_speedtest` | Mutate | Trigger a speedtest on the gateway device. |
-| `unifi_update_device_radio` | Mutate | Update radio settings for a specific band on an access point. |
+| `unifi_update_device_radio` | Mutate | Update radio settings for a specific band on a device with radios (AP, or UDM/gateway with built-in WiFi). |
 | `unifi_upgrade_device` | Mutate | Initiate a firmware upgrade for a device by MAC address (uses cached firmware by default) |
 <!-- /AUTO:tools:devices -->
 
@@ -105,22 +110,28 @@ Always available, regardless of registration mode.
 ## Firewall
 
 <!-- AUTO:tools:firewall -->
-12 tools.
+18 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `unifi_get_firewall_group_details` | Read | Get detailed configuration for a specific firewall group by ID. |
 | `unifi_get_firewall_policy_details` | Read | Get detailed configuration for a specific firewall policy by ID. |
+| `unifi_get_firewall_policy_ordering` | Read | Get user-defined firewall policy ordering for a source/destination firewall zone pair. |
 | `unifi_list_firewall_groups` | Read | List firewall groups (address and port groups) used as reusable objects in firewall policies. |
 | `unifi_list_firewall_policies` | Read | List firewall policies configured on the Unifi Network controller. |
 | `unifi_list_firewall_zones` | Read | List controller firewall zones (V2 API). |
+| `unifi_list_legacy_firewall_rules` | Read | List legacy pre-zone-based firewall rules from the UniFi controller. |
 | `unifi_create_firewall_group` | Mutate | Create a new firewall group (address or port group). |
 | `unifi_create_firewall_policy` | Mutate | Create a V2 zone-based firewall policy with schema validation. |
+| `unifi_create_firewall_zone` | Mutate | Create a new firewall zone. |
 | `unifi_delete_firewall_group` | Mutate | Delete a firewall group. |
 | `unifi_delete_firewall_policy` | Mutate | Delete a firewall policy by ID. |
+| `unifi_delete_firewall_zone` | Mutate | Delete a firewall zone by ID. |
+| `unifi_reorder_firewall_policies` | Mutate | Reorder user-defined firewall policies for a source/destination firewall zone pair. |
 | `unifi_toggle_firewall_policy` | Mutate | Enable or disable a specific firewall policy by ID. |
 | `unifi_update_firewall_group` | Mutate | Update an existing firewall group. |
 | `unifi_update_firewall_policy` | Mutate | Update specific fields of an existing V2 zone-based firewall policy by ID. |
+| `unifi_update_firewall_zone` | Mutate | Rename an existing firewall zone by ID. |
 <!-- /AUTO:tools:firewall -->
 
 **Tips:**
@@ -130,10 +141,29 @@ Always available, regardless of registration mode.
 
 ---
 
+## Gateway Settings
+
+Gateway-wide security / NAT / connection-tracking settings (the controller's `usg` singleton).
+
+<!-- AUTO:tools:gateway_settings -->
+2 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `unifi_get_gateway_settings` | Read | Get the gateway (USG) settings: security (GeoIP filtering, SYN cookies, ICMP redirects, DNS verification), NAT/UPnP (UPnP, NAT-PMP, MSS c... |
+| `unifi_update_gateway_settings` | Mutate | Update gateway (USG) settings. |
+<!-- /AUTO:tools:gateway_settings -->
+
+**Tips:**
+- `unifi_update_gateway_settings` is confirm-gated: call with `confirm=false` first to preview the change and any security/reachability warnings, then re-call with `confirm=true`.
+- Pass only the fields you want to change; current values (including the nested `dns_verification` object) are preserved via deep-merge.
+
+---
+
 ## Networks & WLANs
 
 <!-- AUTO:tools:network -->
-15 tools.
+16 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
@@ -141,12 +171,13 @@ Always available, regardless of registration mode.
 | `unifi_get_network_details` | Read | Get details for a specific network by ID. |
 | `unifi_get_wlan_details` | Read | Get details for a specific WLAN by ID. |
 | `unifi_list_ap_groups` | Read | List all AP groups configured on the controller. |
-| `unifi_list_networks` | Read | Returns all configured networks (LAN, WAN, VLAN-only) with name, purpose, IP subnet, VLAN ID, DHCP settings, and enabled state. |
-| `unifi_list_wlans` | Read | List all configured Wireless LANs (WLANs) on the Unifi Network controller. |
+| `unifi_list_networks` | Read | Returns configured networks (LAN, WAN, VLAN-only) with name, purpose, IP subnet, VLAN ID, DHCP settings, and enabled state. |
+| `unifi_list_wlans` | Read | List configured Wireless LANs (WLANs) on the Unifi Network controller. |
 | `unifi_create_ap_group` | Mutate | Create a new AP group to control which APs broadcast which SSIDs. |
 | `unifi_create_network` | Mutate | Create a new network (LAN/VLAN) with schema validation. |
 | `unifi_create_wlan` | Mutate | Create a new Wireless LAN (WLAN/SSID) with schema validation. |
 | `unifi_delete_ap_group` | Mutate | Delete an AP group by ID. |
+| `unifi_delete_network` | Mutate | Delete a LAN/VLAN network by ID. |
 | `unifi_delete_wlan` | Mutate | Delete a WLAN/SSID by ID. |
 | `unifi_toggle_wlan` | Mutate | Toggle a WLAN/SSID on or off. |
 | `unifi_update_ap_group` | Mutate | Update an existing AP group's configuration. |
@@ -179,17 +210,51 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 
 ---
 
-## Port Forwarding
+## Dynamic DNS
 
-<!-- AUTO:tools:port_forwards -->
+Manage the controller's native Dynamic DNS provider entries (Settings → Internet → Dynamic DNS).
+
+<!-- AUTO:tools:dynamic_dns -->
+5 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `unifi_get_dynamic_dns_entry_details` | Read | Get details for a specific Dynamic DNS entry by ID. |
+| `unifi_list_dynamic_dns` | Read | List all Dynamic DNS provider entries configured on the controller. |
+| `unifi_create_dynamic_dns` | Mutate | Create a new Dynamic DNS provider entry. |
+| `unifi_delete_dynamic_dns` | Mutate | Delete a Dynamic DNS entry. |
+| `unifi_update_dynamic_dns` | Mutate | Update an existing Dynamic DNS entry. |
+<!-- /AUTO:tools:dynamic_dns -->
+
+---
+
+## NAT Rules
+
+<!-- AUTO:tools:nat -->
 6 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `unifi_create_port_forward` | Read | Create a new port forwarding rule on your Unifi Network controller using schema validation. |
+| `unifi_get_nat_rule` | Read | Get a NAT rule from the V2 controller API. |
+| `unifi_list_nat_rules` | Read | List NAT rules from the V2 controller API. |
+| `unifi_create_nat_rule` | Mutate | Create an IPv4 V2 NAT rule (DNAT, SNAT or MASQUERADE) with verified readback; disabled by default. |
+| `unifi_delete_nat_rule` | Mutate | Delete a manual V2 NAT rule and verify its absence. |
+| `unifi_toggle_nat_rule` | Mutate | Set a manual V2 NAT rule's enabled state explicitly; setting its current state is a no-op. |
+| `unifi_update_nat_rule` | Mutate | Update a manual V2 NAT rule with verified fresh readback. |
+<!-- /AUTO:tools:nat -->
+
+## Port Forwarding
+
+<!-- AUTO:tools:port_forwards -->
+7 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
 | `unifi_get_port_forward` | Read | Get a specific port forwarding rule by ID from your Unifi Network controller. |
 | `unifi_list_port_forwards` | Read | List all port forwarding rules on your Unifi Network controller. |
+| `unifi_create_port_forward` | Mutate | Create a new port forwarding rule on your Unifi Network controller using schema validation. |
 | `unifi_create_simple_port_forward` | Mutate | Create a port forward using a simplified schema. |
+| `unifi_delete_port_forward` | Mutate | Delete a port forwarding rule by ID. |
 | `unifi_toggle_port_forward` | Mutate | Toggle a port forwarding rule on or off on your Unifi Network controller. |
 | `unifi_update_port_forward` | Mutate | Update specific fields of an existing port forwarding rule using schema validation. |
 <!-- /AUTO:tools:port_forwards -->
@@ -213,15 +278,29 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 
 ---
 
+## Traffic Flows
+
+<!-- AUTO:tools:traffic_flows -->
+2 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `unifi_get_traffic_flow_statistics` | Read | Aggregated UniFi Traffic Flows summary (Insights > Flows 'Flow Summary'). |
+| `unifi_get_traffic_flows` | Read | Query historical UniFi Traffic Flows (Insights > Flows). |
+<!-- /AUTO:tools:traffic_flows -->
+
+---
+
 ## Traffic Routes
 
 <!-- AUTO:tools:traffic_routes -->
-4 tools.
+5 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `unifi_get_traffic_route_details` | Read | Get detailed information for a specific traffic route by ID. |
 | `unifi_list_traffic_routes` | Read | List all traffic routes (policy-based routing rules) for the current site. |
+| `unifi_create_traffic_route` | Mutate | Create a narrowly scoped Traffic Route (policy-based route). |
 | `unifi_toggle_traffic_route` | Mutate | Toggle a traffic route on/off by ID. |
 | `unifi_update_traffic_route` | Mutate | Update a traffic route's settings. |
 <!-- /AUTO:tools:traffic_routes -->
@@ -231,7 +310,7 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 ## VPN
 
 <!-- AUTO:tools:vpn -->
-6 tools.
+8 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
@@ -239,8 +318,10 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 | `unifi_get_vpn_server_details` | Read | Get details for a specific VPN server by ID. |
 | `unifi_list_vpn_clients` | Read | List all configured VPN clients (Wireguard, OpenVPN, etc). |
 | `unifi_list_vpn_servers` | Read | List all configured VPN servers (Wireguard, OpenVPN, L2TP, etc). |
-| `unifi_update_vpn_client_state` | Read | Enable or disable a specific VPN client by ID. |
-| `unifi_update_vpn_server_state` | Read | Enable or disable a specific VPN server by ID. |
+| `unifi_delete_vpn_client` | Mutate | Delete a VPN client configuration by ID. |
+| `unifi_update_vpn_client_state` | Mutate | Enable or disable a specific VPN client by ID. |
+| `unifi_update_vpn_server_alternate_address` | Mutate | Update the advertised alternate hostname or IPv4 address for a WireGuard VPN server. |
+| `unifi_update_vpn_server_state` | Mutate | Enable or disable a specific VPN server by ID. |
 <!-- /AUTO:tools:vpn -->
 
 **Tips:**
@@ -287,12 +368,13 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 ## Content Filtering
 
 <!-- AUTO:tools:content_filtering -->
-4 tools.
+5 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `unifi_get_content_filter_details` | Read | Get detailed configuration for a specific content filtering profile by ID. |
 | `unifi_list_content_filters` | Read | List content filtering profiles. |
+| `unifi_create_content_filter` | Mutate | Create a content filtering profile with a non-empty blocked_categories list and exactly one non-empty client_macs or network_ids scope. |
 | `unifi_delete_content_filter` | Mutate | Delete a content filtering profile. |
 | `unifi_update_content_filter` | Mutate | Update an existing content filtering profile. |
 <!-- /AUTO:tools:content_filtering -->
@@ -406,7 +488,7 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 
 | Tool | Type | Description |
 |------|------|-------------|
-| `unifi_get_event_types` | Read | Get a list of known event type prefixes for filtering events. |
+| `unifi_get_event_types` | Read | Get recently observed exact event keys for filtering events. |
 | `unifi_list_alarms` | Read | Returns active alarms (security alerts, connectivity issues, firmware warnings). |
 | `unifi_list_events` | Read | Returns timestamped event log entries (client connects/disconnects, device state changes, firmware updates, config changes) sorted newest... |
 | `unifi_recent_events` | Read | Get recent events from the in-memory websocket buffer. |
@@ -418,6 +500,18 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 **Tips:**
 - Use `unifi_get_event_types` first to understand what event types are available for filtering
 - Events are the primary audit trail for network changes
+
+---
+
+## Incident Evidence
+
+<!-- AUTO:tools:incident_evidence -->
+1 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `unifi_get_incident_evidence` | Read | Collects bounded, read-only Network event evidence for one incident window. |
+<!-- /AUTO:tools:incident_evidence -->
 
 ---
 
@@ -434,7 +528,7 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 | `unifi_get_client_sessions` | Read | Get client session history. |
 | `unifi_get_client_stats` | Read | Get statistics for a specific client/device |
 | `unifi_get_client_wifi_details` | Read | Get detailed WiFi statistics for a single wireless client including signal, noise, satisfaction, tx/rx rates, retries, roam count, channe... |
-| `unifi_get_dashboard` | Read | Get the pre-aggregated site dashboard summary (health, device counts, client counts, ISP status). |
+| `unifi_get_dashboard` | Read | Get the pre-aggregated site dashboard. |
 | `unifi_get_device_stats` | Read | Returns historical traffic time-series (rx/tx bytes, client counts) for one device by MAC or _id. |
 | `unifi_get_dpi_stats` | Read | Get Deep Packet Inspection (DPI) statistics (applications and categories) |
 | `unifi_get_gateway_stats` | Read | Get gateway WAN/LAN performance history including bandwidth, CPU, and memory utilization. |
@@ -460,7 +554,7 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 | Tool | Type | Description |
 |------|------|-------------|
 | `unifi_get_voucher_details` | Read | Get detailed information about a specific voucher by its ID |
-| `unifi_list_vouchers` | Read | List all hotspot vouchers for the current site. |
+| `unifi_list_vouchers` | Read | List hotspot vouchers for the current site. |
 | `unifi_create_voucher` | Mutate | Create hotspot voucher(s) for guest network access. |
 | `unifi_revoke_voucher` | Mutate | Revoke/delete a hotspot voucher by its ID, preventing further use |
 <!-- /AUTO:tools:hotspot -->
@@ -489,20 +583,26 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 ## System
 
 <!-- AUTO:tools:system,config -->
-10 tools.
+16 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `unifi_get_autobackup_settings` | Read | Get auto-backup settings (enabled state, schedule, retention count, cloud backup). |
+| `unifi_get_mdns_settings` | Read | Get site-wide mDNS service settings and read-only network scope. |
+| `unifi_get_mgmt_settings` | Read | Get the site's device management (mgmt) settings, read-only: device SSH state and user name, password-auth flag, authorised-key count, wh... |
 | `unifi_get_network_health` | Read | Returns per-subsystem health status for WAN, LAN, WLAN, and VPN — each with status, number of gateways/switches/APs, and active user counts. |
-| `unifi_get_site_settings` | Read | Get current site settings (e.g., country code, timezone, connectivity monitoring). |
-| `unifi_get_snmp_settings` | Read | Get current SNMP settings for the site (enabled state, community string). |
+| `unifi_get_site_settings` | Read | Get current site settings: site identity, regulatory country code, timezone, connectivity monitor (enabled, uplink type) and NTP servers. |
+| `unifi_get_snmp_settings` | Read | Get current SNMP settings for the site: v1/v2c enabled state and community string, SNMPv3 enabled state and user name. |
 | `unifi_get_system_info` | Read | Returns controller version, uptime, hostname, memory/CPU usage, and update availability. |
+| `unifi_get_threat_management_settings` | Read | Get site-wide threat management (IDS/IPS) and traffic identification settings. |
+| `unifi_get_threat_posture` | Read | Get CyberSecure threat posture for HOUR, DAY, WEEK, or MONTH, including allowlisted gateway signature status. |
 | `unifi_list_backups` | Read | List available backups on the controller. |
 | `unifi_create_backup` | Mutate | Create a new backup of the controller configuration. |
 | `unifi_delete_backup` | Mutate | Delete a backup file from the controller. |
 | `unifi_update_autobackup_settings` | Mutate | Update auto-backup settings. |
-| `unifi_update_snmp_settings` | Mutate | Update SNMP settings for the site (enable/disable, set community string). |
+| `unifi_update_mdns_settings` | Mutate | Update site-wide mDNS service mode, predefined services, or custom services. |
+| `unifi_update_snmp_settings` | Mutate | Update SNMP settings for the site: v1/v2c (enabled, community) and SNMPv3 (enabled_v3, username, x_password). |
+| `unifi_update_threat_management_settings` | Mutate | Update site-wide IPS mode/category selection or traffic identification settings and verify persistence. |
 <!-- /AUTO:tools:system,config -->
 
 **Tips:**
@@ -515,30 +615,30 @@ Manage static DNS A/AAAA/CNAME/MX/TXT/NS/SRV records on the controller's local D
 
 ### "Who's eating all the bandwidth?"
 1. `unifi_get_top_clients` → find the top bandwidth consumers
-2. `unifi_get_client_details(mac="...")` → identify the device
+2. `unifi_get_client_details(mac_address="...")` → identify the device
 3. `unifi_get_dpi_stats` → see what application categories are using bandwidth
 
 ### "Client can't connect to WiFi"
 1. `unifi_list_clients` → see if client appears at all
-2. `unifi_lookup_by_ip(ip="...")` → quick lookup if IP is known
+2. `unifi_lookup_by_ip(ip_address="...")` → quick lookup if IP is known
 3. `unifi_list_blocked_clients` → check if it's been blocked
 4. `unifi_list_wlans` → verify SSID is active
 5. `unifi_list_events` → look for connection failure events
 
 ### "Set up a guest network"
 1. `unifi_list_networks` → see existing networks
-2. `unifi_create_network(name="Guest", vlan_id=100, ...)` → create VLAN
-3. `unifi_create_wlan(name="Guest WiFi", network_id="...", security="wpa2", ...)` → create SSID
+2. `unifi_create_network(network_data={"name": "Guest", "purpose": "vlan-only", "vlan": 100})` → create VLAN
+3. `unifi_create_wlan(wlan_data={"name": "Guest WiFi", "networkconf_id": "...", "security": "open"})` → create SSID
 4. `unifi_create_voucher(...)` → create access codes
 
 ### "Open a port for a game server"
-1. `unifi_lookup_by_ip(ip="192.168.1.50")` → confirm the server is on the network
-2. `unifi_create_simple_port_forward(name="Game Server", dst_port=25565, fwd_ip="192.168.1.50", ...)` → create rule
+1. `unifi_lookup_by_ip(ip_address="192.168.1.50")` → confirm the server is on the network
+2. `unifi_create_simple_port_forward(rule={"name": "Game Server", "ext_port": "25565", "to_ip": "192.168.1.50"})` → create rule
 3. `unifi_list_firewall_policies` → verify no firewall rule blocks it
 
 ### "Network health check"
 ```
-unifi_batch(tools=[
+unifi_batch(operations=[
     {"tool": "unifi_get_system_info"},
     {"tool": "unifi_get_network_health"},
     {"tool": "unifi_list_devices"},
@@ -548,6 +648,6 @@ unifi_batch(tools=[
 ```
 
 ### "What happened in the last hour?"
-1. `unifi_list_events(start="<1 hour ago ISO>")` → recent events
+1. `unifi_list_events(within_hours=1, start=0)` → recent events
 2. `unifi_list_alarms` → any active alarms
 3. `unifi_get_alerts` → system alerts

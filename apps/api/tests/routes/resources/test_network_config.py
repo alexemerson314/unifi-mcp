@@ -73,7 +73,7 @@ class _FakeCM:
 
 def _stub_connection(app, cid: str) -> _FakeCM:
     fake = _FakeCM()
-    app.state.manager_factory._connection_cache[(cid, "network")] = fake
+    app.state.manager_factory._connection_cache[(cid, "network", "default")] = fake
     return fake
 
 
@@ -374,7 +374,7 @@ async def test_get_dns_record_details_404(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_get_dns_record_details_unifi_not_found(tmp_path, monkeypatch) -> None:
-    """Manager refactor PR #172: get_dns_record raises UniFiNotFoundError."""
+    """Manager-owned existence check: get_dns_record raises UniFiNotFoundError."""
     monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
     app, key, cid = await _bootstrap(tmp_path)
     _stub_connection(app, cid)
@@ -555,3 +555,94 @@ async def test_get_ap_group_details_happy_path(tmp_path, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["render_hint"]["kind"] == "detail"
+
+
+# ---------- traffic flows ----------
+
+
+@pytest.mark.asyncio
+async def test_get_traffic_flows_happy_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    envelope = {
+        "flows": [
+            {
+                "id": "flow-1",
+                "action": "Allow",
+                "service": "HTTPS",
+                "source": {"name": "alpha", "ip": "10.0.0.5"},
+                "destination": {"ip": "203.0.113.1", "domains": ["example.com"]},
+            }
+        ],
+        "page_number": 0,
+        "total_element_count": 1,
+        "total_page_count": 1,
+        "has_next": False,
+        "or_more": False,
+    }
+
+    async def fake_get(self, query):
+        return envelope
+
+    from unifi_core.network.managers.traffic_flow_manager import TrafficFlowManager
+
+    monkeypatch.setattr(TrafficFlowManager, "get_traffic_flows", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.get(
+            f"/v1/sites/default/traffic-flows?controller={cid}&within_hours=24",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["render_hint"]["kind"] == "list"
+    assert len(body["items"]) == 1
+    assert body["items"][0]["id"] == "flow-1"
+    assert body["items"][0]["destination"]["domains"] == ["example.com"]
+    assert body["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_traffic_flows_next_cursor_and_window_guard(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await _bootstrap(tmp_path)
+    _stub_connection(app, cid)
+
+    envelope = {
+        "flows": [{"id": "flow-1"}],
+        "page_number": 0,
+        "total_element_count": 200,
+        "total_page_count": 2,
+        "has_next": True,
+        "or_more": True,
+    }
+
+    async def fake_get(self, query):
+        return envelope
+
+    from unifi_core.network.managers.traffic_flow_manager import TrafficFlowManager
+
+    monkeypatch.setattr(TrafficFlowManager, "get_traffic_flows", fake_get)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        # has_next -> an opaque next_cursor is returned
+        r = await c.get(
+            f"/v1/sites/default/traffic-flows?controller={cid}&page_size=1",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["next_cursor"] is not None
+        # time_from without time_to -> 400 from the window guard
+        r2 = await c.get(
+            f"/v1/sites/default/traffic-flows?controller={cid}&time_from=1000",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        # malformed cursor -> 400 (not an unhandled 500)
+        r3 = await c.get(
+            f"/v1/sites/default/traffic-flows?controller={cid}&cursor=!!!bad!!!",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    assert r2.status_code == 400, r2.text
+    assert r3.status_code == 400, r3.text

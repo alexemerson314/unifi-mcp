@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import pytest
+from unifi_core.redaction import REDACTED
 
 from tests.graphql.fixtures._helpers import bootstrap, graphql_query, stub_managers
 
@@ -49,9 +50,11 @@ async def test_protect_camera_detail(tmp_path, monkeypatch):
     stub_managers(
         monkeypatch,
         {
-            ("protect", "camera_manager", "list_cameras"): [
-                {"id": "cam1", "name": "Front Door", "model": "G4_PRO"},
-            ],
+            ("protect", "camera_manager", "get_camera"): {
+                "id": "cam1",
+                "name": "Front Door",
+                "model": "G4_PRO",
+            },
         },
     )
     body = await graphql_query(
@@ -107,8 +110,14 @@ async def test_protect_camera_streams(tmp_path, monkeypatch):
             ("protect", "camera_manager", "get_camera_streams"): {
                 "camera_id": "cam1",
                 "camera_name": "Front Door",
-                "channels": {},
-                "rtsps_streams": {},
+                "channels": {
+                    "high": {
+                        "rtsp_alias": "abc123",
+                        "rtsps_url": "rtsps://nvr.local/abc123",
+                        "rtsp_url": "rtsp://nvr.local/abc123",
+                    }
+                },
+                "rtsps_streams": {"high": "rtsps://nvr.local/abc123"},
             },
         },
     )
@@ -117,12 +126,55 @@ async def test_protect_camera_streams(tmp_path, monkeypatch):
         key,
         f'''{{
         protect {{ cameraStreams(controller: "{cid}", id: "cam1") {{
-            cameraId cameraName
+            cameraId cameraName channels rtspsStreams
         }} }}
     }}''',
     )
     assert body.get("errors") is None, body
-    assert body["data"]["protect"]["cameraStreams"]["cameraId"] == "cam1"
+    streams = body["data"]["protect"]["cameraStreams"]
+    assert streams["cameraId"] == "cam1"
+    assert streams["channels"]["high"]["rtsp_alias"] == REDACTED
+    assert streams["channels"]["high"]["rtsps_url"] == REDACTED
+    assert streams["channels"]["high"]["rtsp_url"] == REDACTED
+    assert streams["rtspsStreams"] == REDACTED
+
+
+@pytest.mark.asyncio
+async def test_protect_camera_streams_policy_disabled_returns_raw_urls(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNIFI_API_DB_KEY", "k")
+    app, key, cid = await bootstrap(tmp_path, product="protect", redact_sensitive_fields=False)
+    stub_managers(
+        monkeypatch,
+        {
+            ("protect", "camera_manager", "get_camera_streams"): {
+                "camera_id": "cam1",
+                "camera_name": "Front Door",
+                "channels": {
+                    "high": {
+                        "rtsp_alias": "abc123",
+                        "rtsps_url": "rtsps://nvr.local/abc123",
+                        "rtsp_url": "rtsp://nvr.local/abc123",
+                    }
+                },
+                "rtsps_streams": {"high": "rtsps://nvr.local/abc123"},
+            },
+        },
+    )
+    body = await graphql_query(
+        app,
+        key,
+        f'''{{
+        protect {{ cameraStreams(controller: "{cid}", id: "cam1") {{
+            channels rtspsStreams
+        }} }}
+    }}''',
+    )
+    assert body.get("errors") is None, body
+    streams = body["data"]["protect"]["cameraStreams"]
+    assert streams["channels"]["high"]["rtsp_alias"] == "abc123"
+    assert streams["channels"]["high"]["rtsps_url"] == "rtsps://nvr.local/abc123"
+    assert streams["channels"]["high"]["rtsp_url"] == "rtsp://nvr.local/abc123"
+    assert streams["rtspsStreams"]["high"] == "rtsps://nvr.local/abc123"
 
 
 @pytest.mark.asyncio

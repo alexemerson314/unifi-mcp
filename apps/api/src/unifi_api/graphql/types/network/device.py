@@ -18,11 +18,14 @@ exposes the same dict contract the REST routes return today.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
 from strawberry.types import Info
+from unifi_core.network.models.devices import normalize_radio_channel, normalize_radio_ht
+from unifi_core.redaction import redact_sensitive_fields
 
 if TYPE_CHECKING:
     from unifi_api.graphql.types.network.client import Client
@@ -50,6 +53,16 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _temperature(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        parsed = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 @strawberry.type(description="A UniFi network device (AP, switch, gateway).")
 class Device:
     mac: strawberry.ID | None
@@ -61,6 +74,21 @@ class Device:
     state: str | None
     ip: str | None
     ports: strawberry.scalars.JSON | None  # type: ignore[name-defined]
+
+    system_stats: strawberry.scalars.JSON | None = None  # type: ignore[name-defined]
+    general_temperature: float | None = None
+    temperatures: strawberry.scalars.JSON | None = None  # type: ignore[name-defined]
+    uptime_stats: strawberry.scalars.JSON | None = None  # type: ignore[name-defined]
+
+    source_api: str | None = None
+    integration_id: strawberry.ID | None = strawberry.field(
+        default=None,
+        description=(
+            "Public Integration inventory UUID, not a legacy resource ID. "
+            "These IDs are scoped to the Integration inventory tool family — "
+            "do not pass them to legacy resource tools."
+        ),
+    )
 
     # Context for relationship edges — NOT in SDL, NOT in to_dict().
     _controller_id: strawberry.Private[str | None] = None
@@ -76,23 +104,43 @@ class Device:
         }
 
     @classmethod
-    def from_manager_output(cls, obj: Any) -> "Device":
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "Device":
         raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
         state_raw = raw.get("state")
+        stats = raw.get("system-stats", raw.get("system_stats"))
+        temperatures = raw.get("temperatures")
+        uptime_stats = raw.get("uptime_stats")
         return cls(
+            source_api=raw.get("source_api"),
+            integration_id=raw.get("integration_id"),
             mac=raw.get("mac"),
             name=raw.get("name"),
             model=raw.get("model"),
             type=raw.get("type"),
             version=raw.get("version"),
             uptime=raw.get("uptime"),
-            state=_STATE_MAP.get(state_raw, state_raw),
+            state=raw.get("public_state")
+            if raw.get("source_api") == "integration"
+            else _STATE_MAP.get(state_raw, state_raw),
             ip=raw.get("ip"),
             ports=raw.get("port_table") or raw.get("ports"),
+            system_stats=redact_sensitive_fields(stats, redact_sensitive=redact_sensitive)
+            if isinstance(stats, dict)
+            else None,
+            general_temperature=_temperature(raw.get("general_temperature")),
+            temperatures=redact_sensitive_fields(temperatures, redact_sensitive=redact_sensitive)
+            if isinstance(temperatures, list)
+            else None,
+            uptime_stats=redact_sensitive_fields(uptime_stats, redact_sensitive=redact_sensitive)
+            if isinstance(uptime_stats, dict)
+            else None,
         )
 
     def to_dict(self) -> dict:
         out = asdict(self)
+        if self.source_api is None:
+            out.pop("source_api", None)
+            out.pop("integration_id", None)
         return {k: v for k, v in out.items() if not k.startswith("_") and not callable(v)}
 
     @strawberry.field(description="Clients currently connected through this AP/switch.")
@@ -104,7 +152,7 @@ class Device:
         from unifi_api.graphql.resolvers.network import _fetch_clients
         from unifi_api.graphql.types.network.client import Client
 
-        if not self._controller_id:
+        if not self._controller_id or not self.mac:
             return []
         site = self._site or "default"
         raw_clients = await _fetch_clients(info.context, self._controller_id, site)
@@ -123,12 +171,12 @@ class Device:
         return out
 
 
-@strawberry.type(description="Radio configuration entry on a UniFi access point.")
+@strawberry.type(description="Radio configuration entry on a UniFi device with radios.")
 class RadioEntry:
     name: str | None
     radio: str | None
     channel: int | None
-    ht: int | None
+    ht: str | None
     tx_power: int | None
     tx_power_mode: str | None
     current_channel: int | None
@@ -140,11 +188,11 @@ class RadioEntry:
         return cls(
             name=_get(r, "name"),
             radio=_get(r, "radio"),
-            channel=_get(r, "channel"),
-            ht=_get(r, "ht"),
+            channel=normalize_radio_channel(_get(r, "channel")),
+            ht=normalize_radio_ht(_get(r, "ht")),
             tx_power=_get(r, "tx_power"),
             tx_power_mode=_get(r, "tx_power_mode"),
-            current_channel=_get(r, "current_channel"),
+            current_channel=normalize_radio_channel(_get(r, "current_channel")),
             current_tx_power=_get(r, "current_tx_power"),
             num_sta=_get(r, "num_sta"),
         )
@@ -156,7 +204,7 @@ class RadioEntry:
 @strawberry.type(description="Wrapper dict containing the radio table for a device.")
 class DeviceRadio:
     """Wrapper-dict shape: manager returns ``{mac, name, model, radios: [...]}``
-    (or None for non-AP devices). Pass through with light field whitelisting on
+    (or None for devices without radios). Pass through with light field whitelisting on
     the radio entries.
 
     The per-radio mutable update fields (tx_power_mode, channel, ht, …) are

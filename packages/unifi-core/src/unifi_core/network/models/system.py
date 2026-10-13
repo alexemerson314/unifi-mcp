@@ -57,6 +57,18 @@ class SnmpSettings(BaseModel):
         default=None,
         description="SNMP community string (e.g., 'public')",
     )
+    enabled_v3: Optional[bool] = Field(
+        default=None,
+        description="Enable or disable SNMPv3 on the site (controller key enabledV3); independent of 'enabled'",
+    )
+    username: Optional[str] = Field(
+        default=None,
+        description="SNMPv3 user name",
+    )
+    x_password: Optional[str] = Field(
+        default=None,
+        description="SNMPv3 password (secret; redacted at egress)",
+    )
 
     # --- read-only context ---
     port: Optional[int] = Field(
@@ -112,6 +124,58 @@ class AutoBackupSettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MgmtSettings
+# ---------------------------------------------------------------------------
+
+
+class MgmtSettings(BaseModel):
+    """Read-only posture view of the ``mgmt`` site setting: the device-SSH management plane.
+
+    There is no writer for this record. Field names match the controller's
+    keys where the value is passed through (verified on Network 10.6.102).
+    The model is the allowlist: the four credentials the record carries
+    (``x_ssh_password`` in clear text, ``x_ssh_sha512passwd``, ``x_mgmt_key``,
+    ``x_api_token``) are not modelled at all and are reported only by the
+    ``*_set`` presence flags, so no redaction policy can hand out the device
+    root password, its hash or the adoption key. The authorised-key list is
+    reported by presence and count only; the key objects never leave the
+    converter.
+    """
+
+    x_ssh_enabled: Optional[bool] = Field(default=None, description="Whether SSH is enabled on adopted devices")
+    x_ssh_username: Optional[str] = Field(default=None, description="Device SSH user name")
+    x_ssh_auth_password_enabled: Optional[bool] = Field(
+        default=None, description="Whether password authentication is allowed for device SSH"
+    )
+    x_ssh_bind_wildcard: Optional[bool] = Field(default=None, description="Whether device SSH binds all interfaces")
+    ssh_keys_present: Optional[bool] = Field(
+        default=None,
+        description="Whether any authorised public keys are configured for device SSH (the keys are never returned)",
+    )
+    ssh_keys_count: Optional[int] = Field(
+        default=None, description="Number of authorised public keys configured for device SSH"
+    )
+    ssh_password_set: Optional[bool] = Field(
+        default=None, description="Whether a device SSH password is stored (the password is never returned)"
+    )
+    ssh_password_hash_set: Optional[bool] = Field(
+        default=None, description="Whether a device SSH password hash is stored (the hash is never returned)"
+    )
+    mgmt_key_set: Optional[bool] = Field(
+        default=None, description="Whether a management key is stored (the key is never returned)"
+    )
+    api_token_set: Optional[bool] = Field(
+        default=None, description="Whether a management API token is stored (the token is never returned)"
+    )
+    debug_tools_enabled: Optional[bool] = Field(default=None, description="Whether device debug tools are enabled")
+    auto_upgrade: Optional[bool] = Field(default=None, description="Whether device firmware is upgraded automatically")
+    auto_upgrade_hour: Optional[int] = Field(default=None, description="Hour of day (0-23) for automatic upgrades")
+    advanced_feature_enabled: Optional[bool] = Field(default=None, description="Advanced features enabled on the site")
+    unifi_idp_enabled: Optional[bool] = Field(default=None, description="UniFi Identity integration enabled")
+    wifiman_enabled: Optional[bool] = Field(default=None, description="WiFiman integration enabled")
+
+
+# ---------------------------------------------------------------------------
 # Field sets
 # ---------------------------------------------------------------------------
 
@@ -124,6 +188,10 @@ SNMPSETTINGS_READ_ONLY_FIELDS: frozenset[str] = frozenset(
     for name, field in SnmpSettings.model_fields.items()
     if (field.json_schema_extra or {}).get("mutable", True) is False
 )
+
+# MgmtSettings is a read-only posture view: no field is mutable.
+MGMTSETTINGS_MUTABLE_FIELDS: frozenset[str] = frozenset()
+MGMTSETTINGS_READ_ONLY_FIELDS: frozenset[str] = frozenset(MgmtSettings.model_fields)
 
 AUTOBACKUPSETTINGS_MUTABLE_FIELDS: frozenset[str] = frozenset(
     name
@@ -158,6 +226,17 @@ def _get(obj: Any, *keys: str, default: Any = None) -> Any:
     return default
 
 
+def _as_bool(value: Any) -> Optional[bool]:
+    """Coerce a controller flag to bool: bool, 0/1, or "true"/"false"; else ``None`` (absent)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public factory helpers — SnmpSettings
 # ---------------------------------------------------------------------------
@@ -167,24 +246,76 @@ def snmp_from_controller(raw: Any) -> SnmpSettings:
     """Build a SnmpSettings from a controller API response.
 
     The controller returns SNMP settings as a list; this unwraps the first element.
+
+    The community string is carried verbatim — redaction is a response-boundary
+    concern applied by the serving surface, not the domain model.
     """
     if isinstance(raw, list):
         raw = raw[0] if raw else {}
     return SnmpSettings(
         enabled=_get(raw, "enabled"),
         community=_get(raw, "community"),
+        enabled_v3=_get(raw, "enabledV3", "enabled_v3"),
+        username=_get(raw, "username"),
+        x_password=_get(raw, "x_password"),
         port=_get(raw, "port"),
         version=_get(raw, "version"),
     )
 
 
+# Model field -> controller key, where the spellings differ (reverse of wlans._CONTROLLER_ALIASES).
+_SNMP_CONTROLLER_ALIASES = {"enabled_v3": "enabledV3"}
+
+
 def snmp_to_controller_update(fields: Dict[str, Any]) -> Dict[str, Any]:
-    """Filter a partial dict to only SNMP mutable keys.
+    """Filter a partial dict to only SNMP mutable keys, in the controller's spelling.
 
     Read-only fields and unrecognised keys are dropped.
     ``None`` values are dropped; boolean ``False`` is preserved.
     """
-    return {k: v for k, v in fields.items() if k in SNMPSETTINGS_MUTABLE_FIELDS and v is not None}
+    return {
+        _SNMP_CONTROLLER_ALIASES.get(k, k): v
+        for k, v in fields.items()
+        if k in SNMPSETTINGS_MUTABLE_FIELDS and v is not None
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public factory helpers — MgmtSettings
+# ---------------------------------------------------------------------------
+
+# Presence flag -> the controller key it summarises. These keys are read for
+# their truthiness only and never copied into the model.
+_MGMT_STORED_SECRETS = {
+    "ssh_password_set": "x_ssh_password",
+    "ssh_password_hash_set": "x_ssh_sha512passwd",
+    "mgmt_key_set": "x_mgmt_key",
+    "api_token_set": "x_api_token",
+}
+
+
+def mgmt_from_controller(raw: Any) -> MgmtSettings:
+    """Build a MgmtSettings from a ``mgmt`` settings record (list or dict).
+
+    The model is the allowlist: only its fields leave here. Stored credentials
+    are reduced to presence booleans and the authorised-key list to a
+    presence flag plus a count.
+    """
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if not isinstance(raw, dict):
+        return MgmtSettings()
+    values: Dict[str, Any] = {name: raw.get(name) for name in MgmtSettings.model_fields}
+    for flag, secret_key in _MGMT_STORED_SECRETS.items():
+        values[flag] = bool(raw.get(secret_key))
+    keys = raw.get("x_ssh_keys")
+    if isinstance(keys, list):
+        values["ssh_keys_present"] = len(keys) > 0
+        values["ssh_keys_count"] = len(keys)
+    else:
+        values["ssh_keys_present"] = None
+        values["ssh_keys_count"] = None
+    return MgmtSettings(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +601,31 @@ class SiteSettings(BaseModel):
         description="Regulatory country code (numeric)",
         json_schema_extra={"mutable": False},
     )
+    timezone: Optional[str] = Field(
+        default=None,
+        description="Site timezone (IANA name, from the locale section)",
+        json_schema_extra={"mutable": False},
+    )
+    connectivity_enabled: Optional[bool] = Field(
+        default=None,
+        description="Whether the connectivity monitor is enabled",
+        json_schema_extra={"mutable": False},
+    )
+    connectivity_uplink_type: Optional[str] = Field(
+        default=None,
+        description="Connectivity monitor uplink type (e.g., 'gateway')",
+        json_schema_extra={"mutable": False},
+    )
+    ntp_servers: Optional[List[str]] = Field(
+        default=None,
+        description="Configured NTP servers, blank slots omitted",
+        json_schema_extra={"mutable": False},
+    )
+    ntp_setting_preference: Optional[str] = Field(
+        default=None,
+        description="NTP setting preference ('auto' or 'manual')",
+        json_schema_extra={"mutable": False},
+    )
 
 
 SITESETTINGS_MUTABLE_FIELDS: frozenset[str] = frozenset()
@@ -482,14 +638,25 @@ def site_settings_from_controller(raw: Any) -> SiteSettings:
     The system manager returns ``{"raw": [...], "sections": {key: dict}}``.
     Pull display fields from the sections that own them: ``super_identity``
     owns the site display name and the controller's persisted ``_id``;
-    ``country`` owns the regulatory code.
+    ``country`` the regulatory code; ``locale`` the timezone; ``connectivity``
+    the connectivity monitor; ``ntp`` the time servers. The model is the
+    allowlist: a section's other keys (the connectivity section carries a mesh
+    PSK) never reach the result.
     """
     if not isinstance(raw, dict):
         return SiteSettings()
 
     sections = raw.get("sections") if isinstance(raw.get("sections"), dict) else {}
-    identity = sections.get("super_identity", {}) if isinstance(sections.get("super_identity"), dict) else {}
-    country_section = sections.get("country", {}) if isinstance(sections.get("country"), dict) else {}
+
+    def section(key: str) -> Dict[str, Any]:
+        value = sections.get(key)
+        return value if isinstance(value, dict) else {}
+
+    identity = section("super_identity")
+    country_section = section("country")
+    locale = section("locale")
+    connectivity = section("connectivity")
+    ntp = section("ntp")
 
     site_id = _get(identity, "_id", "site_id") or _get(raw, "_id", "site_id")
     name = _get(identity, "name") or _get(raw, "name")
@@ -500,11 +667,19 @@ def site_settings_from_controller(raw: Any) -> SiteSettings:
     except (TypeError, ValueError):
         country = None
 
+    ntp_servers = [ntp.get(f"ntp_server_{i}") for i in range(1, 5)]
+    ntp_servers = [server for server in ntp_servers if isinstance(server, str) and server]
+
     return SiteSettings(
         site_id=site_id,
         name=name,
         role=role,
         country=country,
+        timezone=_get(locale, "timezone") or None,
+        connectivity_enabled=_as_bool(connectivity.get("enabled")),
+        connectivity_uplink_type=_get(connectivity, "uplink_type") or None,
+        ntp_servers=ntp_servers if ntp else None,
+        ntp_setting_preference=_get(ntp, "setting_preference") or None,
     )
 
 
@@ -514,9 +689,9 @@ def site_settings_from_controller(raw: Any) -> SiteSettings:
 
 
 class EventTypes(BaseModel):
-    """Wrapper for event-type prefix descriptors (read-only).
+    """Wrapper for exact event-key descriptors (read-only).
 
-    The catalog of event-type prefixes is unstructured (varies by firmware),
+    The catalog of observed event keys is unstructured (varies by firmware),
     so each descriptor passes through as a plain list exposed as JSON.
     """
 

@@ -15,6 +15,7 @@ from unifi_core.policy_gate import resolve_permission_mode
 
 from unifi_mcp_shared.metadata import tool_title_from_name
 from unifi_mcp_shared.output_schema import apply_unifi_tool_response_signature, get_unifi_tool_response_output_schema
+from unifi_mcp_shared.tool_index import normalize_tool_annotations
 
 
 def setup_permissioned_tool(
@@ -87,6 +88,8 @@ def create_permissioned_tool(
 
         # Default to local_only when auth is not specified (backward compatible)
         resolved_auth = auth_method if auth_method else "local_only"
+        if resolved_auth not in {"local_only", "api_key_only", "either", "both"}:
+            raise ValueError("Invalid tool authentication requirement")
 
         def decorator(func):
             """Inner decorator that always registers the tool with MCP."""
@@ -100,6 +103,7 @@ def create_permissioned_tool(
             d_kwargs["title"] = title
             input_schema = d_kwargs.pop("input_schema", None)
             output_schema = d_kwargs.pop("output_schema", None)
+            annotations = normalize_tool_annotations(d_kwargs.get("annotations"))
             if output_schema is None:
                 output_schema = get_unifi_tool_response_output_schema()
             if d_kwargs.get("structured_output") is None:
@@ -118,6 +122,7 @@ def create_permissioned_tool(
                     input_schema=input_schema,
                     output_schema=output_schema,
                     auth_method=resolved_auth,
+                    annotations=annotations,
                 )
                 wrapped = (
                     wrap_tool_fn(func, tool_name or getattr(func, "__name__", "<tool>"))
@@ -135,6 +140,7 @@ def create_permissioned_tool(
                 input_schema=input_schema,
                 output_schema=output_schema,
                 auth_method=resolved_auth,
+                annotations=annotations,
                 permission_category=category,
                 permission_action=action,
             )

@@ -5,7 +5,38 @@ description: How to manage UniFi Access door control — locks, credentials, vis
 
 # UniFi Access MCP Server
 
-You have access to a UniFi Access MCP server that lets you query and manage a UniFi Access controller. It provides 29 tools covering doors, locks, credentials, visitors, access policies, and events.
+## Dependencies
+
+Requires: access
+Optional: network
+
+Verify required tools through MCP discovery before collecting data; discovery alone
+does not prove controller connectivity or authorization. If a required server/tool
+is missing or a required read fails, stop and report it unavailable. Optional sources
+may be skipped only when the report visibly names the missing source and resulting
+coverage limits. Use the product setup skill for connection help; never request secrets.
+
+## Coverage and Limitations
+
+Every report must include a **Coverage and Limitations** section: name each requested
+source and its status (available, unavailable, partial, or capped), requested time
+window/timezone or current-state collection time, actual filters, returned counts,
+limits, pagination, and any failed calls or unknown fields. Counts describe retrieved
+records, not totals unless completeness is established. A successful empty query is
+an observation; a failed or missing source is unavailable, never an empty result.
+If a limit is reached, label the source capped unless further bounded reads establish
+coverage. If completeness cannot be established, label it partial. Do not claim
+complete coverage, all-clear, or overall health from unavailable, partial, or capped
+data; say “No concerning activity found in the retrieved records” when appropriate.
+
+Separate **Observations** (cite source/tool, record ID and timestamp when available),
+**Hypotheses** (correlations and alternative explanations), and **Identity** (only
+explicit source-backed credential/account attribution, with its limits). Timing,
+similar names, proximity, or absence of a matching event alone proves neither
+identity nor cause. A credential event identifies the recorded account, not who
+physically used it. Missing mappings or clock uncertainty limit correlations.
+
+You have access to a UniFi Access MCP server that lets you query and manage a UniFi Access controller. It provides 37 tools covering doors, locks, credentials, visitors, access policies, events, devices, and system health.
 
 ## Tool Discovery
 
@@ -45,6 +76,8 @@ Door lock/unlock operations are **physical real-world actions** — always previ
 
 All tools return: `{"success": true, "data": ...}`, `{"success": false, "error": "..."}`, or `{"success": true, "requires_confirmation": true, "preview": ...}`. Always check `success` first.
 
+**Redacted secrets:** Credential `token` and `pin_code` values come back as `***REDACTED***` by default in reads, lists, and create previews. Raw values are controlled by process policy (`UNIFI_ACCESS_REDACT_SENSITIVE_FIELDS=false` or global `UNIFI_REDACT_SENSITIVE_FIELDS=false`), not by tool arguments. Never echo `***REDACTED***` back into a create/update — it is rejected so the placeholder can't be stored as a real credential.
+
 ## Key Capabilities
 
 - **Door control:** `access_lock_door` / `access_unlock_door` — unlock relocks automatically after duration (default 2 seconds)
@@ -52,16 +85,16 @@ All tools return: `{"success": true, "data": ...}`, `{"success": false, "error":
 - **Historical events:** `access_list_events` with time/door/user filters. Topics: `admin` or `admin_activity`
 - **Activity summary:** `access_get_activity_summary` aggregates events over a time period — useful for security audits
 - **Credentials:** Create NFC (`{user_id, token}`), PIN (`{user_id, pin_code}`), or mobile (`{user_id}`) credentials
-- **Visitor passes:** Time-bounded with ISO 8601 start/end times, optional email/phone for notifications
+- **Visitor passes:** Developer API family with scoped UUIDs, ISO 8601 `valid_from`/`valid_until`, and optional contact/company metadata
 
 ## Dual Authentication
 
 Access has two independent auth paths:
 
-- **API key (port 12445)** — for read-only operations (listing doors, events, devices)
-- **Username + password (port 443)** — required for mutations (lock/unlock, credentials, visitors)
+- **API key (port 12445)** — official Developer API operations, including visitor list/get/create/delete
+- **Username + password (port 443)** — proxy-backed operations such as credentials and policies
 
-Either can work independently. For full functionality, configure both. If mutations fail with auth errors, the user needs username+password (API key alone is not enough for write operations).
+Either can work independently for its supported tools. For full functionality, configure both. Visitor auth failures require checking `UNIFI_ACCESS_API_KEY`; proxy-backed mutation failures require checking the local username/password.
 
 To configure, run `/unifi-access:unifi-access-setup` or set env vars manually:
 ```
@@ -81,4 +114,4 @@ Access readers are network clients — if a reader appears offline, the Network 
 
 ## Tool Reference
 
-For the complete list of all 29 tools organized by category with descriptions, tips, and common scenarios, read `references/access-tools.md`.
+For the complete list of all 37 tools organized by category with descriptions, tips, and common scenarios, read `references/access-tools.md`.

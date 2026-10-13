@@ -5,18 +5,50 @@ description = "Unifi Network MCP Server"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "unifi-mcp-shared>=0.5.0,<0.6",
-    # Network managers in unifi-core import aiounifi; pull it in via the
-    # [network] extra rather than declaring aiounifi here directly so
-    # there's one source of truth.
-    "unifi-core[network]>=0.3.2,<0.4",
-    "mcp[cli]>=1.26.0,<2",
-    "aiohttp>=3.14.3",
+    # Optional meta-tool registration and awaited eager filtering require Shared 0.6.27.
+    # The settings-file startup report and setup mode require Shared 0.6.28.
+    # Listing incident evidence directly in lazy mode requires Shared 0.6.31.
+    "unifi-mcp-shared>=0.6.31,<0.7",
+    # Network managers in unifi-core import aiounifi; the [network] extra
+    # declares the compatibility floor for library consumers. This deployable
+    # app also pins the auth client exactly so one MCP release always resolves
+    # to one tested login stack for uvx/pip users (which do not consume uv.lock).
+    # WAN delegation validation requires Core 0.4.30. Firewall-zone CRUD
+    # requires the dual-API bridge added in Core 0.4.32. WLAN schedule-window
+    # validation requires Core 0.4.34. Traffic-flow DPI name enrichment
+    # requires Core 0.4.36. Exact event-key filtering and discovery require
+    # Core 0.4.37; explicit zero event limits require Core 0.4.39. UTC device
+    # timestamps and expanded site settings require Core 0.4.43.
+    # Firewall index rejection and uncapped client lookup require Core 0.4.44.
+    # Shared firewall create-port validation requires Core 0.4.45.
+    # Firewall selector validation and update preparation require Core 0.4.48.
+    # Owned event listeners and controller-session cleanup require Core 0.4.49.
+    # Controller credential redaction requires Core 0.4.51.
+    # Key-backed inventory and authentication status require Core 0.4.53.
+    # WAN DNS, firewall-group contracts, and session event recovery require Core 0.4.55.
+    # Deferred-init event listener startup requires Core 0.4.67.
+    # Serving MCP before the controller connects (shared bounded connection
+    # attempt and not_connected_message) requires Core 0.4.70.
+    # Bounded incident evidence collection and its client view require Core 0.4.71.
+    "unifi-core[network]>=0.4.71,<0.5",
+    "aiounifi==95",
+    "mcp[cli]>=2.2.0,<3",
+    # Published wheels do not consume uv.lock; keep MCP transitive security
+    # floors explicit so upgrades cannot retain vulnerable installed versions.
+    "cryptography>=50.0.1",
+    "pydantic-settings>=2.14.2",
+    "PyJWT>=2.15.0",
+    "python-multipart>=0.0.31",
+    "anyio>=4.14.2",
+    "starlette>=1.7.0",
+    "click>=8.3.3",
+    "multidict>=6.9.1",
+    "aiohttp==3.14.3",
     "pyyaml>=6.0",
     "python-dotenv>=1.2.2",
     "omegaconf>=2.3.0",
     "jsonschema>=4.17.0",
-    "typing-extensions>=4.4.0",
+    "typing-extensions>=4.16.0",
 ]
 
 [tool.uv.sources]
@@ -56,9 +88,9 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.21.0",
     "pytest-xdist>=3.6.0",
-    "aioresponses>=0.7.0",
+    "aioresponses>=0.7.9",
     "pytest-cov>=4.0.0",
-    "ruff>=0.8.0",
+    "ruff>=0.16.6",
 ]
 
 [tool.rye]
@@ -66,9 +98,9 @@ managed = true
 dev-dependencies = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.21.0",
-    "aioresponses>=0.7.0",
+    "aioresponses>=0.7.9",
     "pytest-cov>=4.0.0",
-    "ruff>=0.8.0",
+    "ruff>=0.16.6",
 ]
 
 [project.scripts]

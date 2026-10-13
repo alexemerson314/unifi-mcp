@@ -18,6 +18,12 @@ if TYPE_CHECKING:
     from unifi_api.services.managers import ManagerFactory
 
 
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    """Mark a failed in-flight cache future as observed when it has no waiter."""
+    if not future.cancelled():
+        future.exception()
+
+
 class RequestCache:
     """Memoizes async fetches by key for the lifetime of one request.
 
@@ -33,15 +39,20 @@ class RequestCache:
         if key in self._values:
             return self._values[key]
         if key in self._inflight:
-            return await self._inflight[key]
+            return await asyncio.shield(self._inflight[key])
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
+        fut.add_done_callback(_consume_future_exception)
         self._inflight[key] = fut
         try:
             value = await fetch()
             self._values[key] = value
             fut.set_result(value)
             return value
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.cancel()
+            raise
         except Exception as exc:
             fut.set_exception(exc)
             raise
@@ -65,6 +76,7 @@ class GraphQLContext(BaseContext):
         api_key_id: str | None = None,
         api_key_scopes: str | None = None,
         api_key_prefix: str | None = None,
+        redact_sensitive_fields: bool = True,
     ) -> None:
         super().__init__()
         self.cache = cache if cache is not None else RequestCache()
@@ -73,3 +85,4 @@ class GraphQLContext(BaseContext):
         self.api_key_id = api_key_id
         self.api_key_scopes = api_key_scopes
         self.api_key_prefix = api_key_prefix
+        self.redact_sensitive_fields = redact_sensitive_fields

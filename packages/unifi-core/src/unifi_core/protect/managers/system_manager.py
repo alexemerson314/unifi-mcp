@@ -9,7 +9,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from uiprotect.exceptions import ClientError
+
+from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.protect.managers.connection_manager import ProtectConnectionManager
+from unifi_core.protect.models.system import to_viewer_public_update, viewer_public_update_to_agent
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +23,51 @@ class SystemManager:
 
     def __init__(self, connection_manager: ProtectConnectionManager) -> None:
         self._cm = connection_manager
+
+    @staticmethod
+    def _bootstrap_collection(bootstrap: Any, name: str) -> Dict[str, Any]:
+        """Return a Protect bootstrap device collection when present."""
+        return getattr(bootstrap, name, None) or {}
+
+    @staticmethod
+    def _get_public_value(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    @staticmethod
+    def _raise_public_api_error(operation: str, resource_type: str, resource_id: str, exc: Exception) -> None:
+        message = str(exc)
+        message_lower = message.lower()
+        if "404" in message or "not found" in message_lower:
+            raise UniFiNotFoundError(resource_type, resource_id) from exc
+        raise ValueError(
+            f"Failed to {operation} for {resource_type} {resource_id}: {message}. "
+            "Verify viewer_id with protect_list_viewers and liveview_id with protect_list_liveviews, "
+            "and ensure UNIFI_PROTECT_API_KEY or UNIFI_API_KEY has Protect public API access."
+        ) from exc
+
+    async def _get_public_viewer(self, viewer_id: str, operation: str) -> Any:
+        try:
+            return await self._cm.client.get_viewer_public(viewer_id)
+        except ClientError as exc:
+            self._raise_public_api_error(operation, "viewer", viewer_id, exc)
+
+    async def _validate_public_liveview(self, liveview_id: str) -> None:
+        try:
+            await self._cm.client.get_liveview_public(liveview_id)
+        except ClientError as exc:
+            self._raise_public_api_error("validate liveview assignment", "liveview", liveview_id, exc)
+
+    @classmethod
+    def _viewer_update_state(cls, viewer: Any, public_update: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        proposed = viewer_public_update_to_agent(public_update)
+        current: Dict[str, Any] = {}
+        if "name" in proposed:
+            current["name"] = cls._get_public_value(viewer, "name")
+        if "liveview_id" in proposed:
+            current["liveview_id"] = cls._get_public_value(viewer, "liveview_id")
+        return current, proposed
 
     # ------------------------------------------------------------------
     # Public methods
@@ -57,11 +106,11 @@ class SystemManager:
             "up_since": nvr.up_since.isoformat() if nvr.up_since else None,
             "is_updating": nvr.is_updating,
             "storage": storage_info,
-            "camera_count": len(bootstrap.cameras),
-            "light_count": len(bootstrap.lights),
-            "sensor_count": len(bootstrap.sensors),
-            "viewer_count": len(bootstrap.viewers),
-            "chime_count": len(bootstrap.chimes),
+            "camera_count": len(self._bootstrap_collection(bootstrap, "cameras")),
+            "light_count": len(self._bootstrap_collection(bootstrap, "lights")),
+            "sensor_count": len(self._bootstrap_collection(bootstrap, "sensors")),
+            "viewer_count": len(self._bootstrap_collection(bootstrap, "viewers")),
+            "chime_count": len(self._bootstrap_collection(bootstrap, "chimes")),
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -118,6 +167,57 @@ class SystemManager:
             )
         return viewers
 
+    async def update_viewer(self, viewer_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Return current and proposed viewer settings for preview."""
+        public_update = to_viewer_public_update(settings)
+        self._cm.require_public_api_key("update viewer")
+
+        viewer = await self._get_public_viewer(viewer_id, "preview viewer update")
+        liveview_id = public_update.get("liveview")
+        if liveview_id is not None:
+            await self._validate_public_liveview(str(liveview_id))
+
+        current_state, proposed_changes = self._viewer_update_state(viewer, public_update)
+        viewer_name = self._get_public_value(viewer, "name") or viewer_id
+
+        return {
+            "viewer_id": viewer_id,
+            "viewer_name": viewer_name,
+            "current_state": current_state,
+            "proposed_changes": proposed_changes,
+        }
+
+    async def apply_viewer_update(self, viewer_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply viewer settings through the Protect public API after confirmation."""
+        public_update = to_viewer_public_update(settings)
+        self._cm.require_public_api_key("update viewer")
+
+        viewer = await self._get_public_viewer(viewer_id, "validate viewer update")
+        liveview_id = public_update.get("liveview")
+        if liveview_id is not None:
+            await self._validate_public_liveview(str(liveview_id))
+
+        update_kwargs: Dict[str, Any] = {}
+        if "name" in public_update:
+            update_kwargs["name"] = public_update["name"]
+        if "liveview" in public_update:
+            update_kwargs["liveview"] = public_update["liveview"]
+
+        try:
+            updated = await self._cm.client.update_viewer_public(viewer_id, **update_kwargs)
+        except ClientError as exc:
+            self._raise_public_api_error("update viewer", "viewer", viewer_id, exc)
+
+        updated_state, _ = self._viewer_update_state(updated, public_update)
+        viewer_name = self._get_public_value(updated, "name") or self._get_public_value(viewer, "name") or viewer_id
+
+        return {
+            "viewer_id": viewer_id,
+            "viewer_name": viewer_name,
+            "applied": viewer_public_update_to_agent(public_update),
+            "updated_state": updated_state,
+        }
+
     async def get_firmware_status(self) -> Dict[str, Any]:
         """Return firmware update availability for NVR and all devices."""
         bootstrap = self._cm.client.bootstrap
@@ -127,13 +227,13 @@ class SystemManager:
 
         # Collect firmware info from each device category
         device_collections = {
-            "camera": bootstrap.cameras,
-            "light": bootstrap.lights,
-            "sensor": bootstrap.sensors,
-            "viewer": bootstrap.viewers,
-            "chime": bootstrap.chimes,
-            "bridge": bootstrap.bridges,
-            "doorlock": bootstrap.doorlocks,
+            "camera": self._bootstrap_collection(bootstrap, "cameras"),
+            "light": self._bootstrap_collection(bootstrap, "lights"),
+            "sensor": self._bootstrap_collection(bootstrap, "sensors"),
+            "viewer": self._bootstrap_collection(bootstrap, "viewers"),
+            "chime": self._bootstrap_collection(bootstrap, "chimes"),
+            "bridge": self._bootstrap_collection(bootstrap, "bridges"),
+            "doorlock": self._bootstrap_collection(bootstrap, "doorlocks"),
         }
 
         for category, collection in device_collections.items():

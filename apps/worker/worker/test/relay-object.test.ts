@@ -18,7 +18,7 @@ import type { ToolInfo, AggregatedResponse } from "../src/types";
 // ---------------------------------------------------------------------------
 
 import { handleMcpRequest, type RelayStub } from "../src/mcp-handler";
-import { toolInputSchema, toolServerOrigin } from "../src/tool-info";
+import { buildToolIndexResponse, toolInputSchema, toolServerOrigin } from "../src/tool-info";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -100,42 +100,7 @@ function createMockRelay(
       args: Record<string, unknown>,
     ): Promise<Record<string, unknown> | AggregatedResponse> {
       if (toolName === "unifi_tool_index") {
-        const allTools = getAggregatedTools();
-        const includeSchemas = Boolean(args.include_schemas);
-        let filtered = allTools.map((t) => {
-          const entry: Record<string, unknown> = {
-            name: t.name,
-            description: t.description,
-            locations: toolToLocations.get(t.name) || [],
-            annotations: t.annotations,
-          };
-          if (t.title) {
-            entry.title = t.title;
-          }
-          if (includeSchemas && t.inputSchema) {
-            entry.inputSchema = t.inputSchema;
-          }
-          return entry;
-        });
-        const category = args.category as string | undefined;
-        const search = args.search as string | undefined;
-        if (category) {
-          const cat = category.toLowerCase();
-          filtered = filtered.filter(
-            (t) =>
-              (t.name as string).toLowerCase().includes(cat) ||
-              (t.description as string).toLowerCase().includes(cat),
-          );
-        }
-        if (search) {
-          const term = search.toLowerCase();
-          filtered = filtered.filter(
-            (t) =>
-              (t.name as string).toLowerCase().includes(term) ||
-              (t.description as string).toLowerCase().includes(term),
-          );
-        }
-        return { success: true, data: { tools: filtered, total: filtered.length, multi_location: locationTools.size > 1 } };
+        return buildToolIndexResponse(locationTools, toolToLocations, args);
       }
       return { success: false, error: `Tool not found: ${toolName}` };
     },
@@ -463,6 +428,28 @@ describe("MCP handler with relay stub", () => {
     for (const tool of tools) {
       expect(tool.inputSchema).toBeDefined();
     }
+  });
+
+  it("unifi_tool_index name returns the exact tool and rejects combined filters", async () => {
+    const relay = createMockRelay(new Map([["loc-1", sampleTools()]]));
+    const call = async (args: Record<string, unknown>) => {
+      const response = await handleMcpRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "unifi_tool_index", arguments: args } },
+        relay,
+        "lazy",
+      );
+      const content = (response.result as Record<string, unknown>).content as Array<Record<string, unknown>>;
+      return JSON.parse(content[0].text as string);
+    };
+
+    const named = await call({ name: "list_clients", include_schemas: true });
+    expect(named.data.tools.map((tool: Record<string, unknown>) => tool.name)).toEqual(["list_clients"]);
+    expect(named.data.tools[0].inputSchema).toBeDefined();
+
+    expect((await call({ name: "List_Clients" })).data.tools).toEqual([]);
+
+    const conflict = await call({ name: "list_clients", category: "" });
+    expect(conflict).toEqual({ success: false, error: "Tool index name cannot be combined with category or search." });
   });
 
   it("unifi_tool_index category filter narrows results", async () => {

@@ -5,17 +5,76 @@ through empirical endpoint probing.
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 from aioresponses import CallbackResult, aioresponses
+from aiounifi.errors import (
+    AuthenticationRateLimitError,
+    Forbidden,
+    LoginRequired,
+    RequestError,
+    ResponseError,
+    Unauthorized,
+)
+from aiounifi.models.api import ApiRequest
+from yarl import URL
 
 from unifi_core.network.managers.connection_manager import (
     ConnectionManager,
     detect_unifi_os_proactively,
     detect_with_retry,
 )
+
+
+def _mock_url(base_url: str, path: str = "") -> URL:
+    """Mirror aiohttp/yarl URL normalization for aioresponses matching."""
+    return URL(f"{base_url}{path}")
+
+
+class _Aiohttp314CompatibleResponse(aiohttp.ClientResponse):
+    """Test shim until aioresponses supports aiohttp 3.14's stream_writer arg."""
+
+    def __init__(self, method, url, **kwargs):
+        kwargs.setdefault("stream_writer", MagicMock(output_size=0))
+        super().__init__(method, url, **kwargs)
+
+
+def _callback_result(**kwargs) -> CallbackResult:
+    kwargs.setdefault("response_class", _Aiohttp314CompatibleResponse)
+    return CallbackResult(**kwargs)
+
+
+def _mock_get(mock: aioresponses, base_url: str, path: str = "", **kwargs) -> None:
+    kwargs.setdefault("response_class", _Aiohttp314CompatibleResponse)
+    mock.get(_mock_url(base_url, path), **kwargs)
+
+
+def _mock_post(mock: aioresponses, base_url: str, path: str = "", **kwargs) -> None:
+    kwargs.setdefault("response_class", _Aiohttp314CompatibleResponse)
+    mock.post(_mock_url(base_url, path), **kwargs)
+
+
+class _FailingLoginController:
+    def __init__(self, config):
+        self.connectivity = MagicMock()
+        self.connectivity.is_unifi_os = False
+        self.connectivity.config = config
+
+    async def login(self):
+        raise RequestError("SSO MFA required but no totp_secret configured")
+
+
+class _PasswordLeakingLoginController:
+    def __init__(self, config):
+        self.connectivity = MagicMock()
+        self.connectivity.is_unifi_os = False
+        self.connectivity.config = config
+
+    async def login(self):
+        raise RequestError(f"login failed for {self.connectivity.config.password}")
 
 
 class TestPathDetection:
@@ -34,12 +93,14 @@ class TestPathDetection:
 
         Expected: detect_unifi_os_proactively() returns True
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
 
         with aioresponses() as mock:
             # Mock UniFi OS endpoint to succeed
-            mock.get(
-                f"{base_url}/proxy/network/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/proxy/network/api/self/sites",
                 status=200,
                 payload={"meta": {"rc": "ok"}, "data": []},
             )
@@ -61,15 +122,17 @@ class TestPathDetection:
 
         Expected: detect_unifi_os_proactively() returns False
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
 
         with aioresponses() as mock:
             # Mock UniFi OS endpoint to fail
-            mock.get(f"{base_url}/proxy/network/api/self/sites", status=404)
+            _mock_get(mock, base_url, "/proxy/network/api/self/sites", status=404)
 
             # Mock standard endpoint to succeed
-            mock.get(
-                f"{base_url}/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/api/self/sites",
                 status=200,
                 payload={"meta": {"rc": "ok"}, "data": []},
             )
@@ -89,13 +152,13 @@ class TestPathDetection:
 
         Expected: detect_unifi_os_proactively() returns None (fallback to aiounifi)
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
 
         with aioresponses() as mock:
             # Mock both endpoints to fail
-            mock.get(f"{base_url}/proxy/network/api/self/sites", status=404)
+            _mock_get(mock, base_url, "/proxy/network/api/self/sites", status=404)
 
-            mock.get(f"{base_url}/api/self/sites", status=404)
+            _mock_get(mock, base_url, "/api/self/sites", status=404)
 
             async with aiohttp.ClientSession() as session:
                 result = await detect_unifi_os_proactively(session=session, base_url=base_url, timeout=5)
@@ -113,18 +176,22 @@ class TestPathDetection:
 
         Expected: detect_unifi_os_proactively() returns False (prefers direct)
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
 
         with aioresponses() as mock:
             # Mock both endpoints to succeed
-            mock.get(
-                f"{base_url}/proxy/network/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/proxy/network/api/self/sites",
                 status=200,
                 payload={"meta": {"rc": "ok"}, "data": []},
             )
 
-            mock.get(
-                f"{base_url}/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/api/self/sites",
                 status=200,
                 payload={"meta": {"rc": "ok"}, "data": []},
             )
@@ -146,18 +213,22 @@ class TestPathDetection:
 
         Expected: detect_unifi_os_proactively() returns None
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
 
         with aioresponses() as mock:
             # Mock timeout on UniFi OS endpoint
-            mock.get(
-                f"{base_url}/proxy/network/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/proxy/network/api/self/sites",
                 exception=asyncio.TimeoutError("Request timeout"),
             )
 
             # Mock timeout on standard endpoint
-            mock.get(
-                f"{base_url}/api/self/sites",
+            _mock_get(
+                mock,
+                base_url,
+                "/api/self/sites",
                 exception=asyncio.TimeoutError("Request timeout"),
             )
 
@@ -184,7 +255,7 @@ class TestPathDetection:
         returns None (not an exception). Retries happen immediately without
         exponential backoff since no exception bubbles up to detect_with_retry.
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
         attempt_count = 0
 
         with aioresponses() as mock:
@@ -193,7 +264,7 @@ class TestPathDetection:
                 nonlocal attempt_count
                 attempt_count += 1
                 # Always return 404 for proxy endpoint
-                return CallbackResult(status=404)
+                return _callback_result(status=404)
 
             def standard_callback(url, **kwargs):
                 nonlocal attempt_count
@@ -202,15 +273,15 @@ class TestPathDetection:
                 current_attempt = attempt_count // 2
                 if current_attempt >= 3:
                     # Third attempt: standard succeeds
-                    return CallbackResult(
+                    return _callback_result(
                         status=200,
                         payload={"meta": {"rc": "ok"}, "data": []},
                     )
                 # First 2 attempts: return 404
-                return CallbackResult(status=404)
+                return _callback_result(status=404)
 
-            mock.get(f"{base_url}/proxy/network/api/self/sites", callback=proxy_callback, repeat=True)
-            mock.get(f"{base_url}/api/self/sites", callback=standard_callback, repeat=True)
+            _mock_get(mock, base_url, "/proxy/network/api/self/sites", callback=proxy_callback, repeat=True)
+            _mock_get(mock, base_url, "/api/self/sites", callback=standard_callback, repeat=True)
 
             async with aiohttp.ClientSession() as session:
                 result = await detect_with_retry(session, base_url, max_retries=3, timeout=5)
@@ -238,7 +309,7 @@ class TestPathDetection:
         Note: Exponential backoff only triggers on exceptions. When detection
         returns None (no exception), retries happen without delay.
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
         call_count = 0
 
         def error_callback(url, **kwargs):
@@ -249,8 +320,8 @@ class TestPathDetection:
 
         with aioresponses() as mock:
             # Both endpoints always raise errors
-            mock.get(f"{base_url}/proxy/network/api/self/sites", callback=error_callback, repeat=True)
-            mock.get(f"{base_url}/api/self/sites", callback=error_callback, repeat=True)
+            _mock_get(mock, base_url, "/proxy/network/api/self/sites", callback=error_callback, repeat=True)
+            _mock_get(mock, base_url, "/api/self/sites", callback=error_callback, repeat=True)
 
             async with aiohttp.ClientSession() as session:
                 with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -282,7 +353,7 @@ class TestPathDetection:
 
         Note: Uses HTTP-level mocking for reliability across environments.
         """
-        base_url = "https://192.168.1.1:443"
+        base_url = "https://192.0.2.1:443"
         pre_login_probe_count = 0
         post_login_probe_count = 0
 
@@ -291,14 +362,14 @@ class TestPathDetection:
             nonlocal pre_login_probe_count
             pre_login_probe_count += 1
             # Return 200 to indicate UniFi OS
-            return CallbackResult(status=200, body="<html>UniFi OS</html>")
+            return _callback_result(status=200, body="<html>UniFi OS</html>")
 
         def post_login_proxy_callback(url, **kwargs):
             """Track post-login proxy endpoint probes."""
             nonlocal post_login_probe_count
             post_login_probe_count += 1
             # Return success for proxy endpoint (UniFi OS)
-            return CallbackResult(
+            return _callback_result(
                 status=200,
                 payload={"meta": {"rc": "ok"}, "data": []},
             )
@@ -308,11 +379,11 @@ class TestPathDetection:
             nonlocal post_login_probe_count
             post_login_probe_count += 1
             # Return 404 for standard endpoint
-            return CallbackResult(status=404)
+            return _callback_result(status=404)
 
         # Create connection manager
         manager = ConnectionManager(
-            host="192.168.1.1",
+            host="192.0.2.1",
             username="test_user",
             password="test_pass",
             port=443,
@@ -330,19 +401,21 @@ class TestPathDetection:
 
         with aioresponses() as mock:
             # Pre-login detection endpoint (base URL)
-            mock.get(base_url, callback=pre_login_callback, repeat=True)
+            _mock_get(mock, base_url, callback=pre_login_callback, repeat=True)
             # Post-login detection endpoints
-            mock.get(f"{base_url}/proxy/network/api/self/sites", callback=post_login_proxy_callback, repeat=True)
-            mock.get(f"{base_url}/api/self/sites", callback=post_login_standard_callback, repeat=True)
-            # Mock login endpoint (UniFi OS uses /api/auth/login)
-            # Need both with and without explicit port for URL normalization
-            mock.post(
-                f"{base_url}/api/auth/login",
-                payload={"unique_id": "test", "first_name": "Test", "last_name": "User"},
+            _mock_get(
+                mock,
+                base_url,
+                "/proxy/network/api/self/sites",
+                callback=post_login_proxy_callback,
                 repeat=True,
             )
-            mock.post(
-                "https://192.168.1.1/api/auth/login",
+            _mock_get(mock, base_url, "/api/self/sites", callback=post_login_standard_callback, repeat=True)
+            # Mock login endpoint (UniFi OS uses /api/auth/login)
+            _mock_post(
+                mock,
+                base_url,
+                "/api/auth/login",
                 payload={"unique_id": "test", "first_name": "Test", "last_name": "User"},
                 repeat=True,
             )
@@ -375,4 +448,367 @@ class TestPathDetection:
                     assert manager._unifi_os_override is True, "Cached result should be preserved"
 
         # Cleanup
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_request_includes_safe_initialize_guidance_after_auth_failure(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret", max_retries=1)
+
+        with patch("unifi_core.network.managers.connection_manager.Controller", _FailingLoginController):
+            with patch("unifi_core.network.controller_type.resolve_controller_type", return_value="direct"):
+                initialized = await manager.initialize()
+                assert initialized is False
+
+                with pytest.raises(ConnectionError) as exc_info:
+                    await manager.request(ApiRequest(method="get", path="/stat/sysinfo"))
+
+        assert "Not connected to controller" in str(exc_info.value)
+        assert "RequestError" in str(exc_info.value)
+        assert "MFA/TOTP configuration" in str(exc_info.value)
+        assert "SSO MFA required but no totp_secret configured" not in str(exc_info.value)
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            AuthenticationRateLimitError("429: You've reached the login attempt limit"),
+            ResponseError("Call https://controller/api/auth/login received 429: rate limited"),
+            Unauthorized("api.err.Invalid"),
+        ],
+    )
+    async def test_terminal_auth_failure_blocks_automatic_reconnects(self, error):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret", max_retries=3)
+        manager._cache["networks_default"] = [{"_id": "stale"}]
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.is_unifi_os = False
+        controller.login = AsyncMock(side_effect=error)
+
+        with patch("unifi_core.network.managers.connection_manager.Controller", return_value=controller) as factory:
+            with patch("unifi_core.network.controller_type.resolve_controller_type", return_value="direct"):
+                assert await manager.initialize() is False
+                assert await manager.initialize() is False
+
+        factory.assert_called_once()
+        controller.login.assert_awaited_once()
+        assert type(error).__name__ in manager.last_connection_error
+        assert str(error) not in manager.last_connection_error
+        assert manager._cache == {}
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_each_retry_is_reported_as_in_progress_while_active(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret", max_retries=2, retry_delay=0)
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.is_unifi_os = False
+        attempts = 0
+
+        async def login():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise aiohttp.ClientConnectionError("temporary connection failure")
+            assert manager.support_status()["last_attempt"]["status"] == "in_progress"
+
+        controller.login = login
+
+        with patch("unifi_core.network.managers.connection_manager.Controller", return_value=controller):
+            with patch("unifi_core.network.controller_type.resolve_controller_type", return_value="direct"):
+                assert await manager.initialize() is True
+
+        assert attempts == 2
+        assert manager.support_status()["last_attempt"]["status"] == "succeeded"
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_auth_circuit_half_opens_after_cooldown_and_success_resets(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret", max_retries=1)
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.is_unifi_os = False
+        rate_limited = AuthenticationRateLimitError("429: login attempt limit")
+        controller.login = AsyncMock(side_effect=[rate_limited, None])
+
+        with patch("unifi_core.network.managers.connection_manager.Controller", return_value=controller):
+            with patch("unifi_core.network.controller_type.resolve_controller_type", return_value="direct"):
+                with patch(
+                    "unifi_core.network.managers.connection_manager.detect_unifi_os_pre_login", return_value=False
+                ):
+                    assert await manager.initialize() is False
+                    assert manager.reconnect_blocked is True
+                    # Within the cool-down: no second login attempt.
+                    assert await manager.initialize() is False
+                    controller.login.assert_awaited_once()
+
+                    # After the cool-down expires the circuit half-opens and a
+                    # successful login clears the block entirely.
+                    manager._reconnect_block_until = 0.0
+                    assert await manager.initialize() is True
+
+        assert manager.reconnect_blocked is False
+        assert manager._reconnect_block_count == 0
+        assert controller.login.await_count == 2
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_auth_circuit_relatch_escalates_cooldown(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret", max_retries=1)
+        first = manager._block_automatic_reconnect(AuthenticationRateLimitError("429"))
+        first_deadline = manager._reconnect_block_until
+        manager._reconnect_block_until = 0.0
+        second = manager._block_automatic_reconnect(AuthenticationRateLimitError("429"))
+
+        assert first == second
+        assert "AuthenticationRateLimitError" in first
+        assert manager._reconnect_block_count == 2
+        # The second cool-down is double the first (base*2), measured from now.
+        assert manager._reconnect_block_until > first_deadline
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_expired_session_explicitly_reauthenticates_and_retries_request(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        controller.login = AsyncMock()
+        controller.request = AsyncMock(
+            side_effect=[
+                LoginRequired("expired"),
+                {"meta": {"rc": "ok"}, "data": [{"id": "site-1"}]},
+            ]
+        )
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        result = await manager.request(ApiRequest(method="get", path="/stat/sysinfo"))
+
+        assert result == [{"id": "site-1"}]
+        controller.login.assert_awaited_once()
+        assert controller.request.await_count == 2
+        assert manager._auth_generation == 2
+        assert controller.connectivity.can_retry_login is False
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_expired_requests_share_one_reauthentication(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+
+        async def login() -> None:
+            await asyncio.sleep(0.01)
+
+        controller.login = AsyncMock(side_effect=login)
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        results = await asyncio.gather(manager._reauthenticate(1), manager._reauthenticate(1))
+
+        assert results == [True, True]
+        controller.login.assert_awaited_once()
+        assert manager._auth_generation == 2
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_waits_for_inflight_reauthentication(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        login_started = asyncio.Event()
+        release_login = asyncio.Event()
+
+        async def login() -> None:
+            login_started.set()
+            await release_login.wait()
+
+        controller.login = AsyncMock(side_effect=login)
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        reauthenticate = asyncio.create_task(manager._reauthenticate(1))
+        await login_started.wait()
+        cleanup = asyncio.create_task(manager.cleanup())
+        await asyncio.sleep(0)
+
+        assert cleanup.done() is False
+        assert manager.controller is controller
+
+        release_login.set()
+        assert await reauthenticate is True
+        await cleanup
+
+        assert manager.controller is None
+        assert manager._aiohttp_session is None
+        session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_expired_requests_through_request_share_one_login(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        controller.connectivity.can_retry_login = False
+        authenticated = False
+
+        async def login() -> None:
+            nonlocal authenticated
+            await asyncio.sleep(0.01)
+            authenticated = True
+
+        async def request(_api_request):
+            if not authenticated:
+                raise LoginRequired("expired")
+            return {"meta": {"rc": "ok"}, "data": [{"id": "site-1"}]}
+
+        controller.login = AsyncMock(side_effect=login)
+        controller.request = AsyncMock(side_effect=request)
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        results = await asyncio.gather(
+            manager.request(ApiRequest(method="get", path="/stat/sysinfo")),
+            manager.request(ApiRequest(method="get", path="/stat/sysinfo")),
+        )
+
+        assert results == [[{"id": "site-1"}], [{"id": "site-1"}]]
+        controller.login.assert_awaited_once()
+        assert manager._auth_generation == 2
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_persistent_login_required_after_reauthentication_opens_auth_circuit(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        controller.request = AsyncMock(side_effect=[LoginRequired("expired"), LoginRequired("still expired")])
+        controller.login = AsyncMock()
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        with pytest.raises(LoginRequired, match="still expired"):
+            await manager.request(ApiRequest(method="get", path="/stat/sysinfo"))
+
+        assert manager.controller is None
+        assert manager.reconnect_blocked is True
+        assert "LoginRequired" in manager._reconnect_block_error
+        assert "still expired" not in manager._reconnect_block_error
+        controller.login.assert_awaited_once()
+        assert await manager.ensure_connected() is False
+        controller.login.assert_awaited_once()
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_endpoint_forbidden_after_reauthentication_does_not_open_auth_circuit(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        controller.request = AsyncMock(side_effect=[LoginRequired("expired"), Forbidden("endpoint denied")])
+        controller.login = AsyncMock()
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+
+        with pytest.raises(Forbidden, match="endpoint denied"):
+            await manager.request(ApiRequest(method="get", path="/rest/restricted"))
+
+        assert manager.controller is controller
+        assert manager._initialized is True
+        assert manager.reconnect_blocked is False
+        await manager.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reauthentication_preserves_actionable_error_with_path_override(self):
+        manager = ConnectionManager("192.0.2.1", "admin", "secret")
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        controller = MagicMock()
+        controller.connectivity = MagicMock()
+        controller.connectivity.config.session = session
+        controller.connectivity.is_unifi_os = False
+        controller.request = AsyncMock(side_effect=LoginRequired("expired"))
+        controller.login = AsyncMock(side_effect=Unauthorized("api.err.Invalid"))
+        manager._aiohttp_session = session
+        manager.controller = controller
+        manager._initialized = True
+        manager._auth_generation = 1
+        manager._unifi_os_override = True
+
+        with pytest.raises(ConnectionError, match="Unauthorized"):
+            await manager.request(ApiRequest(method="get", path="/stat/sysinfo"))
+
+        assert manager.controller is None
+        controller.login.assert_awaited_once()
+        await manager.cleanup()
+
+    def test_aiounifi_logging_is_disabled_for_controller_data_safety(self, caplog):
+        ConnectionManager("controller.test", "admin", "secret")
+        event_logger = logging.getLogger("aiounifi.models.event")
+        message_logger = logging.getLogger("aiounifi.models.message")
+        connectivity_logger = logging.getLogger("aiounifi.interfaces.connectivity")
+        caplog.set_level(logging.DEBUG)
+
+        event_logger.warning("Unsupported event %s", {"ip": "event-ip-sentinel"})
+        message_logger.warning("Unsupported message %s", {"hostname": "message-hostname-sentinel"})
+        connectivity_logger.error("Cannot connect to host %s", "controller-address-sentinel")
+        logging.getLogger("unifi-network-mcp").warning("safe operation context sentinel")
+
+        assert "event-ip-sentinel" not in caplog.text
+        assert "message-hostname-sentinel" not in caplog.text
+        assert "controller-address-sentinel" not in caplog.text
+        assert "safe operation context sentinel" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_last_initialize_error_redacts_configured_secret(self, caplog):
+        manager = ConnectionManager("192.0.2.1", "admin", "super-secret-password", max_retries=1)
+
+        with patch("unifi_core.network.managers.connection_manager.Controller", _PasswordLeakingLoginController):
+            with patch("unifi_core.network.controller_type.resolve_controller_type", return_value="direct"):
+                initialized = await manager.initialize()
+                assert initialized is False
+
+                with pytest.raises(ConnectionError) as exc_info:
+                    await manager.request(ApiRequest(method="get", path="/stat/sysinfo"))
+
+        message = str(exc_info.value)
+        assert "super-secret-password" not in message
+        assert "super-secret-password" not in caplog.text
+        assert "RequestError" in message
+        assert "check controller connectivity" in message
         await manager.cleanup()

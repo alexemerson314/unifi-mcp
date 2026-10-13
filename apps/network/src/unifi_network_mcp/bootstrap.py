@@ -18,16 +18,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
 from unifi_core.config import load_yaml_config  # noqa: F401 — re-export for convenience
 from unifi_core.config import setup_logging as _shared_setup_logging
 
 # ---------------------------------------------------------------------------
 # Environment & logging
 # ---------------------------------------------------------------------------
+# Use only the launcher-supplied environment. Project .env files are never loaded:
+# they must not select credential destinations or weaken permissions/redaction.
+# Operators can explicitly load a trusted env file in their launcher, or name a
+# per-user settings file in UNIFI_SETTINGS_FILE.
+from unifi_mcp_shared.bootstrap import load_process_env, report_settings_file
 
-load_dotenv()
+load_process_env()
 
 
 DEFAULT_LOG_LEVEL = os.getenv("UNIFI_MCP_LOG_LEVEL", "INFO").upper()
@@ -39,6 +42,7 @@ def setup_logging(level: str | None = None) -> logging.Logger:
 
 
 logger = setup_logging()
+report_settings_file(logger)
 
 
 # ---------------------------------------------------------------------------

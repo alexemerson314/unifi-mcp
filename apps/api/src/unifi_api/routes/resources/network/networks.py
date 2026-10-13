@@ -22,12 +22,13 @@ router = APIRouter()
 def _network_key(obj) -> tuple:
     """Sort by (0, id) — id-stable order, no time component."""
     raw = getattr(obj, "raw", obj if isinstance(obj, dict) else {})
-    return (0, raw.get("_id") or raw.get("id") or "")
+    return (0, raw.get("_id") or raw.get("id") or raw.get("integration_id") or "")
 
 
 @router.get(
     "/sites/{site_id}/networks",
     response_model=Page[to_pydantic_model(Network)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/networks"],
 )
@@ -47,10 +48,8 @@ async def list_networks(
             controller.id,
             "network",
             "network_manager",
+            site=site_id,
         )
-        cm = await factory.get_connection_manager(session, controller.id, "network")
-        if cm.site != site_id:
-            await cm.set_site(site_id)
         all_networks = await mgr.get_networks()
 
     cursor_obj = None
@@ -81,6 +80,7 @@ async def list_networks(
 @router.get(
     "/sites/{site_id}/networks/{network_id}",
     response_model=Detail[to_pydantic_model(Network)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/networks"],
 )
@@ -100,10 +100,8 @@ async def get_network(
                 controller.id,
                 "network",
                 "network_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             network = await mgr.get_network_details(network_id)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

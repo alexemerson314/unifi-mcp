@@ -13,6 +13,8 @@ established fixture pattern.
 Usage:
     python scripts/live_api_smoke.py --output report.json
     python scripts/live_api_smoke.py --controllers network,protect --retry 3
+    # From a fresh environment containing the published wheel and httpx:
+    python scripts/live_api_smoke.py --installed --output installed-report.json
 """
 
 from __future__ import annotations
@@ -615,6 +617,116 @@ async def run_protect_assertions(  # noqa: C901
         retry=retry,
     )
 
+    # 9a. REST detection-search labels vocabulary (Find Anything)
+    async def _rest_detection_search_labels():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
+            r = await c.get(
+                f"/v1/sites/default/detection-search-labels?controller={cid}",
+                headers=headers,
+            )
+            assert r.status_code == 200, f"status={r.status_code}"
+            body = r.json()
+            assert "vehicle_types" in body, f"missing 'vehicle_types': {list(body)[:8]}"
+            return {"vehicle_type_count": len(body.get("vehicle_types") or [])}
+
+    await _run_assertion(
+        report,
+        "REST detection-search-labels (vocabulary)",
+        "protect",
+        "rest",
+        _rest_detection_search_labels,
+        retry=retry,
+    )
+
+    # 9b. REST detection-search — Page envelope (Find Anything)
+    async def _rest_detection_search():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
+            r = await c.get(
+                f"/v1/sites/default/detection-search?controller={cid}&labels=smartDetectType:vehicle&limit=5",
+                headers=headers,
+            )
+            assert r.status_code == 200, f"status={r.status_code}"
+            body = r.json()
+            assert "items" in body, f"missing 'items': {body}"
+            assert "next_cursor" in body, f"missing 'next_cursor': {body}"
+            return {"item_count": len(body["items"])}
+
+    await _run_assertion(
+        report,
+        "REST detection-search (Page envelope)",
+        "protect",
+        "rest",
+        _rest_detection_search,
+        retry=retry,
+    )
+
+    # 9c. REST detection-search with min_confidence filter (Find Anything)
+    async def _rest_detection_search_min_confidence():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
+            r = await c.get(
+                f"/v1/sites/default/detection-search?controller={cid}&labels=smartDetectType:vehicle&min_confidence=50&limit=5",
+                headers=headers,
+            )
+            assert r.status_code == 200, f"status={r.status_code}"
+            body = r.json()
+            assert "items" in body, f"missing 'items': {body}"
+            assert "next_cursor" in body, f"missing 'next_cursor': {body}"
+            return {"item_count": len(body["items"])}
+
+    await _run_assertion(
+        report,
+        "REST detection-search (min_confidence)",
+        "protect",
+        "rest",
+        _rest_detection_search_min_confidence,
+        retry=retry,
+    )
+
+    # 9d. GraphQL searchDetections query (Find Anything, incl minConfidence)
+    async def _gql_search_detections():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
+            q = (
+                f'{{ protect {{ searchDetections(controller: "{cid}", '
+                f'labels: ["smartDetectType:vehicle"], limit: 5, minConfidence: 50) '
+                f"{{ id type smartDetectTypes }} }} }}"
+            )
+            r = await c.post("/v1/graphql", headers=headers, json={"query": q})
+            assert r.status_code == 200, f"status={r.status_code}"
+            body = r.json()
+            assert not body.get("errors"), f"GraphQL errors: {body.get('errors')}"
+            items = body["data"]["protect"]["searchDetections"]
+            return {"item_count": len(items)}
+
+    await _run_assertion(
+        report,
+        "GraphQL protect.searchDetections query",
+        "protect",
+        "graphql",
+        _gql_search_detections,
+        retry=retry,
+    )
+
+    # 9e. GraphQL detectionSearchLabels query (Find Anything)
+    async def _gql_detection_search_labels():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
+            # vehicleTypes/colors are JSON-scalar sub-maps on DetectionSearchLabels — no subfield selection.
+            q = f'{{ protect {{ detectionSearchLabels(controller: "{cid}") {{ vehicleTypes colors }} }} }}'
+            r = await c.post("/v1/graphql", headers=headers, json={"query": q})
+            assert r.status_code == 200, f"status={r.status_code}"
+            body = r.json()
+            assert not body.get("errors"), f"GraphQL errors: {body.get('errors')}"
+            vts = body["data"]["protect"]["detectionSearchLabels"]["vehicleTypes"]
+            return {"vehicle_type_count": len(vts)}
+
+    await _run_assertion(
+        report,
+        "GraphQL protect.detectionSearchLabels query",
+        "protect",
+        "graphql",
+        _gql_detection_search_labels,
+        retry=retry,
+    )
+
     # 10. Auth scope rejection
     async def _auth_rejection():
         async with AsyncClient(transport=ASGITransport(app=app), base_url=base) as c:
@@ -886,6 +998,8 @@ async def run_access_assertions(  # noqa: C901
 async def bootstrap_app_and_controllers(
     env: dict,
     products: list[str],
+    *,
+    installed: bool = False,
 ) -> tuple[Any, str, dict[str, str]]:
     """Boot unifi-api in-process; seed admin key + one Controller row per product.
 
@@ -893,7 +1007,8 @@ async def bootstrap_app_and_controllers(
     """
     import tempfile
 
-    sys.path.insert(0, str(REPO_ROOT / "apps/api/src"))
+    if not installed:
+        sys.path.insert(0, str(REPO_ROOT / "apps/api/src"))
     from unifi_api.auth.api_key import generate_key, hash_key
     from unifi_api.config import ApiConfig, DbConfig, HttpConfig, LoggingConfig
     from unifi_api.db.crypto import ColumnCipher, derive_key
@@ -976,54 +1091,62 @@ async def main_async(args: argparse.Namespace) -> int:
     report.started_at = datetime.now(timezone.utc).isoformat()
 
     print(f"Live smoke: products={products} retry={args.retry}")
-    app, key, cids = await bootstrap_app_and_controllers(env, products)
+    app, key, cids = await bootstrap_app_and_controllers(env, products, installed=args.installed)
 
-    # Always-on assertion: the app boots and /v1/health is ok
-    from httpx import ASGITransport, AsyncClient
+    try:
+        # Always-on assertion: the app boots and /v1/health is ok
+        from httpx import ASGITransport, AsyncClient
 
-    async def _health():
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-            r = await c.get("/v1/health")
-            assert r.status_code == 200, f"/v1/health returned {r.status_code}"
-            assert r.json().get("status") == "ok", r.json()
-            return {"status_code": 200}
+        async def _health():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                r = await c.get("/v1/health")
+                assert r.status_code == 200, f"/v1/health returned {r.status_code}"
+                assert r.json().get("status") == "ok", r.json()
+                return {"status_code": 200}
 
-    await _run_assertion(
-        report,
-        "service boots / v1 health",
-        "core",
-        "rest",
-        _health,
-        retry=args.retry,
-    )
-
-    if "network" in products and "network" in cids:
-        await run_network_assertions(
+        await _run_assertion(
             report,
-            env,
-            app,
-            key,
-            cids["network"],
+            "service boots / v1 health",
+            "core",
+            "rest",
+            _health,
             retry=args.retry,
         )
-    if "protect" in products and "protect" in cids:
-        await run_protect_assertions(
-            report,
-            env,
-            app,
-            key,
-            cids["protect"],
-            retry=args.retry,
-        )
-    if "access" in products and "access" in cids:
-        await run_access_assertions(
-            report,
-            env,
-            app,
-            key,
-            cids["access"],
-            retry=args.retry,
-        )
+
+        if "network" in products and "network" in cids:
+            await run_network_assertions(
+                report,
+                env,
+                app,
+                key,
+                cids["network"],
+                retry=args.retry,
+            )
+        if "protect" in products and "protect" in cids:
+            await run_protect_assertions(
+                report,
+                env,
+                app,
+                key,
+                cids["protect"],
+                retry=args.retry,
+            )
+        if "access" in products and "access" in cids:
+            await run_access_assertions(
+                report,
+                env,
+                app,
+                key,
+                cids["access"],
+                retry=args.retry,
+            )
+
+    finally:
+        try:
+            for controller_id in cids.values():
+                await app.state.manager_factory.invalidate_controller(controller_id)
+        finally:
+            await app.state.engine.dispose()
 
     report.finished_at = datetime.now(timezone.utc).isoformat()
     args.output.write_text(
@@ -1056,6 +1179,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("smoke-report.json"))
     parser.add_argument("--controllers", default="network,protect,access")
     parser.add_argument("--retry", type=int, default=3)
+    parser.add_argument(
+        "--installed", action="store_true", help="Use the installed API package without adding checkout sources"
+    )
     args = parser.parse_args()
     return asyncio.run(main_async(args))
 

@@ -1,11 +1,14 @@
-# Protect Server Tool Reference (48 tools)
+# Protect Server Tool Reference (63 tools)
 
 Complete reference for `protect_*` tools. All read tools are always available. All mutations are **disabled by default** — the user must explicitly enable them because Protect controls physical security hardware.
+
+Permission variables use the server's config keys (`CAMERAS`, `LIGHTS`, `CHIMES`, `SENSORS`), not the singular `permission_category` shorthand in `tools_manifest.json` (`camera`, `light`, `chime`). `UNIFI_POLICY_PROTECT_CAMERA_UPDATE` is never read; a denied tool's error names the exact variable to set.
 
 ## Table of Contents
 - [Meta-Tools](#meta-tools)
 - [Cameras](#cameras)
 - [Events](#events)
+- [Incident Evidence](#incident-evidence)
 - [Recordings](#recordings)
 - [Devices: Lights, Sensors, Chimes](#devices-lights-sensors-chimes)
 - [Liveviews](#liveviews)
@@ -33,7 +36,7 @@ Always available, regardless of registration mode.
 ## Cameras
 
 <!-- AUTO:tools:cameras -->
-11 tools.
+12 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
@@ -47,12 +50,13 @@ Always available, regardless of registration mode.
 | `protect_ptz_zoom` | Mutate | Zooms a PTZ camera using normalized zoom speed. |
 | `protect_reboot_camera` | Mutate | Reboots a camera. |
 | `protect_toggle_recording` | Mutate | Enables or disables recording on a camera. |
+| `protect_toggle_rtsp` | Mutate | Enables or disables the RTSP/RTSPS stream on a camera channel. |
 | `protect_update_camera_settings` | Mutate | Updates camera settings such as IR LED mode, HDR mode, mic/speaker volume, status light, and motion detection. |
 <!-- /AUTO:tools:cameras -->
 
 **Tips:**
 - `protect_get_snapshot` with `include_image=true` returns base64 JPEG inline — useful for quick visual checks
-- `protect_get_camera_streams` gives RTSP URLs for video player integration — these can be shared with the user
+- `protect_get_camera_streams` gives RTSP URL metadata for video player integration. Raw aliases and URLs are redacted by default and require redaction policy to be disabled for a trusted local process before sharing.
 - Camera settings use a dict: `settings={"ir_led_mode": "auto", "hdr_mode": true, "mic_enabled": true}`
 - PTZ pan/tilt uses `protect_ptz_move`; PTZ zoom uses `protect_ptz_zoom`; saved positions use `protect_ptz_preset`
 
@@ -64,25 +68,40 @@ Always available, regardless of registration mode.
 ## Events
 
 <!-- AUTO:tools:events -->
-7 tools.
+9 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
+| `protect_detection_search_labels` | Read | List the detection-search filter vocabulary supported by this controller. |
 | `protect_get_event` | Read | Get detailed information for a single event by ID. |
 | `protect_get_event_thumbnail` | Read | Get the thumbnail image for an event. |
 | `protect_list_events` | Read | Query events from the NVR with optional filters. |
 | `protect_list_smart_detections` | Read | List smart detection events (person, vehicle, animal, package, etc.) with optional filters. |
 | `protect_recent_events` | Read | Get recent events from the in-memory websocket buffer. |
+| `protect_search_detections` | Read | Search detections across all cameras using Protect's 'Find Anything' filter vocabulary. |
 | `protect_subscribe_events` | Read | Returns instructions for subscribing to real-time Protect events. |
 | `protect_acknowledge_event` | Mutate | Acknowledge an event by marking it as a favorite on the NVR. |
 <!-- /AUTO:tools:events -->
 
 **Tips:**
 - **Real-time vs historical**: Use `protect_recent_events` for "what just happened?" (instant, from websocket buffer). Use `protect_list_events` for "what happened last Tuesday?" (API query, slower)
+- **Find Anything searches**: Call `protect_detection_search_labels` first, then pass the returned `value` strings to `protect_search_detections` for attribute searches such as vehicle type, color, device, or smart-detection type.
 - Smart detection types: `person`, `vehicle`, `animal`, `package`, `face`, `licensePlate`
 - `min_confidence` parameter filters out low-confidence detections (default threshold: 50)
 - Event types for filtering: `motion`, `smartDetectZone`, `ring`, `sensorMotion`, `sensorContact`, `sensorDoorbell`
 - Time parameters use ISO 8601 format: `2026-03-17T00:00:00Z`
+
+---
+
+## Incident Evidence
+
+<!-- AUTO:tools:incident_evidence -->
+1 tools.
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `protect_get_incident_evidence` | Read | Collects bounded, read-only Protect event evidence for one incident window. |
+<!-- /AUTO:tools:incident_evidence -->
 
 ---
 
@@ -110,20 +129,22 @@ Always available, regardless of registration mode.
 ## Devices: Lights, Sensors, Chimes
 
 <!-- AUTO:tools:devices -->
-6 tools.
+7 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `protect_list_chimes` | Read | Lists all UniFi Protect chime devices with their name, connection state, volume, ring settings per camera, and available ringtones/tracks. |
 | `protect_list_lights` | Read | Lists all UniFi Protect floodlight devices with their name, connection state, brightness level, PIR motion sensitivity, and paired camera. |
 | `protect_list_sensors` | Read | Lists all UniFi Protect sensor devices (motion, door/window, temperature, humidity, light level, leak detection). |
-| `protect_trigger_chime` | Read | Plays the chime tone on a specific chime device. |
-| `protect_update_chime` | Mutate | Updates chime settings such as speaker volume (0-100), repeat times (1-6), and device name. |
+| `protect_trigger_chime` | Mutate | Plays the chime tone on a specific chime device. |
+| `protect_update_chime` | Mutate | Updates chime settings. |
 | `protect_update_light` | Mutate | Updates light settings such as on/off state, LED brightness level (1-6), PIR motion sensitivity (0-100), motion-triggered duration (15-90... |
+| `protect_update_sensor_settings` | Mutate | Updates UniFi Protect sensor settings. |
 <!-- /AUTO:tools:devices -->
 
 **Permission env vars:**
 - `UNIFI_POLICY_PROTECT_LIGHTS_UPDATE=true`
+- `UNIFI_POLICY_PROTECT_SENSORS_UPDATE=true`
 - `UNIFI_POLICY_PROTECT_CHIMES_UPDATE=true`
 
 ---
@@ -147,7 +168,7 @@ Always available, regardless of registration mode.
 ## System
 
 <!-- AUTO:tools:system -->
-4 tools.
+5 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
@@ -155,6 +176,7 @@ Always available, regardless of registration mode.
 | `protect_get_health` | Read | Returns NVR health summary including CPU load and temperature, memory usage, and storage utilization. |
 | `protect_get_system_info` | Read | Returns NVR model, firmware version, uptime, storage usage, and connected device counts. |
 | `protect_list_viewers` | Read | Lists all connected Protect viewers (e.g., UP-Viewer, Viewport) with their connection state, firmware version, and assigned liveview. |
+| `protect_update_viewer` | Mutate | Updates a UniFi Protect viewer name or liveview assignment. |
 <!-- /AUTO:tools:system -->
 
 **Tips:**
@@ -168,14 +190,19 @@ Always available, regardless of registration mode.
 Controls the UniFi Protect Alarm Manager (Protect 6.1+). Requires arm profiles configured in the Protect web UI. Mutations gated by `UNIFI_POLICY_PROTECT_ALARM_UPDATE=true`.
 
 <!-- AUTO:tools:alarm -->
-4 tools.
+9 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
+| `protect_alarm_get_rule` | Read | Fetches a single UniFi Protect alarm rule by id (normalized: id, title, enabled, triggers, actions, scope, stats), including AI-powered a... |
 | `protect_alarm_get_status` | Read | Returns the current armed/disarmed state of the UniFi Protect Alarm Manager, including the active profile, raw status string, armed-at ti... |
-| `protect_alarm_list_profiles` | Read | Lists all configured UniFi Protect Alarm Manager profiles with their id, name, activation delay, schedule count, and automation count. |
+| `protect_alarm_list_profiles` | Read | Lists all configured UniFi Protect Alarm Manager profiles with their id, name, state, state_set_at timestamp, activation delay, schedule ... |
+| `protect_alarm_list_rules` | Read | Lists every UniFi Protect alarm rule, including AI-powered alarms (e.g. |
 | `protect_alarm_arm` | Mutate | Arms the UniFi Protect Alarm Manager. |
+| `protect_alarm_create_rule` | Mutate | Creates a new alarm rule via POST. |
+| `protect_alarm_delete_rule` | Mutate | Deletes an alarm rule (automation) by id. |
 | `protect_alarm_disarm` | Mutate | Disarms the UniFi Protect Alarm Manager system-wide via POST arm/disable. |
+| `protect_alarm_update_rule` | Mutate | Updates an alarm rule. |
 <!-- /AUTO:tools:alarm -->
 
 **Tips:**
@@ -191,14 +218,17 @@ Controls the UniFi Protect Alarm Manager (Protect 6.1+). Requires arm profiles c
 Lists and manages UniFi Protect Known Faces / named face recognition groups. Read tools return metadata and controller image references only; mutations use preview-then-confirm.
 
 <!-- AUTO:tools:recognition -->
-4 tools.
+7 tools.
 
 | Tool | Type | Description |
 |------|------|-------------|
 | `protect_list_known_faces` | Read | List UniFi Protect face recognition groups, including assigned Known Faces by default and unlabeled groups when group_types includes unkn... |
+| `protect_list_known_license_plates` | Read | List UniFi Protect license-plate identities (vehicle recognition groups), including named/known license plates by default and unlabeled p... |
 | `protect_delete_known_face` | Mutate | Delete or remove a UniFi Protect face recognition group. |
+| `protect_delete_known_license_plate` | Mutate | Delete or remove a UniFi Protect license-plate recognition group. |
 | `protect_merge_known_faces` | Mutate | Merge one UniFi Protect face group into another. |
 | `protect_update_known_face` | Mutate | Update UniFi Protect Known Face metadata. |
+| `protect_update_known_license_plate` | Mutate | Update UniFi Protect Known License Plate (license-plate identity) metadata. |
 <!-- /AUTO:tools:recognition -->
 
 **Tips:**
@@ -227,7 +257,7 @@ Lists and manages UniFi Protect Known Faces / named face recognition groups. Rea
 
 ### "Check NVR health"
 ```
-protect_batch(tools=[
+protect_batch(operations=[
     {"tool": "protect_get_system_info"},
     {"tool": "protect_get_health"},
     {"tool": "protect_get_firmware_status"},
@@ -238,7 +268,7 @@ protect_batch(tools=[
 ### "A camera seems offline"
 1. `protect_list_cameras` → check connection state
 2. `protect_get_camera(camera_id="...")` → detailed status including IP and MAC
-3. Cross-reference with Network: `unifi_lookup_by_ip(ip="<camera IP>")` → network-level status
+3. Cross-reference with Network: `unifi_lookup_by_ip(ip_address="<camera IP>")` → network-level status
 4. If needed: `protect_reboot_camera(camera_id="...", confirm=true)` → reboot (requires permission)
 
 ---

@@ -10,7 +10,7 @@ from typing import Annotated, Any, Dict
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
 
-from unifi_access_mcp.runtime import credential_manager, server
+from unifi_access_mcp.runtime import credential_manager, server, should_redact_sensitive_fields
 from unifi_core.access.models._actions import RevokeCredentialInput
 from unifi_core.access.models.credentials import (
     Credential,
@@ -23,6 +23,7 @@ from unifi_core.access.models.credentials import (
 )
 from unifi_core.confirmation import create_preview, preview_response
 from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.redaction import redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,14 @@ logger = logging.getLogger(__name__)
 async def access_list_credentials() -> Dict[str, Any]:
     """List all credentials."""
     logger.info("access_list_credentials tool called")
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         raw_list = await credential_manager.list_credentials()
         credentials = [credential_from_controller(raw).model_dump(exclude_none=True) for raw in raw_list]
-        return {"success": True, "data": {"credentials": credentials, "count": len(credentials)}}
+        return redact_sensitive_fields(
+            {"success": True, "data": {"credentials": credentials, "count": len(credentials)}},
+            redact_sensitive=redact_sensitive,
+        )
     except Exception as e:
         logger.error("Error listing credentials: %s", e, exc_info=True)
         return {"success": False, "error": f"Failed to list credentials: {e}"}
@@ -65,10 +70,14 @@ async def access_get_credential(
 ) -> Dict[str, Any]:
     """Get detailed credential information by ID."""
     logger.info("access_get_credential tool called for %s", credential_id)
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         raw = await credential_manager.get_credential(credential_id)
         shaped = credential_from_controller(raw).model_dump(exclude_none=True)
-        return {"success": True, "data": shaped}
+        return redact_sensitive_fields(
+            {"success": True, "data": shaped},
+            redact_sensitive=redact_sensitive,
+        )
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
@@ -111,6 +120,7 @@ async def access_create_credential(
 ) -> Dict[str, Any]:
     """Create a credential with preview/confirm."""
     logger.info("access_create_credential tool called (type=%s, confirm=%s)", credential_type, confirm)
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         if not credential_data:
             return {"success": False, "error": "No credential data provided."}
@@ -132,13 +142,16 @@ async def access_create_credential(
 
         if confirm:
             result = await credential_manager.apply_create_credential(cred_type, cred_data)
-            return {"success": True, "data": result}
+            return redact_sensitive_fields({"success": True, "data": result}, redact_sensitive=redact_sensitive)
 
         preview_data = await credential_manager.create_credential(cred_type, cred_data)
-        return create_preview(
-            resource_type="access_credential",
-            resource_data=preview_data["proposed_changes"],
-            resource_name=f"{credential_type} credential",
+        return redact_sensitive_fields(
+            create_preview(
+                resource_type="access_credential",
+                resource_data=preview_data["proposed_changes"],
+                resource_name=f"{credential_type} credential",
+            ),
+            redact_sensitive=redact_sensitive,
         )
     except (UniFiNotFoundError, ValueError) as e:
         return {"success": False, "error": str(e)}

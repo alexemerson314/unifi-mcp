@@ -1,7 +1,7 @@
 """Tests for the ContentFilterManager class.
 
 This module tests content filtering profile operations.
-Note: The UniFi API does not support POST (create) or GET /{id}.
+Note: create uses the UI endpoint; GET /{id} is unsupported.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -124,6 +124,67 @@ class TestContentFilterManager:
     # ---- update_content_filter ----
 
     @pytest.mark.asyncio
+    async def test_create_uses_ui_path_and_validated_payload(self, content_filter_manager, mock_connection):
+        mock_connection.request.return_value = [{"_id": "cf-new"}]
+        result = await content_filter_manager.create_content_filter(
+            {
+                "name": "Kids",
+                "client_macs": ["AA:BB:CC:DD:EE:FF"],
+                "blocked_categories": ["FAMILY"],
+                "schedule_days": ["mon"],
+            }
+        )
+        request = mock_connection.request.call_args.args[0]
+        assert result == {"_id": "cf-new"}
+        assert request.method == "post"
+        assert request.path == "/content-filtering/create"
+        assert request.data == {
+            "name": "Kids",
+            "client_macs": ["aa:bb:cc:dd:ee:ff"],
+            "categories": ["FAMILY"],
+            "schedule": {"mode": "ALWAYS", "repeat_on_days": ["mon"], "time_all_day": True},
+            "enabled": False,
+        }
+        mock_connection._invalidate_cache.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_mixed_scope_before_connection(self, content_filter_manager, mock_connection):
+        with pytest.raises(ValueError, match="Exactly one"):
+            await content_filter_manager.create_content_filter(
+                {
+                    "name": "Kids",
+                    "client_macs": ["aa:bb:cc:dd:ee:ff"],
+                    "network_ids": ["net"],
+                    "blocked_categories": ["FAMILY"],
+                }
+            )
+        mock_connection.ensure_connected.assert_not_called()
+        mock_connection.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("categories", [None, []])
+    async def test_create_requires_categories_before_connection(
+        self, content_filter_manager, mock_connection, categories
+    ):
+        fields = {"name": "Kids", "network_ids": ["net"]}
+        if categories is not None:
+            fields["blocked_categories"] = categories
+        with pytest.raises(ValueError, match="blocked_categories"):
+            await content_filter_manager.create_content_filter(fields)
+        mock_connection.ensure_connected.assert_not_called()
+        mock_connection.request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_unknown_response_reports_uncertainty(self, content_filter_manager, mock_connection):
+        mock_connection.request.return_value = [{}]
+        result = await content_filter_manager.create_content_filter(
+            {"name": "Kids", "network_ids": ["net"], "blocked_categories": ["FAMILY"]}
+        )
+        assert result["success"] is False
+        assert result["uncertain"] is True
+        assert "List profiles before retrying" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_update_content_filter_success(self, content_filter_manager, mock_connection):
         """Test update_content_filter with valid data."""
         existing = {"_id": "f1", "name": "Original", "categories": ["FAMILY"]}
@@ -161,7 +222,7 @@ class TestContentFilterManager:
             "_id": "cf1",
             "name": "Kids Filter",
             "enabled": True,
-            "blocked_categories": ["adult", "gambling"],
+            "categories": ["ADULT", "GAMBLING"],
             "safe_search": ["GOOGLE", "YOUTUBE"],
             "client_macs": ["aa:bb:cc:dd:ee:ff"],
         }
@@ -180,7 +241,61 @@ class TestContentFilterManager:
         assert put_request.method == "put"
         assert put_request.data["name"] == "Family Filter"
         assert put_request.data["safe_search"] == ["GOOGLE", "YOUTUBE", "BING"]
-        assert put_request.data["blocked_categories"] == ["adult", "gambling"]
+        assert put_request.data["categories"] == ["ADULT", "GAMBLING"]
+
+    @pytest.mark.asyncio
+    async def test_update_content_filter_puts_controller_dialect_verbatim(
+        self, content_filter_manager, mock_connection
+    ):
+        """The manager is dialect-agnostic: callers hand it a controller payload.
+
+        Field-name translation lives in
+        ``unifi_core.network.models.content_filter.to_controller_update``.
+        """
+        existing_filter = {
+            "_id": "cf1",
+            "name": "Default",
+            "categories": ["ADVERTISEMENT", "MALWARE", "PHISHING"],
+            "safe_search": ["GOOGLE"],
+        }
+        mock_connection.request.side_effect = [
+            [existing_filter],
+            {},
+        ]
+
+        result = await content_filter_manager.update_content_filter("cf1", {"categories": ["MALWARE", "PHISHING"]})
+
+        put_request = mock_connection.request.call_args_list[1][0][0]
+        assert put_request.data == {
+            "_id": "cf1",
+            "name": "Default",
+            "categories": ["MALWARE", "PHISHING"],
+            "safe_search": ["GOOGLE"],
+        }
+        assert result == put_request.data
+
+    @pytest.mark.asyncio
+    async def test_update_content_filter_preserves_schedule_siblings(self, content_filter_manager, mock_connection):
+        """A partial schedule update must not drop repeat_on_days / time_all_day."""
+        existing_filter = {
+            "_id": "cf1",
+            "name": "Default",
+            "categories": ["ADVERTISEMENT"],
+            "schedule": {"mode": "ALWAYS", "repeat_on_days": ["mon", "tue"], "time_all_day": False},
+        }
+        mock_connection.request.side_effect = [
+            [existing_filter],
+            {},
+        ]
+
+        await content_filter_manager.update_content_filter("cf1", {"schedule": {"mode": "EVERY_DAY"}})
+
+        put_request = mock_connection.request.call_args_list[1][0][0]
+        assert put_request.data["schedule"] == {
+            "mode": "EVERY_DAY",
+            "repeat_on_days": ["mon", "tue"],
+            "time_all_day": False,
+        }
 
     @pytest.mark.asyncio
     async def test_update_content_filter_not_found(self, content_filter_manager, mock_connection):

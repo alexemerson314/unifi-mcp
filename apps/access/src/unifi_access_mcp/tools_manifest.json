@@ -1,5 +1,5 @@
 {
-  "count": 34,
+  "count": 37,
   "generated_by": "scripts/generate_tool_manifest.py",
   "module_map": {
     "access_create_credential": "unifi_access_mcp.tools.credentials",
@@ -8,6 +8,7 @@
     "access_get_activity_summary": "unifi_access_mcp.tools.events",
     "access_get_credential": "unifi_access_mcp.tools.credentials",
     "access_get_device": "unifi_access_mcp.tools.devices",
+    "access_get_device_configs": "unifi_access_mcp.tools.devices",
     "access_get_door": "unifi_access_mcp.tools.doors",
     "access_get_door_status": "unifi_access_mcp.tools.doors",
     "access_get_event": "unifi_access_mcp.tools.events",
@@ -30,6 +31,7 @@
     "access_revoke_credential": "unifi_access_mcp.tools.credentials",
     "access_subscribe_events": "unifi_access_mcp.tools.events",
     "access_unlock_door": "unifi_access_mcp.tools.doors",
+    "access_update_device_config": "unifi_access_mcp.tools.devices",
     "access_update_policy": "unifi_access_mcp.tools.policies"
   },
   "note": "Auto-generated with full schemas from tool decorators. Do not edit manually.",
@@ -41,21 +43,22 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Execute multiple UniFi Access tools in parallel through the UniFi compatibility wrapper. Returns job IDs; use access_batch_status to check progress.",
+      "auth_method": "local_only",
+      "description": "Execute multiple UniFi Access tools in parallel through the indirect execution wrapper. Returns job IDs; use access_batch_status to check progress.",
       "name": "access_batch",
       "schema": {
         "input": {
           "properties": {
             "operations": {
-              "description": "Array of {tool, arguments} objects using tool names from access_tool_index",
+              "description": "Array of {tool, arguments} objects using names from access_tool_index in lazy mode, or known domain tool names in meta-only mode",
               "items": {
                 "properties": {
                   "arguments": {
-                    "description": "Tool parameters matching the schema from the tool index",
+                    "description": "Tool parameters matching the domain tool's input schema",
                     "type": "object"
                   },
                   "tool": {
-                    "description": "Tool name from access_tool_index",
+                    "description": "Tool name from access_tool_index in lazy mode, or a known domain tool name in meta-only mode",
                     "type": "string"
                   }
                 },
@@ -112,6 +115,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Check status of UniFi Access batch operations. Returns status, result (if done), or error (if failed).",
       "name": "access_batch_status",
       "schema": {
@@ -165,6 +169,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "local_only",
       "description": "Create a new access credential (NFC card, PIN, or mobile credential) and assign it to a user. Requires confirm=true to execute. Only available via local proxy session.",
       "name": "access_create_credential",
       "permission_action": "create",
@@ -268,7 +273,8 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Create a new visitor pass with a name and access time range. Optionally assign specific doors and contact information. Requires confirm=true to execute. Only available via local proxy session.",
+      "auth_method": "api_key_only",
+      "description": "Create a visitor pass in the UniFi Access Developer API. The returned UUID is scoped to the Access Developer API visitor tool family \u2014 use it only with access_get_visitor and access_delete_visitor. Requires a UniFi Access API token and confirm=true to execute.",
       "name": "access_create_visitor",
       "permission_action": "create",
       "permission_category": "visitor",
@@ -276,11 +282,15 @@
         "input": {
           "properties": {
             "access_end": {
-              "description": "End of access period as ISO 8601 timestamp (e.g., 2026-03-17T17:00:00Z)",
+              "description": "Backward-compatible alias for valid_until (ISO 8601 with timezone).",
               "type": "string"
             },
             "access_start": {
-              "description": "Start of access period as ISO 8601 timestamp (e.g., 2026-03-17T09:00:00Z)",
+              "description": "Backward-compatible alias for valid_from (ISO 8601 with timezone).",
+              "type": "string"
+            },
+            "company": {
+              "description": "Visitor company. Optional.",
               "type": "string"
             },
             "confirm": {
@@ -291,19 +301,41 @@
               "description": "Visitor email address for notifications. Optional.",
               "type": "string"
             },
+            "first_name": {
+              "description": "Explicit first name. Provide together with last_name to override splitting name.",
+              "type": "string"
+            },
+            "last_name": {
+              "description": "Explicit last name. Provide together with first_name to override splitting name.",
+              "type": "string"
+            },
             "name": {
               "description": "Visitor display name",
               "type": "string"
             },
             "phone": {
-              "description": "Visitor phone number. Optional.",
+              "description": "Visitor mobile phone number. Optional.",
+              "type": "string"
+            },
+            "remarks": {
+              "description": "Operator notes about the visit. Optional.",
+              "type": "string"
+            },
+            "valid_from": {
+              "description": "Start of access period as ISO 8601 timestamp (e.g., 2026-03-17T09:00:00Z).",
+              "type": "string"
+            },
+            "valid_until": {
+              "description": "End of access period as ISO 8601 timestamp (e.g., 2026-03-17T17:00:00Z).",
+              "type": "string"
+            },
+            "visit_reason": {
+              "description": "Reason for the visit. Optional.",
               "type": "string"
             }
           },
           "required": [
-            "name",
-            "access_start",
-            "access_end"
+            "name"
           ],
           "type": "object"
         },
@@ -385,7 +417,8 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Delete a visitor pass. This permanently removes the visitor's access. Requires confirm=true to execute. Only available via local proxy session.",
+      "auth_method": "api_key_only",
+      "description": "Delete a visitor pass through the UniFi Access Developer API, revoking its access; the controller retains a cancelled historical record. The UUID must come from access_list_visitors and is scoped to this visitor tool family \u2014 do not pass IDs from other Access user or credential tools. Requires an Access API token and confirm=true.",
       "name": "access_delete_visitor",
       "permission_action": "delete",
       "permission_category": "visitor",
@@ -397,7 +430,7 @@
               "type": "boolean"
             },
             "visitor_id": {
-              "description": "Visitor UUID (from access_list_visitors)",
+              "description": "Access Developer API visitor UUID from access_list_visitors; visitor-family scoped",
               "type": "string"
             }
           },
@@ -485,17 +518,21 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Execute a UniFi Access tool (door locks, access readers, credentials, visitors, access policies, and entry events) by name for lazy/meta-only compatibility workflows.",
+      "auth_method": "local_only",
+      "description": "Execute a UniFi Access tool (door locks, access readers, credentials, visitors, access policies, and entry events) by name for lazy/meta-only workflows.",
       "name": "access_execute",
       "schema": {
         "input": {
           "properties": {
             "arguments": {
-              "description": "Tool parameters matching the schema from the tool index",
-              "type": "object"
+              "description": "Tool parameters matching the domain tool's input schema",
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "tool": {
-              "description": "Tool name from access_tool_index (e.g. 'access_list_*')",
+              "description": "Domain tool name (e.g. 'access_list_*'); discover it through access_tool_index in lazy mode",
               "type": "string"
             }
           },
@@ -516,6 +553,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Get an aggregated activity summary for Access events over a time period. Shows event counts, breakdowns by type, and trends. Optionally scope to a single door. Only available via local proxy session.",
       "name": "access_get_activity_summary",
       "permission_action": "read",
@@ -611,6 +649,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Returns detailed information for a single access credential including type, status, assigned user, and creation date.",
       "name": "access_get_credential",
       "permission_action": "read",
@@ -705,6 +744,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Returns detailed information for a single Access device including name, type, connection state, firmware version, MAC, and IP address.",
       "name": "access_get_device",
       "permission_action": "read",
@@ -713,7 +753,7 @@
         "input": {
           "properties": {
             "device_id": {
-              "description": "Device UUID (from access_list_devices)",
+              "description": "Device identifier returned as 'id' by access_list_devices. This is a MAC address on the Integration API path and an Access topology unique ID on the local proxy path.",
               "type": "string"
             }
           },
@@ -799,6 +839,102 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
+      "description": "Returns a device's settings (its configs[] array) \u2014 the per-device settings the Access web UI edits, such as the reader voice greeting. Each entry is a {key, value, tag} record; tags group entries by category (device_setting, device_extra, hub_action, hub_power, wiring_state, credential). Credential-tagged and secret-named values are redacted. Use this to discover the exact keys before calling access_update_device_config. Only available via local proxy session.",
+      "name": "access_get_device_configs",
+      "permission_action": "read",
+      "permission_category": "device",
+      "schema": {
+        "input": {
+          "properties": {
+            "device_id": {
+              "description": "Device identifier returned as 'id' by access_list_devices. This is a MAC address on the Integration API path and an Access topology unique ID on the local proxy path.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_id"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "description": "Structured view of the existing UniFi MCP tool response contract.",
+          "properties": {
+            "data": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Successful result payload.",
+              "title": "Data"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Actionable error message for handled failures.",
+              "title": "Error"
+            },
+            "preview": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Mutation preview payload returned before confirmation.",
+              "title": "Preview"
+            },
+            "requires_confirmation": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "True when a mutation preview requires caller confirmation.",
+              "title": "Requires Confirmation"
+            },
+            "success": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "True when the tool call succeeded; false for handled errors.",
+              "title": "Success"
+            }
+          },
+          "title": "UniFiToolResponse",
+          "type": "object"
+        }
+      },
+      "title": "Get Device Configs"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "auth_method": "either",
       "description": "Returns detailed information for a single door including lock state, configuration, and connected devices.",
       "name": "access_get_door",
       "permission_action": "read",
@@ -893,6 +1029,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Returns the current lock and position status for a single door. Lightweight alternative to access_get_door when you only need state info.",
       "name": "access_get_door_status",
       "permission_action": "read",
@@ -987,6 +1124,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Returns detailed information for a single access event including event type, door, user, timestamp, and result.",
       "name": "access_get_event",
       "permission_action": "read",
@@ -995,7 +1133,7 @@
         "input": {
           "properties": {
             "event_id": {
-              "description": "Event UUID (from access_list_events or access_recent_events)",
+              "description": "Event ID (from access_list_events or access_recent_events)",
               "type": "string"
             }
           },
@@ -1081,6 +1219,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Returns Access system health summary including API client and proxy session status. Use to verify connectivity and diagnose auth path issues.",
       "name": "access_get_health",
       "permission_action": "read",
@@ -1167,6 +1306,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Returns detailed information for a single access policy including assigned doors, schedule, user groups, and configuration.",
       "name": "access_get_policy",
       "permission_action": "read",
@@ -1258,9 +1398,62 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
+      "description": "Generate sanitized UniFi Access support evidence for user review. Summary is local/cache-only; live probes are bounded and explicitly allowlisted.",
+      "name": "access_get_support_bundle",
+      "schema": {
+        "input": {
+          "properties": {
+            "probe": {
+              "default": "summary",
+              "enum": [
+                "summary",
+                "connectivity",
+                "resource_shape"
+              ],
+              "type": "string"
+            },
+            "resource": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "output": {
+          "properties": {
+            "data": {
+              "type": "object"
+            },
+            "error": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "success"
+          ],
+          "type": "object"
+        }
+      },
+      "title": "UniFi Access Support Bundle"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "auth_method": "either",
       "description": "Returns Access controller model, firmware version, uptime, and connected device counts. Use for basic health checks and capacity overview.",
       "name": "access_get_system_info",
       "permission_action": "read",
@@ -1347,7 +1540,8 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Returns detailed information for a single visitor pass including name, access time range, assigned doors, and status.",
+      "auth_method": "api_key_only",
+      "description": "Return one visitor pass from the UniFi Access Developer API. The visitor UUID must come from access_list_visitors and is scoped to this visitor tool family \u2014 do not pass IDs from other Access user or credential tools.",
       "name": "access_get_visitor",
       "permission_action": "read",
       "permission_category": "visitor",
@@ -1355,7 +1549,7 @@
         "input": {
           "properties": {
             "visitor_id": {
-              "description": "Visitor UUID (from access_list_visitors)",
+              "description": "Access Developer API visitor UUID from access_list_visitors; visitor-family scoped",
               "type": "string"
             }
           },
@@ -1441,6 +1635,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Lists all access credentials (NFC cards, PINs, mobile credentials) with their type, status, and assigned user.",
       "name": "access_list_credentials",
       "permission_action": "read",
@@ -1527,6 +1722,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Lists all Access hardware devices (hubs, readers, relays, intercoms) with their name, type, connection state, and firmware version.",
       "name": "access_list_devices",
       "permission_action": "read",
@@ -1618,6 +1814,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Lists all door groups configured on the Access controller. Door groups organize doors for policy assignment. Only available via local proxy session.",
       "name": "access_list_door_groups",
       "permission_action": "read",
@@ -1704,6 +1901,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Lists all doors managed by the Access controller with their name, lock state, and connection status. Use to get an overview of all doors.",
       "name": "access_list_doors",
       "permission_action": "read",
@@ -1795,6 +1993,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Query access events from the controller with optional filters. Returns events such as door unlocks, access denials, and system events. Supports filtering by time range, door, user, and result limit. For real-time buffer events use access_recent_events.",
       "name": "access_list_events",
       "permission_action": "read",
@@ -1811,7 +2010,9 @@
               "type": "string"
             },
             "limit": {
-              "description": "Maximum number of events to return (default 30).",
+              "description": "Maximum number of events to return (0-5000, default 30).",
+              "maximum": 5000,
+              "minimum": 0,
               "type": "integer"
             },
             "start": {
@@ -1819,7 +2020,7 @@
               "type": "string"
             },
             "topic": {
-              "description": "Event topic to query: 'admin' (user/account changes) or 'admin_activity' (admin actions). Default: admin.",
+              "description": "Event topic, mirroring the Access UI's syslog Category filter: 'unlocks' (door grants and open/close), 'access_denial' (refused attempts), 'ring' (doorbell), 'updates', 'critical', 'admin' (user/account changes), 'admin_activity' (admin actions). No other value is accepted. Default: admin.",
               "type": "string"
             },
             "user_id": {
@@ -1906,6 +2107,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Lists all access policies configured on the Access controller. Shows policy name, assigned doors, schedules, and user groups.",
       "name": "access_list_policies",
       "permission_action": "read",
@@ -1992,6 +2194,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Lists all access schedules configured on the Access controller.",
       "name": "access_list_schedules",
       "permission_action": "read",
@@ -2078,6 +2281,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "local_only",
       "description": "Lists all users registered in the Access controller with their access credentials and groups. Use to audit who has physical access or to look up a specific user.",
       "name": "access_list_users",
       "permission_action": "read",
@@ -2173,7 +2377,8 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Lists all visitor passes with their name, status, valid time range, and assigned doors.",
+      "auth_method": "api_key_only",
+      "description": "List visitor passes from the UniFi Access Developer API. Returned UUIDs are scoped to the Access Developer API visitor tool family \u2014 pass them only to access_get_visitor and access_delete_visitor; do not pass them to other Access user or credential tools.",
       "name": "access_list_visitors",
       "permission_action": "read",
       "permission_category": "visitor",
@@ -2261,6 +2466,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "local_only",
       "description": "Load UniFi Access tools (door locks, access readers, credentials, visitors, access policies, and entry events) for direct MCP access. Advanced lazy-mode extension that emits notifications/tools/list_changed when tools are loaded.",
       "name": "access_load_tools",
       "schema": {
@@ -2308,6 +2514,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "either",
       "description": "Lock a door immediately. This is a physical real-world action. Requires confirm=true to execute. Uses the Access API client when available, with local proxy fallback.",
       "name": "access_lock_door",
       "permission_action": "update",
@@ -2407,6 +2614,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "local_only",
       "description": "Reboot an Access hardware device (hub, reader, relay, intercom). The device will be temporarily offline during reboot. Requires confirm=true to execute. Only available via local proxy session.",
       "name": "access_reboot_device",
       "permission_action": "update",
@@ -2419,7 +2627,7 @@
               "type": "boolean"
             },
             "device_id": {
-              "description": "Device UUID (from access_list_devices)",
+              "description": "Device identifier returned as 'id' by access_list_devices. This is a MAC address on the Integration API path and an Access topology unique ID on the local proxy path.",
               "type": "string"
             }
           },
@@ -2505,6 +2713,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Get recent events from the in-memory websocket buffer. Fast (no API call). Supports filtering by event type and door. Use for real-time monitoring; use access_list_events for historical queries.",
       "name": "access_recent_events",
       "permission_action": "read",
@@ -2517,7 +2726,7 @@
               "type": "string"
             },
             "event_type": {
-              "description": "Filter by event type: door_open, door_close, access_granted, access_denied, door_alarm.",
+              "description": "Filter by event type, matched exactly against the controller's own dotted event names as delivered over the websocket - e.g. 'access.door.unlock', 'access.dps.status.update', 'access.logs.add', 'access.hw.door_bell', 'access.data.device.remote_unlock'. Omit to return every buffered event.",
               "type": "string"
             },
             "limit": {
@@ -2605,6 +2814,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "local_only",
       "description": "Revoke (delete) an access credential. This permanently removes the credential from the system. Requires confirm=true to execute. Only available via local proxy session.",
       "name": "access_revoke_credential",
       "permission_action": "delete",
@@ -2703,6 +2913,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
+      "auth_method": "either",
       "description": "Returns instructions for subscribing to real-time Access events. Provides the MCP resource URI for the event stream and guidance on polling intervals. Use this to set up continuous event monitoring.",
       "name": "access_subscribe_events",
       "permission_action": "read",
@@ -2791,7 +3002,8 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Discover UniFi Access tools (door locks, access readers, credentials, visitors, access policies, and entry events) through the UniFi compatibility index. Standard MCP clients should prefer tools/list when it exposes the needed tools.",
+      "auth_method": "local_only",
+      "description": "Discover UniFi Access tools (door locks, access readers, credentials, visitors, access policies, and entry events) through the compact tool index. The catalog is manifest-backed in lazy mode; in meta-only mode it starts with registered meta-tools and expands after domain modules execute. Standard MCP clients should prefer tools/list when it exposes the needed tools.",
       "name": "access_tool_index",
       "schema": {
         "input": {
@@ -2802,11 +3014,15 @@
             },
             "include_schemas": {
               "default": false,
-              "description": "Include full input/output schemas per tool. Defaults to false \u2014 set true with a category or search filter to get parameter details for specific tools.",
+              "description": "Include full input/output schemas per tool. Defaults to false \u2014 set true with a name, category or search filter to get parameter details for specific tools.",
               "type": "boolean"
             },
+            "name": {
+              "description": "Exact, case-sensitive tool name. Cannot be combined with category or search. Unknown names return an empty index.",
+              "type": "string"
+            },
             "search": {
-              "description": "Case-insensitive substring match against tool name and description.",
+              "description": "Case-insensitive token search over tool names and descriptions. Ignores common words and one-character terms; multi-word queries require at least half of usable terms (minimum two). Terms of four or more characters also match token prefixes. Results are ranked by exact phrase and name matches, with at most 20 returned. An empty string applies no filter; a non-empty query with no usable terms returns no tools.",
               "type": "string"
             }
           },
@@ -2826,7 +3042,7 @@
               "type": "integer"
             },
             "filtered": {
-              "description": "True when category or search filter was applied",
+              "description": "True when name, category or search filter was applied",
               "type": "boolean"
             },
             "tools": {
@@ -2845,6 +3061,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "either",
       "description": "Unlock a door for a specified duration. This is a physical real-world action. Requires confirm=true to execute. Default duration is 2 seconds.",
       "name": "access_unlock_door",
       "permission_action": "update",
@@ -2944,10 +3161,121 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
         "readOnlyHint": false
       },
+      "auth_method": "local_only",
+      "description": "Update a device's settings (its configs[] entries), e.g. the reader voice greeting. Pass 'updates' as a {key: value} map; only keys the device already exposes may be set (call access_get_device_configs first to discover them), and credential/secret keys are refused. Requires confirm=true to execute; confirm=false returns a preview of the current\u2192proposed change. Only available via local proxy session.",
+      "name": "access_update_device_config",
+      "permission_action": "update",
+      "permission_category": "device",
+      "schema": {
+        "input": {
+          "properties": {
+            "confirm": {
+              "description": "When true, applies the update. When false (default), returns a preview.",
+              "type": "boolean"
+            },
+            "device_id": {
+              "description": "Device identifier returned as 'id' by access_list_devices. This is a MAC address on the Integration API path and an Access topology unique ID on the local proxy path.",
+              "type": "string"
+            },
+            "is_camera": {
+              "description": "Override the camera-class flag for the config PUT. Omit to auto-derive from the device (camera-class readers vs hubs).",
+              "type": "boolean"
+            },
+            "updates": {
+              "description": "Map of config key \u2192 new value. Keys must already exist on the device.",
+              "type": "object"
+            }
+          },
+          "required": [
+            "device_id",
+            "updates"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "description": "Structured view of the existing UniFi MCP tool response contract.",
+          "properties": {
+            "data": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Successful result payload.",
+              "title": "Data"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Actionable error message for handled failures.",
+              "title": "Error"
+            },
+            "preview": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Mutation preview payload returned before confirmation.",
+              "title": "Preview"
+            },
+            "requires_confirmation": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "True when a mutation preview requires caller confirmation.",
+              "title": "Requires Confirmation"
+            },
+            "success": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "True when the tool call succeeded; false for handled errors.",
+              "title": "Success"
+            }
+          },
+          "title": "UniFiToolResponse",
+          "type": "object"
+        }
+      },
+      "title": "Update Device Config"
+    },
+    {
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "auth_method": "local_only",
       "description": "Update an access policy's configuration. Supported fields include name, door_ids, schedule_id, user_group_ids, and enabled. Requires confirm=true to apply. Only available via local proxy session.",
       "name": "access_update_policy",
       "permission_action": "update",

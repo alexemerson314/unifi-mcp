@@ -7,9 +7,36 @@ from unittest.mock import MagicMock
 import pytest
 from unifi_mcp_shared.protocol import (
     DEFAULT_MCP_PROTOCOL_REVISION,
+    FUTURE_MCP_PROTOCOL_REVISION,
     create_mcp_tool_adapter,
     get_protocol_revision,
+    get_request_protocol_revision,
+    is_known_protocol_target,
+    structured_content_supported,
 )
+
+
+@pytest.mark.parametrize("revision", ["2025-06-18", "2025-11-25", "2026-07-28", "2027-01-01"])
+def test_structured_content_supported_for_current_and_future_revisions(revision):
+    assert structured_content_supported(revision) is True
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [None, "", "2024-11-05", "2025-03-26", "not-a-date", "20250618", "2025-W25-3"],
+)
+def test_structured_content_not_assumed_for_old_or_unknown_revisions(revision):
+    assert structured_content_supported(revision) is False
+
+
+def test_request_protocol_revision_reads_current_sdk_session():
+    context = MagicMock()
+    context.request_context.protocol_version = "2025-11-25"
+    assert get_request_protocol_revision(context) == "2025-11-25"
+
+
+def test_request_protocol_revision_returns_none_outside_request():
+    assert get_request_protocol_revision(None) is None
 
 
 class TestGetProtocolRevision:
@@ -35,6 +62,13 @@ class TestGetProtocolRevision:
         monkeypatch.setenv("UNIFI_MCP_PROTOCOL_VERSION", "v1")
         assert get_protocol_revision() == DEFAULT_MCP_PROTOCOL_REVISION
 
+    def test_future_revision_is_known_target(self):
+        assert FUTURE_MCP_PROTOCOL_REVISION == "2026-07-28"
+        assert is_known_protocol_target("2026-07-28") is True
+
+    def test_unknown_revision_is_not_known_target(self):
+        assert is_known_protocol_target("2026-06-18") is False
+
 
 class TestCreateMcpToolAdapter:
     """Test the tool decorator adapter factory."""
@@ -49,10 +83,16 @@ class TestCreateMcpToolAdapter:
         adapter = create_mcp_tool_adapter(mock_decorator, protocol_revision="v1")
         assert adapter is mock_decorator
 
-    def test_unsupported_revision_raises(self):
+    def test_unknown_revision_is_ignored_for_per_client_negotiation(self, caplog):
         mock_decorator = MagicMock()
-        with pytest.raises(ValueError, match="Unsupported MCP protocol revision"):
-            create_mcp_tool_adapter(mock_decorator, protocol_revision="2026-06-18")
+        adapter = create_mcp_tool_adapter(mock_decorator, protocol_revision="2026-06-18")
+        assert adapter is mock_decorator
+        assert "negotiates the protocol per client" in caplog.text
+
+    def test_future_target_revision_uses_same_negotiated_adapter(self):
+        mock_decorator = MagicMock()
+        adapter = create_mcp_tool_adapter(mock_decorator, protocol_revision="2026-07-28")
+        assert adapter is mock_decorator
 
     def test_v2_revision_alias_raises(self):
         mock_decorator = MagicMock()

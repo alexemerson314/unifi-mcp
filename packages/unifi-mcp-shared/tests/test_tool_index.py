@@ -1,6 +1,7 @@
 """Tests for the shared tool_index module."""
 
 import json
+from pathlib import Path
 
 import pytest
 from unifi_mcp_shared.tool_index import (
@@ -9,6 +10,8 @@ from unifi_mcp_shared.tool_index import (
     get_tool_index,
     register_tool,
 )
+
+SEARCH_FIXTURE = json.loads((Path(__file__).resolve().parents[3] / "tests/fixtures/tool_search_cases.json").read_text())
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +125,16 @@ class TestRegisterTool:
 
 class TestGetToolIndex:
     """Tests for get_tool_index."""
+
+    @pytest.mark.parametrize("mode", ["eager", "lazy", "meta_only"])
+    @pytest.mark.parametrize("include_schemas", [False, True])
+    @pytest.mark.parametrize("requirement", ["local_only", "api_key_only", "either", "both"])
+    def test_auth_requirement_survives_all_registration_modes(self, tmp_path, mode, requirement, include_schemas):
+        register_tool(name="credential_tool", description="test", auth_method=requirement)
+        manifest_path = tmp_path / "tools_manifest.json"
+        manifest_path.write_text(json.dumps({"tools": [TOOL_REGISTRY["credential_tool"].to_dict()]}))
+        result = get_tool_index(registration_mode=mode, manifest_path=manifest_path, include_schemas=include_schemas)
+        assert result["tools"][0]["auth_method"] == requirement
 
     def test_returns_registered_tools(self):
         register_tool(name="tool_a", description="Tool A")
@@ -300,6 +313,79 @@ class TestGetToolIndex:
         index = get_tool_index(registration_mode="eager", search="LIST")
         assert index["count"] == 1
 
+    @pytest.mark.parametrize(
+        ("search", "expected"),
+        [(case["search"], case["expected"]) for case in SEARCH_FIXTURE["cases"]],
+        ids=[case["search"] or "empty" for case in SEARCH_FIXTURE["cases"]],
+    )
+    def test_search_contract_matches_shared_fixture(self, search, expected):
+        for tool in SEARCH_FIXTURE["tools"]:
+            register_tool(**tool)
+
+        index = get_tool_index(registration_mode="eager", search=search)
+
+        assert [tool["name"] for tool in index["tools"]] == expected
+
+    def test_search_prioritizes_exact_phrase(self):
+        register_tool(name="unifi_firewall_policy_update", description="Modify policy configuration")
+        register_tool(name="unifi_exact_wall_policy", description="Apply the wall policy update workflow")
+
+        index = get_tool_index(registration_mode="eager", search="wall policy update")
+
+        assert [tool["name"] for tool in index["tools"]] == [
+            "unifi_exact_wall_policy",
+            "unifi_firewall_policy_update",
+        ]
+
+    def test_search_does_not_create_exact_phrase_across_fields(self):
+        register_tool(name="unifi_wall_alpha", description="Configure policy update")
+        register_tool(name="unifi_wall", description="Policy update settings")
+
+        index = get_tool_index(registration_mode="eager", search="wall policy update")
+
+        assert [tool["name"] for tool in index["tools"]] == ["unifi_wall_alpha", "unifi_wall"]
+
+    def test_search_preserves_source_order_for_ties(self):
+        register_tool(name="unifi_alpha", description="Inspect client details")
+        register_tool(name="unifi_beta", description="Inspect client details")
+
+        index = get_tool_index(registration_mode="eager", search="inspect client")
+
+        assert [tool["name"] for tool in index["tools"]] == ["unifi_alpha", "unifi_beta"]
+
+    def test_search_caps_results(self):
+        for index in range(25):
+            register_tool(name=f"unifi_client_{index:02}", description="Inspect a client")
+
+        result = get_tool_index(registration_mode="eager", search="client")
+
+        assert result["count"] == 20
+        assert [tool["name"] for tool in result["tools"]] == [f"unifi_client_{index:02}" for index in range(20)]
+
+    def test_empty_search_applies_no_filter(self):
+        for tool in SEARCH_FIXTURE["tools"]:
+            register_tool(**tool)
+
+        result = get_tool_index(registration_mode="eager", search="")
+
+        assert result["count"] == len(SEARCH_FIXTURE["tools"])
+        assert "filtered" not in result
+
+    def test_search_contract_in_lazy_mode(self, tmp_path):
+        manifest_path = tmp_path / "tools_manifest.json"
+        manifest_path.write_text(json.dumps({"tools": SEARCH_FIXTURE["tools"], "count": len(SEARCH_FIXTURE["tools"])}))
+
+        result = get_tool_index(
+            registration_mode="lazy",
+            manifest_path=manifest_path,
+            search="update tx power",
+        )
+
+        assert [tool["name"] for tool in result["tools"]] == [
+            "unifi_update_device_radio",
+            "unifi_get_device_radio",
+        ]
+
     # --- Categories metadata ---
 
     def test_categories_always_present(self):
@@ -426,3 +512,39 @@ class TestToolMetadataAnnotations:
             input_schema={"type": "object"},
         )
         assert meta.annotations is None
+
+
+@pytest.mark.parametrize("mode", ["lazy", "eager", "meta_only"])
+@pytest.mark.parametrize("include_schemas", [False, True])
+def test_exact_name_lookup(mode, include_schemas, tmp_path):
+    schema = {"type": "object", "properties": {"limit": {"type": "integer"}}}
+    register_tool("unifi_list_clients", "List clients", input_schema=schema, output_schema={"type": "object"})
+    register_tool("unifi_list_clients_extra", "List clients extra")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(get_tool_index(registration_mode="eager", include_schemas=True)))
+    result = get_tool_index(mode, manifest, name="unifi_list_clients", include_schemas=include_schemas)
+    assert result["count"] == 1
+    assert result["filtered"] is True
+    assert [tool["name"] for tool in result["tools"]] == ["unifi_list_clients"]
+    assert ("schema" in result["tools"][0]) is include_schemas
+    if include_schemas:
+        assert result["tools"][0]["schema"] == {"input": schema, "output": {"type": "object"}}
+
+
+@pytest.mark.parametrize("name", ["", "unifi_list", "UNIFI_LIST_CLIENTS", " unifi_list_clients", "missing"])
+def test_exact_name_unknown_returns_empty_index(name):
+    register_tool("unifi_list_clients", "List clients")
+    assert get_tool_index(registration_mode="eager", name=name) == {
+        "tools": [],
+        "count": 0,
+        "categories": [],
+        "filtered": True,
+    }
+
+
+@pytest.mark.parametrize("filters", [{"search": "client"}, {"category": "clients"}, {"search": ""}, {"category": ""}])
+def test_exact_name_rejects_other_filters(filters):
+    result = get_tool_index(name="unifi_list_clients", **filters)
+    assert result["success"] is False
+    assert "name" in result["error"]
+    assert "category" in result["error"] and "search" in result["error"]

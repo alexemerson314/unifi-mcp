@@ -15,13 +15,13 @@ import logging
 from typing import Annotated, Any, Dict, List, Optional
 
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, ValidationError
 
-from unifi_core.confirmation import create_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, update_preview
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.models.acl import (
     MUTABLE_FIELDS,
-    AclRule,
+    build_acl_rule,
     from_controller,
     to_controller_create,
     to_controller_update,
@@ -108,7 +108,9 @@ async def get_acl_rule_details(
     name="unifi_create_acl_rule",
     description="Create a new MAC ACL rule for Layer 2 access control within a VLAN. "
     "Uses the same field names as unifi_list_acl_rules output — source_macs, destination_macs, "
-    "network_id, action, etc. Empty MAC list = match any device. Requires confirmation.",
+    "network_id, action, etc. Empty MAC list = match any device. Optionally apply a netmask "
+    "(source_netmask/destination_netmask) to match a leading-bit prefix instead of exact MACs. "
+    "Requires confirmation.",
     permission_category="acl_rules",
     permission_action="create",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
@@ -133,6 +135,22 @@ async def create_acl_rule(
         Optional[List[str]],
         Field(description="List of destination MAC addresses to match (empty list = any destination)"),
     ] = None,
+    source_netmask: Annotated[
+        Optional[int],
+        Field(
+            description="Optional netmask for source_macs — number of leading bits that must match "
+            "(e.g. 24 matches the vendor OUI, 48 matches the complete MAC). Omit for an exact match; "
+            "do NOT pass 0 to mean 'no mask' — 0 matches ANY MAC."
+        ),
+    ] = None,
+    destination_netmask: Annotated[
+        Optional[int],
+        Field(
+            description="Optional netmask for destination_macs — number of leading bits that must match "
+            "(e.g. 24 matches the vendor OUI, 48 matches the complete MAC). Omit for an exact match; "
+            "do NOT pass 0 to mean 'no mask' — 0 matches ANY MAC."
+        ),
+    ] = None,
     confirm: Annotated[
         bool,
         Field(description="When true, creates the rule. When false (default), returns a preview of the changes"),
@@ -149,6 +167,8 @@ async def create_acl_rule(
         enabled (bool): Whether the rule is active. Defaults to True.
         source_macs (list): List of source MAC addresses. Empty list or None = any.
         destination_macs (list): List of destination MAC addresses. Empty list or None = any.
+        source_netmask (int): Optional leading-bit match count for source_macs (e.g. 24=OUI, 48=full MAC). None = exact.
+        destination_netmask (int): Optional leading-bit match count for destination_macs. None = exact.
         confirm (bool): Must be True to execute. False returns a preview.
 
     Returns:
@@ -156,15 +176,23 @@ async def create_acl_rule(
     """
     logger.info("unifi_create_acl_rule called (name=%s, action=%s, confirm=%s)", name, action, confirm)
 
-    rule = AclRule(
-        name=name,
-        acl_index=acl_index,
-        action=action.upper(),
-        enabled=enabled,
-        network_id=network_id,
-        source_macs=source_macs if source_macs is not None else [],
-        destination_macs=destination_macs if destination_macs is not None else [],
-    )
+    try:
+        rule = build_acl_rule(
+            {
+                "name": name,
+                "acl_index": acl_index,
+                "action": action,
+                "enabled": enabled,
+                "network_id": network_id,
+                "source_macs": source_macs,
+                "destination_macs": destination_macs,
+                "source_netmask": source_netmask,
+                "destination_netmask": destination_netmask,
+            }
+        )
+    except ValidationError as e:
+        msg = e.errors()[0].get("msg", str(e)) if e.errors() else str(e)
+        return {"success": False, "error": f"Invalid ACL rule: {msg}"}
     controller_payload = to_controller_create(rule)
 
     if not confirm:
@@ -195,7 +223,10 @@ async def create_acl_rule(
     description="Update an existing MAC ACL rule. Pass only the fields you want to change — "
     "current values are automatically preserved. "
     "Uses the same field names as unifi_list_acl_rules output: name, acl_index, action, enabled, "
-    "network_id, source_macs, destination_macs. Requires confirmation.",
+    "network_id, source_macs, destination_macs, source_netmask, destination_netmask. "
+    "To remove a netmask (widen a prefix rule back to an exact match), set clear_source_netmask / "
+    "clear_destination_netmask = true (passing source_netmask=null is a no-op, not a clear). "
+    "Requires confirmation.",
     permission_category="acl_rules",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
@@ -210,9 +241,20 @@ async def update_acl_rule(
             description="Dictionary of fields to update. Pass only the fields you want to change — "
             "current values are automatically preserved. "
             "Allowed keys: name, acl_index, action ('ALLOW'/'BLOCK'), enabled (bool), "
-            "network_id, source_macs (list of MACs), destination_macs (list of MACs)"
+            "network_id, source_macs (list of MACs), destination_macs (list of MACs), "
+            "source_netmask (int, e.g. 24=OUI/48=full MAC), destination_netmask (int)"
         ),
     ],
+    clear_source_netmask: Annotated[
+        bool,
+        Field(
+            description="When true, removes the source netmask (revert to exact-MAC match). Overrides source_netmask."
+        ),
+    ] = False,
+    clear_destination_netmask: Annotated[
+        bool,
+        Field(description="When true, removes the destination netmask (revert to exact-MAC match)."),
+    ] = False,
     confirm: Annotated[
         bool,
         Field(description="When true, applies the update. When false (default), returns a preview of the changes"),
@@ -222,7 +264,7 @@ async def update_acl_rule(
     logger.info("unifi_update_acl_rule called (rule_id=%s, confirm=%s)", rule_id, confirm)
     if not rule_id:
         return {"success": False, "error": "rule_id is required"}
-    if not rule_data:
+    if not rule_data and not (clear_source_netmask or clear_destination_netmask):
         return {"success": False, "error": "rule_data cannot be empty"}
 
     # Validate field names against the model's mutable fields
@@ -238,8 +280,16 @@ async def update_acl_rule(
     if not is_valid:
         return {"success": False, "error": type_error}
 
+    # Add the clear-netmask sentinels (handled by to_controller_update / the manager),
+    # separate from rule_data so they bypass the MUTABLE_FIELDS check above.
+    update_fields = dict(rule_data)
+    if clear_source_netmask:
+        update_fields["clear_source_netmask"] = True
+    if clear_destination_netmask:
+        update_fields["clear_destination_netmask"] = True
+
     # Translate model field names to controller API shape
-    controller_update = to_controller_update(rule_data)
+    controller_update = to_controller_update(update_fields)
 
     if not confirm:
         return update_preview(
@@ -247,7 +297,7 @@ async def update_acl_rule(
             resource_id=rule_id,
             resource_name=rule_id,
             current_state={},
-            updates=rule_data,
+            updates=update_fields,
         )
 
     try:
@@ -297,15 +347,13 @@ async def delete_acl_rule(
         return {"success": False, "error": "rule_id is required"}
 
     if not confirm:
-        return {
-            "success": True,
-            "requires_confirmation": True,
-            "action": "delete",
-            "resource_type": "acl_rule",
-            "rule_id": rule_id,
-            "message": f"Will delete ACL rule '{rule_id}'. Set confirm=true to execute. "
-            "WARNING: Removing an ALLOW rule may block device communication.",
-        }
+        return delete_preview(
+            resource_type="acl_rule",
+            resource_id=rule_id,
+            resource_data={"rule_id": rule_id},
+            resource_name=rule_id,
+            warnings=["Removing an ALLOW rule may block device communication."],
+        )
 
     try:
         success = await acl_manager.delete_acl_rule(rule_id)

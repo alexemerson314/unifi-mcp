@@ -1,6 +1,7 @@
 """Tests for event/alarm tool confirmation previews."""
 
 import os
+import re
 
 import pytest
 
@@ -33,3 +34,213 @@ async def test_archive_all_alarms_preview_requires_confirmation():
     assert result["resource_type"] == "alarm_collection"
     assert result["resource_id"] == "all_active_alarms"
     assert result["preview"]["proposed"]["archived"] is True
+
+
+class _StubConnection:
+    site = "default"
+
+
+class _StubEventManager:
+    """Minimal stand-in for EventManager returning canned records."""
+
+    _connection = _StubConnection()
+
+    def __init__(self, records):
+        self._records = records
+
+    async def get_events(self, **_kwargs):
+        return self._records
+
+    async def get_event_types(self):
+        return self._records
+
+
+_V2_RECORD = {
+    "id": "evt-0001",
+    "key": "TRAFFIC_BLOCKED_KNOWN_SOURCE_CLIENT",
+    "severity": "MEDIUM",
+    "timestamp": 1786225096952,
+    "message_raw": "{SRC_CLIENT} was blocked from accessing {DST_IP} by the {TRIGGER} Firewall Policy.",
+    "parameters": {
+        "SRC_CLIENT": {"id": "aa:bb:cc:00:00:01", "ip": "192.0.2.11", "name": "Lab-Camera"},
+        "DST_IP": {"id": "198.51.100.24", "name": "198.51.100.24"},
+        "TRIGGER": {"id": "trigger-0001", "name": "block cameras to external"},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_list_events_surfaces_mac_ip_and_msg_for_v2_records(monkeypatch):
+    """End-to-end through the tool: v2 records must not come back anonymous.
+
+    ``model_dump(exclude_none=True)`` drops unresolved fields, so a mapping
+    gap shows up as missing keys rather than nulls.
+    """
+    from unifi_network_mcp.tools import events as events_module
+
+    monkeypatch.setattr(
+        events_module,
+        "_get_event_manager",
+        lambda: _StubEventManager([_V2_RECORD]),
+    )
+
+    result = await events_module.list_events(within_hours=1, limit=10)
+
+    assert result["success"] is True
+    assert result["count"] == 1
+    event = result["events"][0]
+    assert event["mac"] == "aa:bb:cc:00:00:01"
+    assert event["ip"] == "192.0.2.11"
+    assert event["msg"] == (
+        "Lab-Camera was blocked from accessing 198.51.100.24 by the block cameras to external Firewall Policy."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["list_events", "unifi_recent_events"])
+async def test_event_tools_reject_negative_limit_before_controller_io(monkeypatch, tool_name):
+    from unifi_network_mcp.tools import events as events_module
+
+    def unexpected_manager_lookup():
+        raise AssertionError("negative limit must not reach the event manager")
+
+    monkeypatch.setattr(events_module, "_get_event_manager", unexpected_manager_lookup)
+
+    result = await getattr(events_module, tool_name)(limit=-1)
+
+    operation = "list events" if tool_name == "list_events" else "get recent events"
+    assert result == {"success": False, "error": f"Failed to {operation}: limit must be zero or greater"}
+
+
+@pytest.mark.asyncio
+async def test_list_events_still_maps_legacy_records(monkeypatch):
+    from unifi_network_mcp.tools import events as events_module
+
+    legacy = {
+        "_id": "legacy-1",
+        "key": "EVT_WU_Disconnected",
+        "msg": "Client disconnected",
+        "time": 1700000000000,
+        "user": "aa:bb:cc:00:00:09",
+        "ip": "192.0.2.50",
+    }
+    monkeypatch.setattr(
+        events_module,
+        "_get_event_manager",
+        lambda: _StubEventManager([legacy]),
+    )
+
+    event = (await events_module.list_events())["events"][0]
+
+    assert event["mac"] == "aa:bb:cc:00:00:09"
+    assert event["ip"] == "192.0.2.50"
+    assert event["msg"] == "Client disconnected"
+
+
+@pytest.mark.asyncio
+async def test_get_event_types_returns_observed_exact_keys(monkeypatch):
+    from unifi_network_mcp.tools import events as events_module
+
+    observed = [
+        {
+            "key": "CLIENT_CONNECTED_WIRELESS_2",
+            "prefix": "CLIENT_CONNECTED_WIRELESS_2",
+            "description": "Exact event key observed in the 1,000 most recent events within the last 7 days",
+            "observed_count": 4,
+        }
+    ]
+    monkeypatch.setattr(
+        events_module,
+        "_get_event_manager",
+        lambda: _StubEventManager(observed),
+    )
+
+    result = await events_module.get_event_types()
+
+    assert result["success"] is True
+    assert result["event_types"] == observed
+    assert result["usage"] == (
+        "Use a key value with the unifi_list_events event_type parameter. "
+        "Keys are sampled from the 1,000 most recent events within the last 7 days."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_event_types_returns_standard_error_when_discovery_fails(monkeypatch):
+    from unifi_network_mcp.tools import events as events_module
+
+    manager = _StubEventManager([])
+
+    async def fail_discovery():
+        raise RuntimeError("controller event query failed")
+
+    manager.get_event_types = fail_discovery
+    monkeypatch.setattr(events_module, "_get_event_manager", lambda: manager)
+
+    result = await events_module.get_event_types()
+
+    assert result == {
+        "success": False,
+        "error": "Failed to get event types: controller event query failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_events_passes_categories_and_severities_through(monkeypatch):
+    """The manager already accepts categories/severities; the tool must expose and forward them."""
+    from unifi_network_mcp.tools import events as events_module
+
+    captured: dict = {}
+
+    class _CapturingEventManager(_StubEventManager):
+        async def get_events(self, **kwargs):
+            captured.update(kwargs)
+            return self._records
+
+    monkeypatch.setattr(events_module, "_get_event_manager", lambda: _CapturingEventManager([]))
+
+    result = await events_module.list_events(categories=["SECURITY"], severities=["HIGH", "VERY_HIGH"])
+
+    assert result["success"] is True
+    assert captured["categories"] == ["SECURITY"]
+    assert captured["severities"] == ["HIGH", "VERY_HIGH"]
+    assert result["filters"]["categories"] == ["SECURITY"]
+    assert result["filters"]["severities"] == ["HIGH", "VERY_HIGH"]
+
+
+def _bracketed_examples(text: str) -> list[str]:
+    """Return every quoted value inside a bracketed example list in ``text``."""
+    values: list[str] = []
+    for group in re.findall(r"\[([^\]]*)\]", text):
+        values.extend(re.findall(r"'([A-Z_]+)'", group))
+    return values
+
+
+def test_list_events_examples_use_controller_supported_spellings():
+    """Every category/severity example the tool advertises must be a manager-known spelling.
+
+    Maintainer live run on Network 10.6.102: ``categories=["DEVICES"]`` and
+    ``severities=["CRITICAL"]`` both fail on the controller, yet the tool
+    description, the manifest and the API catalog advertised them.
+    """
+    from unifi_core.network.managers import event_manager as manager_module
+    from unifi_network_mcp.tools import events as events_module
+
+    known_categories = {entry["category"] for entry in manager_module.EventManager.get_event_categories(None)}
+    known_severities = set(manager_module._DEFAULT_SEVERITIES)
+
+    tool = events_module.server._tool_manager.get_tool("unifi_list_events")
+    assert tool is not None
+    schema = tool.parameters["properties"]
+
+    advertised_categories = set(_bracketed_examples(schema["categories"]["description"]))
+    advertised_severities = set(_bracketed_examples(schema["severities"]["description"]))
+    advertised_in_description = set(_bracketed_examples(tool.description))
+
+    assert advertised_categories, "category example missing from the parameter description"
+    assert advertised_severities, "severity example missing from the parameter description"
+    assert advertised_in_description <= known_categories | known_severities, (
+        advertised_in_description - known_categories - known_severities
+    )
+    assert advertised_categories <= known_categories, advertised_categories - known_categories
+    assert advertised_severities <= known_severities, advertised_severities - known_severities

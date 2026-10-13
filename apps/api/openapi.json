@@ -26,12 +26,34 @@
             ],
             "title": "Action"
           },
+          "destination_mac_mask": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination Mac Mask"
+          },
           "destination_macs": {
             "items": {
               "type": "string"
             },
             "title": "Destination Macs",
             "type": "array"
+          },
+          "destination_netmask": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination Netmask"
           },
           "destination_type": {
             "anyOf": [
@@ -81,12 +103,34 @@
             ],
             "title": "Network Id"
           },
+          "source_mac_mask": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Mac Mask"
+          },
           "source_macs": {
             "items": {
               "type": "string"
             },
             "title": "Source Macs",
             "type": "array"
+          },
+          "source_netmask": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Netmask"
           },
           "source_type": {
             "anyOf": [
@@ -107,20 +151,23 @@
         "properties": {
           "args": {
             "additionalProperties": true,
-            "default": {},
+            "description": "Arguments from the catalog entry's input schema.",
             "title": "Args",
             "type": "object"
           },
           "confirm": {
             "default": false,
+            "description": "For mutations, false validates and returns a non-mutating preview; true executes the action. Read actions execute regardless of this value.",
             "title": "Confirm",
             "type": "boolean"
           },
           "controller": {
+            "description": "Registered controller identifier.",
             "title": "Controller",
             "type": "string"
           },
           "site": {
+            "description": "Controller site to use for this action.",
             "title": "Site",
             "type": "string"
           }
@@ -313,6 +360,17 @@
               }
             ],
             "title": "Mac"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
           }
         },
         "title": "BlockedClientModel",
@@ -329,6 +387,17 @@
               }
             ],
             "title": "Channels"
+          },
+          "firmware_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Firmware Version"
           },
           "hdr_mode": {
             "anyOf": [
@@ -384,6 +453,17 @@
               }
             ],
             "title": "Is Motion Detected"
+          },
+          "is_ptz": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Ptz"
           },
           "is_recording": {
             "anyOf": [
@@ -472,6 +552,20 @@
               }
             ],
             "title": "Name"
+          },
+          "smart_detect_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Smart Detect Types"
           },
           "speaker_volume": {
             "anyOf": [
@@ -604,6 +698,18 @@
             ],
             "title": "Hostname"
           },
+          "integration_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family \u2014 do not pass them to legacy resource tools.",
+            "title": "Integration Id"
+          },
           "ip": {
             "anyOf": [
               {
@@ -616,12 +722,26 @@
             "title": "Ip"
           },
           "is_guest": {
-            "title": "Is Guest",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Guest"
           },
           "is_wired": {
-            "title": "Is Wired",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Wired"
           },
           "last_seen": {
             "anyOf": [
@@ -645,6 +765,17 @@
             ],
             "title": "Mac"
           },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
           "note": {
             "anyOf": [
               {
@@ -655,6 +786,17 @@
               }
             ],
             "title": "Note"
+          },
+          "source_api": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Api"
           },
           "status": {
             "title": "Status",
@@ -746,6 +888,42 @@
             "title": "Safe Search",
             "type": "array"
           },
+          "schedule_date_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Date End"
+          },
+          "schedule_date_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Date Start"
+          },
+          "schedule_days": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Days"
+          },
           "schedule_mode": {
             "anyOf": [
               {
@@ -756,6 +934,39 @@
               }
             ],
             "title": "Schedule Mode"
+          },
+          "schedule_time_all_day": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Time All Day"
+          },
+          "schedule_time_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Time End"
+          },
+          "schedule_time_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Time Start"
           }
         },
         "title": "ContentFilterModel",
@@ -788,6 +999,7 @@
             "type": "string"
           },
           "password": {
+            "default": "",
             "title": "Password",
             "type": "string"
           },
@@ -799,6 +1011,7 @@
             "type": "array"
           },
           "username": {
+            "default": "",
             "title": "Username",
             "type": "string"
           },
@@ -811,8 +1024,6 @@
         "required": [
           "name",
           "base_url",
-          "username",
-          "password",
           "product_kinds"
         ],
         "title": "ControllerIn",
@@ -1059,6 +1270,35 @@
           }
         },
         "title": "CredentialModel",
+        "type": "object"
+      },
+      "CustomServiceModel": {
+        "additionalProperties": true,
+        "properties": {
+          "address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Address"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "CustomServiceModel",
         "type": "object"
       },
       "Detail_AclRuleModel_": {
@@ -1311,6 +1551,31 @@
         "title": "Detail[DoorModel]",
         "type": "object"
       },
+      "Detail_DynamicDnsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DynamicDnsModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[DynamicDnsModel]",
+        "type": "object"
+      },
       "Detail_FirewallGroupModel_": {
         "additionalProperties": true,
         "properties": {
@@ -1336,6 +1601,31 @@
         "title": "Detail[FirewallGroupModel]",
         "type": "object"
       },
+      "Detail_FirewallPolicyOrderingModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FirewallPolicyOrderingModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[FirewallPolicyOrderingModel]",
+        "type": "object"
+      },
       "Detail_FirewallRuleModel_": {
         "additionalProperties": true,
         "properties": {
@@ -1359,6 +1649,81 @@
           "data"
         ],
         "title": "Detail[FirewallRuleModel]",
+        "type": "object"
+      },
+      "Detail_GatewaySettingsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/GatewaySettingsModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[GatewaySettingsModel]",
+        "type": "object"
+      },
+      "Detail_MdnsSettingsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MdnsSettingsModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[MdnsSettingsModel]",
+        "type": "object"
+      },
+      "Detail_NatRuleModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/NatRuleModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[NatRuleModel]",
         "type": "object"
       },
       "Detail_NetworkModel_": {
@@ -1509,6 +1874,81 @@
           "data"
         ],
         "title": "Detail[RouteModel]",
+        "type": "object"
+      },
+      "Detail_ThreatManagementSettingsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ThreatManagementSettingsModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[ThreatManagementSettingsModel]",
+        "type": "object"
+      },
+      "Detail_ThreatPostureModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ThreatPostureModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[ThreatPostureModel]",
+        "type": "object"
+      },
+      "Detail_TrafficFlowStatisticsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TrafficFlowStatisticsModel"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[TrafficFlowStatisticsModel]",
         "type": "object"
       },
       "Detail_TrafficRouteModel_": {
@@ -1686,9 +2126,129 @@
         "title": "Detail[WlanModel]",
         "type": "object"
       },
+      "Detail_dict_": {
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "Detail[dict]",
+        "type": "object"
+      },
+      "DetectionSearchLabelsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "colors": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Colors"
+          },
+          "devices": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devices"
+          },
+          "door_access": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Door Access"
+          },
+          "event_types": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Types"
+          },
+          "group_type": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Type"
+          },
+          "smart_detect_types": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Smart Detect Types"
+          },
+          "vehicle_types": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vehicle Types"
+          }
+        },
+        "title": "DetectionSearchLabelsModel",
+        "type": "object"
+      },
       "DeviceModel": {
         "additionalProperties": true,
         "properties": {
+          "general_temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "General Temperature"
+          },
+          "integration_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family \u2014 do not pass them to legacy resource tools.",
+            "title": "Integration Id"
+          },
           "ip": {
             "anyOf": [
               {
@@ -1742,6 +2302,17 @@
             ],
             "title": "Ports"
           },
+          "source_api": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Api"
+          },
           "state": {
             "anyOf": [
               {
@@ -1752,6 +2323,24 @@
               }
             ],
             "title": "State"
+          },
+          "system_stats": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Stats"
+          },
+          "temperatures": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperatures"
           },
           "type": {
             "anyOf": [
@@ -1774,6 +2363,15 @@
               }
             ],
             "title": "Uptime"
+          },
+          "uptime_stats": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uptime Stats"
           },
           "version": {
             "anyOf": [
@@ -2073,6 +2671,126 @@
         "title": "DpiCategoryModel",
         "type": "object"
       },
+      "DynamicDnsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "custom_service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Service"
+          },
+          "host_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Name"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interface"
+          },
+          "login": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Options"
+          },
+          "server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server"
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service"
+          },
+          "site_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site Id"
+          },
+          "x_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "X Password"
+          }
+        },
+        "title": "DynamicDnsModel",
+        "type": "object"
+      },
       "EventModel": {
         "additionalProperties": true,
         "properties": {
@@ -2152,6 +2870,39 @@
               }
             ],
             "title": "Recognized Person Name"
+          },
+          "recognized_plate_confidence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Confidence"
+          },
+          "recognized_plate_group_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Group Id"
+          },
+          "recognized_plate_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Text"
           },
           "score": {
             "anyOf": [
@@ -2253,6 +3004,16 @@
           }
         },
         "title": "FirewallGroupModel",
+        "type": "object"
+      },
+      "FirewallPolicyOrderingModel": {
+        "additionalProperties": true,
+        "properties": {
+          "ordering": {
+            "title": "Ordering"
+          }
+        },
+        "title": "FirewallPolicyOrderingModel",
         "type": "object"
       },
       "FirewallRuleModel": {
@@ -2490,6 +3251,542 @@
         "title": "FirewallZoneModel",
         "type": "object"
       },
+      "GatewaySettingsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "broadcast_ping": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Broadcast Ping"
+          },
+          "dns_verification": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dns Verification"
+          },
+          "echo_server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Echo Server"
+          },
+          "ftp_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ftp Module"
+          },
+          "geo_ip_filtering_block": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geo Ip Filtering Block"
+          },
+          "geo_ip_filtering_countries": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geo Ip Filtering Countries"
+          },
+          "geo_ip_filtering_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geo Ip Filtering Enabled"
+          },
+          "geo_ip_filtering_traffic_direction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geo Ip Filtering Traffic Direction"
+          },
+          "gre_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gre Module"
+          },
+          "h323_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "H323 Module"
+          },
+          "icmp_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icmp Timeout"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "mss_clamp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mss Clamp"
+          },
+          "offload_accounting": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offload Accounting"
+          },
+          "offload_l2_blocking": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offload L2 Blocking"
+          },
+          "offload_sch": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Offload Sch"
+          },
+          "other_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Other Timeout"
+          },
+          "pptp_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pptp Module"
+          },
+          "receive_redirects": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receive Redirects"
+          },
+          "send_redirects": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Send Redirects"
+          },
+          "sip_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sip Module"
+          },
+          "syn_cookies": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Syn Cookies"
+          },
+          "tcp_close_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Close Timeout"
+          },
+          "tcp_close_wait_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Close Wait Timeout"
+          },
+          "tcp_established_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Established Timeout"
+          },
+          "tcp_fin_wait_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Fin Wait Timeout"
+          },
+          "tcp_last_ack_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Last Ack Timeout"
+          },
+          "tcp_syn_recv_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Syn Recv Timeout"
+          },
+          "tcp_syn_sent_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Syn Sent Timeout"
+          },
+          "tcp_time_wait_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tcp Time Wait Timeout"
+          },
+          "tftp_module": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tftp Module"
+          },
+          "timeout_setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Setting Preference"
+          },
+          "udp_other_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Udp Other Timeout"
+          },
+          "udp_stream_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Udp Stream Timeout"
+          },
+          "unbind_wan_monitors": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unbind Wan Monitors"
+          },
+          "upnp_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upnp Enabled"
+          },
+          "upnp_nat_pmp_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upnp Nat Pmp Enabled"
+          },
+          "upnp_secure_mode": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upnp Secure Mode"
+          },
+          "upnp_wan_interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upnp Wan Interface"
+          }
+        },
+        "title": "GatewaySettingsModel",
+        "type": "object"
+      },
+      "GatewaySignatureModel": {
+        "additionalProperties": true,
+        "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Legacy Network device ID, not an Integration API UUID; null if unknown.",
+            "title": "Device Id"
+          },
+          "is_activating": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Activation state; null if unknown.",
+            "title": "Is Activating"
+          },
+          "mac_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Gateway MAC address; null if unknown.",
+            "title": "Mac Address"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Gateway display name; null if unknown.",
+            "title": "Name"
+          },
+          "rule_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Signature rule count; null if unknown.",
+            "title": "Rule Count"
+          },
+          "signature_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Controller signature type; null if unknown.",
+            "title": "Signature Type"
+          },
+          "update_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Signature update time in Unix milliseconds; null if unknown.",
+            "title": "Update Time"
+          }
+        },
+        "title": "GatewaySignatureModel",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -2671,9 +3968,823 @@
         "title": "KnownFaceModel",
         "type": "object"
       },
+      "KnownLicensePlateModel": {
+        "additionalProperties": true,
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "detections_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detections Count"
+          },
+          "enhanced_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enhanced Path"
+          },
+          "first_detected_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Detected At"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "image_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Path"
+          },
+          "is_degraded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Degraded"
+          },
+          "is_notification_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Notification Enabled"
+          },
+          "last_detected_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Detected At"
+          },
+          "matched_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched Name"
+          },
+          "metadata": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "tags": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "title": "KnownLicensePlateModel",
+        "type": "object"
+      },
+      "LegacyFirewallRuleModel": {
+        "additionalProperties": true,
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "dst_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Address"
+          },
+          "dst_address_ipv6": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Address Ipv6"
+          },
+          "dst_firewallgroup_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dst Firewallgroup Ids",
+            "type": "array"
+          },
+          "dst_networkconf_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Networkconf Id"
+          },
+          "dst_networkconf_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Networkconf Type"
+          },
+          "dst_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Port"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "icmp_typename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icmp Typename"
+          },
+          "icmpv6_typename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icmpv6 Typename"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "ipsec": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipsec"
+          },
+          "logging": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logging"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "no_delete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Delete"
+          },
+          "no_edit": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Edit"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol"
+          },
+          "protocol_match_excepted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol Match Excepted"
+          },
+          "protocol_v6": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol V6"
+          },
+          "rule_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Index"
+          },
+          "ruleset": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruleset"
+          },
+          "setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setting Preference"
+          },
+          "src_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Address"
+          },
+          "src_address_ipv6": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Address Ipv6"
+          },
+          "src_firewallgroup_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Src Firewallgroup Ids",
+            "type": "array"
+          },
+          "src_mac_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Mac Address"
+          },
+          "src_networkconf_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Networkconf Id"
+          },
+          "src_networkconf_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Networkconf Type"
+          },
+          "src_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Port"
+          },
+          "state_established": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Established"
+          },
+          "state_invalid": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Invalid"
+          },
+          "state_new": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State New"
+          },
+          "state_related": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Related"
+          }
+        },
+        "title": "LegacyFirewallRuleModel",
+        "type": "object"
+      },
+      "MdnsSettingsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "custom_services": {
+            "items": {
+              "$ref": "#/components/schemas/CustomServiceModel"
+            },
+            "title": "Custom Services",
+            "type": "array"
+          },
+          "enabled_for": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled For"
+          },
+          "enabled_for_network_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Enabled For Network Ids",
+            "type": "array"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "predefined_services": {
+            "items": {
+              "$ref": "#/components/schemas/PredefinedServiceModel"
+            },
+            "title": "Predefined Services",
+            "type": "array"
+          },
+          "site_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site Id"
+          }
+        },
+        "title": "MdnsSettingsModel",
+        "type": "object"
+      },
+      "NatRuleModel": {
+        "additionalProperties": true,
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "destination_filter": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination Filter"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "exclude": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "in_interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "In Interface"
+          },
+          "ip_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip Address"
+          },
+          "ip_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip Version"
+          },
+          "is_predefined": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Predefined"
+          },
+          "logging": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logging"
+          },
+          "out_interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Out Interface"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "pppoe_use_base_interface": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pppoe Use Base Interface"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol"
+          },
+          "rule_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Index"
+          },
+          "setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setting Preference"
+          },
+          "source_filter": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Filter"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "title": "NatRuleModel",
+        "type": "object"
+      },
       "NetworkModel": {
         "additionalProperties": true,
         "properties": {
+          "auto_scale_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Scale Enabled"
+          },
           "dhcp_relay_enabled": {
             "anyOf": [
               {
@@ -2927,6 +5038,72 @@
             ],
             "title": "Dhcpd Wins Enabled"
           },
+          "dhcpdv6_allow_slaac": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Allow Slaac"
+          },
+          "dhcpdv6_dns_auto": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Dns Auto"
+          },
+          "dhcpdv6_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Enabled"
+          },
+          "dhcpdv6_leasetime": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Leasetime"
+          },
+          "dhcpdv6_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Start"
+          },
+          "dhcpdv6_stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dhcpdv6 Stop"
+          },
           "dhcpguard_enabled": {
             "anyOf": [
               {
@@ -2950,8 +5127,27 @@
             "title": "Domain Name"
           },
           "enabled": {
-            "title": "Enabled",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "firewall_zone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "V2 firewall-zone ID. These IDs are scoped to the V2 firewall/network tool family; do not pass Integration API firewall-zone UUIDs.",
+            "title": "Firewall Zone Id"
           },
           "id": {
             "anyOf": [
@@ -2975,6 +5171,26 @@
             ],
             "title": "Igmp Flood Unknown Multicast"
           },
+          "igmp_proxy_for": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Igmp Proxy For"
+          },
+          "igmp_proxy_upstream": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Igmp Proxy Upstream"
+          },
           "igmp_querier_switches": {
             "anyOf": [
               {},
@@ -2994,6 +5210,18 @@
               }
             ],
             "title": "Igmp Snooping"
+          },
+          "integration_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family \u2014 do not pass them to legacy resource tools.",
+            "title": "Integration Id"
           },
           "internet_access_enabled": {
             "anyOf": [
@@ -3017,6 +5245,174 @@
             ],
             "title": "Ip Subnet"
           },
+          "ipv6_aliases": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Aliases"
+          },
+          "ipv6_client_address_assignment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Client Address Assignment"
+          },
+          "ipv6_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Enabled"
+          },
+          "ipv6_interface_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Interface Type"
+          },
+          "ipv6_pd_auto_prefixid_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Pd Auto Prefixid Enabled"
+          },
+          "ipv6_pd_interface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Pd Interface"
+          },
+          "ipv6_pd_prefixid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Pd Prefixid"
+          },
+          "ipv6_pd_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Pd Start"
+          },
+          "ipv6_pd_stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Pd Stop"
+          },
+          "ipv6_ra_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Ra Enabled"
+          },
+          "ipv6_ra_preferred_lifetime": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Ra Preferred Lifetime"
+          },
+          "ipv6_ra_priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Ra Priority"
+          },
+          "ipv6_setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Setting Preference"
+          },
+          "ipv6_wan_delegation_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipv6 Wan Delegation Type"
+          },
+          "mac_override_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mac Override Enabled"
+          },
           "mdns_enabled": {
             "anyOf": [
               {
@@ -3026,6 +5422,7 @@
                 "type": "null"
               }
             ],
+            "description": "Whether mDNS is enabled for this network. Read-only and not authoritative: mDNS is configured site-wide on current UniFi Network versions, and this key only mirrors that site-wide scope \u2014 the mirror can go stale for hours, so treat the site-level setting as the source of truth (this server does not expose it). The controller accepts this field on the per-network write path but silently ignores it; unifi_update_network rejects it as read-only.",
             "title": "Mdns Enabled"
           },
           "name": {
@@ -3060,6 +5457,28 @@
               }
             ],
             "title": "Purpose"
+          },
+          "report_wan_event": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Report Wan Event"
+          },
+          "source_api": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Api"
           },
           "subnet": {
             "anyOf": [
@@ -3104,6 +5523,203 @@
               }
             ],
             "title": "Vlan Enabled"
+          },
+          "wan_dhcpv6_pd_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Dhcpv6 Pd Size"
+          },
+          "wan_dhcpv6_pd_size_auto": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Dhcpv6 Pd Size Auto"
+          },
+          "wan_dns1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Dns1"
+          },
+          "wan_dns2": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Dns2"
+          },
+          "wan_dns_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Dns Preference"
+          },
+          "wan_failover_priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Failover Priority"
+          },
+          "wan_ip_aliases": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Ip Aliases"
+          },
+          "wan_ipv6_dns1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Ipv6 Dns1"
+          },
+          "wan_ipv6_dns2": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Ipv6 Dns2"
+          },
+          "wan_ipv6_dns_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Ipv6 Dns Preference"
+          },
+          "wan_load_balance_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Load Balance Type"
+          },
+          "wan_load_balance_weight": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Load Balance Weight"
+          },
+          "wan_networkgroup": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Networkgroup"
+          },
+          "wan_sla": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Controller WAN-SLA configuration ID for this uplink.",
+            "title": "Wan Sla"
+          },
+          "wan_smartq_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Smartq Enabled"
+          },
+          "wan_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Type"
+          },
+          "wan_type_v6": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Type V6"
+          },
+          "wan_vlan_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wan Vlan Enabled"
           }
         },
         "title": "NetworkModel",
@@ -3831,6 +6447,46 @@
         "title": "Page[DpiCategoryModel]",
         "type": "object"
       },
+      "Page_DynamicDnsModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DynamicDnsModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[DynamicDnsModel]",
+        "type": "object"
+      },
       "Page_EventModel_": {
         "additionalProperties": true,
         "properties": {
@@ -4029,6 +6685,126 @@
           "items"
         ],
         "title": "Page[KnownFaceModel]",
+        "type": "object"
+      },
+      "Page_KnownLicensePlateModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/KnownLicensePlateModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[KnownLicensePlateModel]",
+        "type": "object"
+      },
+      "Page_LegacyFirewallRuleModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LegacyFirewallRuleModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[LegacyFirewallRuleModel]",
+        "type": "object"
+      },
+      "Page_NatRuleModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NatRuleModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[NatRuleModel]",
         "type": "object"
       },
       "Page_NetworkModel_": {
@@ -4309,6 +7085,86 @@
           "items"
         ],
         "title": "Page[RouteModel]",
+        "type": "object"
+      },
+      "Page_SmartDetectionModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SmartDetectionModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[SmartDetectionModel]",
+        "type": "object"
+      },
+      "Page_TrafficFlowModel_": {
+        "additionalProperties": true,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowModel"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "render_hint": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Render Hint"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[TrafficFlowModel]",
         "type": "object"
       },
       "Page_TrafficRouteModel_": {
@@ -4594,6 +7450,17 @@
       "PortForwardModel": {
         "additionalProperties": true,
         "properties": {
+          "destination_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination Ip"
+          },
           "dst_port": {
             "anyOf": [
               {
@@ -4697,6 +7564,20 @@
             ],
             "title": "Dot1X Ctrl"
           },
+          "excluded_networkconf_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excluded Networkconf Ids"
+          },
           "forward": {
             "anyOf": [
               {
@@ -4763,6 +7644,94 @@
             ],
             "title": "Poe Mode"
           },
+          "stormctrl_bcast_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Bcast Enabled"
+          },
+          "stormctrl_bcast_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Bcast Rate"
+          },
+          "stormctrl_mcast_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Mcast Enabled"
+          },
+          "stormctrl_mcast_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Mcast Rate"
+          },
+          "stormctrl_ucast_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Ucast Enabled"
+          },
+          "stormctrl_ucast_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stormctrl Ucast Rate"
+          },
+          "stp_bpdu_guard_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stp Bpdu Guard Enabled"
+          },
+          "stp_edge_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stp Edge State"
+          },
           "stp_port_mode": {
             "anyOf": [
               {
@@ -4774,12 +7743,34 @@
             ],
             "title": "Stp Port Mode"
           },
+          "stp_uplink": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stp Uplink"
+          },
           "tagged_networkconf_ids": {
             "items": {
               "type": "string"
             },
             "title": "Tagged Networkconf Ids",
             "type": "array"
+          },
+          "tagged_vlan_mgmt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tagged Vlan Mgmt"
           },
           "voice_networkconf_id": {
             "anyOf": [
@@ -4794,6 +7785,24 @@
           }
         },
         "title": "PortProfileModel",
+        "type": "object"
+      },
+      "PredefinedServiceModel": {
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          }
+        },
+        "title": "PredefinedServiceModel",
         "type": "object"
       },
       "QosRuleModel": {
@@ -5070,6 +8079,887 @@
           "settings"
         ],
         "title": "SettingsBody",
+        "type": "object"
+      },
+      "SmartDetectionModel": {
+        "additionalProperties": true,
+        "properties": {
+          "camera": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera"
+          },
+          "detected_thumbnail_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detected Thumbnail Id"
+          },
+          "end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "recognized_person_confidence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Person Confidence"
+          },
+          "recognized_person_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Person Id"
+          },
+          "recognized_person_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Person Name"
+          },
+          "recognized_plate_confidence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Confidence"
+          },
+          "recognized_plate_group_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Group Id"
+          },
+          "recognized_plate_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recognized Plate Text"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "smart_detect_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Smart Detect Types",
+            "type": "array"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start"
+          },
+          "thumbnail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thumbnail"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "title": "SmartDetectionModel",
+        "type": "object"
+      },
+      "ThreatManagementSettingsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "advanced_filtering_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Advanced filtering preference; null when missing or malformed.",
+            "title": "Advanced Filtering Preference"
+          },
+          "device_fingerprinting_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Device fingerprinting enabled state (strict boolean, null if missing/malformed).",
+            "title": "Device Fingerprinting Enabled"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Normalized enabled state: true for known active modes, false for disabled, null for unknown/missing.",
+            "title": "Enabled"
+          },
+          "enabled_categories": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Enabled threat category codes (null when absent from controller).",
+            "title": "Enabled Categories"
+          },
+          "enabled_networks": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Protected network IDs (null when absent from controller).",
+            "title": "Enabled Networks"
+          },
+          "ips_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Raw IPS operation mode string from controller (e.g. 'disabled', 'ids', 'ips', 'ipsInline').",
+            "title": "Ips Mode"
+          },
+          "traffic_identification_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Traffic identification (DPI) enabled state (strict boolean, null if missing/malformed).",
+            "title": "Traffic Identification Enabled"
+          }
+        },
+        "title": "ThreatManagementSettingsModel",
+        "type": "object"
+      },
+      "ThreatPostureModel": {
+        "additionalProperties": true,
+        "properties": {
+          "enterprise": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Enterprise status; null if unknown.",
+            "title": "Enterprise"
+          },
+          "gateway_signatures": {
+            "description": "Allowlisted per-gateway signature status.",
+            "items": {
+              "$ref": "#/components/schemas/GatewaySignatureModel"
+            },
+            "title": "Gateway Signatures",
+            "type": "array"
+          },
+          "has_subscription": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Subscription status; null if unknown.",
+            "title": "Has Subscription"
+          },
+          "ips_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "IPS enabled state; null if unknown.",
+            "title": "Ips Enabled"
+          },
+          "is_activating": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Activation state; null if unknown.",
+            "title": "Is Activating"
+          },
+          "period": {
+            "description": "HOUR, DAY, WEEK, or MONTH.",
+            "title": "Period",
+            "type": "string"
+          },
+          "scanned_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Scanned bytes during the period; null if unknown.",
+            "title": "Scanned Bytes"
+          },
+          "signature_capacity": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Signature capacity; null if unknown.",
+            "title": "Signature Capacity"
+          },
+          "signatures": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Signature count; null if unknown.",
+            "title": "Signatures"
+          },
+          "threats": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Threat count during the period; null if unknown.",
+            "title": "Threats"
+          },
+          "updated_timestamp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Summary update time in Unix milliseconds; null if unknown.",
+            "title": "Updated Timestamp"
+          }
+        },
+        "title": "ThreatPostureModel",
+        "type": "object"
+      },
+      "TrafficFlowEndpointModel": {
+        "additionalProperties": true,
+        "properties": {
+          "domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Domains",
+            "type": "array"
+          },
+          "ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip"
+          },
+          "mac": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mac"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "network_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Network Name"
+          },
+          "zone_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zone Name"
+          }
+        },
+        "title": "TrafficFlowEndpointModel",
+        "type": "object"
+      },
+      "TrafficFlowModel": {
+        "additionalProperties": true,
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "bytes_rx": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes Rx"
+          },
+          "bytes_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes Total"
+          },
+          "bytes_tx": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes Tx"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/TrafficFlowEndpointModel"
+          },
+          "direction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Direction"
+          },
+          "duration_milliseconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Milliseconds"
+          },
+          "flow_end_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flow End Time"
+          },
+          "flow_start_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flow Start Time"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol"
+          },
+          "risk": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Risk"
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TrafficFlowEndpointModel"
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time"
+          }
+        },
+        "title": "TrafficFlowModel",
+        "type": "object"
+      },
+      "TrafficFlowStatisticsModel": {
+        "additionalProperties": true,
+        "properties": {
+          "all_count_by_region": {
+            "title": "All Count By Region"
+          },
+          "allowed_count_by_region_by_risk": {
+            "title": "Allowed Count By Region By Risk"
+          },
+          "allowed_count_by_risk": {
+            "title": "Allowed Count By Risk"
+          },
+          "blocked_count_by_region": {
+            "title": "Blocked Count By Region"
+          },
+          "blocked_count_by_risk": {
+            "title": "Blocked Count By Risk"
+          },
+          "top_applications": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowTopApplicationModel"
+            },
+            "title": "Top Applications",
+            "type": "array"
+          },
+          "top_blocked_clients": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowTopClientModel"
+            },
+            "title": "Top Blocked Clients",
+            "type": "array"
+          },
+          "top_blocked_policies": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowTopPolicyModel"
+            },
+            "title": "Top Blocked Policies",
+            "type": "array"
+          },
+          "top_clients": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowTopClientModel"
+            },
+            "title": "Top Clients",
+            "type": "array"
+          },
+          "top_destinations": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFlowTopDestinationModel"
+            },
+            "title": "Top Destinations",
+            "type": "array"
+          }
+        },
+        "title": "TrafficFlowStatisticsModel",
+        "type": "object"
+      },
+      "TrafficFlowTopApplicationModel": {
+        "additionalProperties": true,
+        "properties": {
+          "application_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Low V2 traffic-flow application ID. Scoped to the V2 traffic-flow tool family; do not pass it to Integration API DPI tools.",
+            "title": "Application Id"
+          },
+          "application_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Name"
+          },
+          "bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "V2 traffic-flow category ID used for one-way name annotation. Scoped to the V2 traffic-flow tool family; do not pass it to Integration API DPI tools.",
+            "title": "Category Id"
+          },
+          "category_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Name"
+          }
+        },
+        "title": "TrafficFlowTopApplicationModel",
+        "type": "object"
+      },
+      "TrafficFlowTopClientModel": {
+        "additionalProperties": true,
+        "properties": {
+          "client_mac": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Mac"
+          },
+          "client_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Name"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          }
+        },
+        "title": "TrafficFlowTopClientModel",
+        "type": "object"
+      },
+      "TrafficFlowTopDestinationModel": {
+        "additionalProperties": true,
+        "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination"
+          },
+          "most_frequent_region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Most Frequent Region"
+          }
+        },
+        "title": "TrafficFlowTopDestinationModel",
+        "type": "object"
+      },
+      "TrafficFlowTopPolicyModel": {
+        "additionalProperties": true,
+        "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "policy_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Id"
+          },
+          "policy_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Name"
+          },
+          "policy_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Type"
+          }
+        },
+        "title": "TrafficFlowTopPolicyModel",
         "type": "object"
       },
       "TrafficRouteModel": {
@@ -5491,6 +9381,28 @@
             ],
             "title": "Allowed Subnets"
           },
+          "alternate_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alternate Address"
+          },
+          "alternate_address_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alternate Address Enabled"
+          },
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
@@ -5605,8 +9517,15 @@
             "title": "Dtim Ng"
           },
           "enabled": {
-            "title": "Enabled",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
           },
           "fast_roaming_enabled": {
             "anyOf": [
@@ -5673,6 +9592,18 @@
               }
             ],
             "title": "Id"
+          },
+          "integration_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Public Integration inventory UUID, not a legacy resource ID. These IDs are scoped to the Integration inventory tool family \u2014 do not pass them to legacy resource tools.",
+            "title": "Integration Id"
           },
           "l2_isolation": {
             "anyOf": [
@@ -5765,6 +9696,17 @@
             ],
             "title": "Minrate Ng Enabled"
           },
+          "minrate_setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minrate Setting Preference"
+          },
           "multicast_enhance_enabled": {
             "anyOf": [
               {
@@ -5820,6 +9762,75 @@
             ],
             "title": "Proxy Arp"
           },
+          "roaming_assistant_6e_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roaming Assistant 6E Enabled"
+          },
+          "roaming_assistant_6e_rssi": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roaming Assistant 6E Rssi"
+          },
+          "roaming_assistant_na_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roaming Assistant Na Enabled"
+          },
+          "roaming_assistant_na_rssi": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roaming Assistant Na Rssi"
+          },
+          "rrm_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rrm Enabled"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule"
+          },
           "schedule_enabled": {
             "anyOf": [
               {
@@ -5831,6 +9842,31 @@
             ],
             "title": "Schedule Enabled"
           },
+          "schedule_reversed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Reversed"
+          },
+          "schedule_with_duration": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WlanScheduleWindowModel"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule With Duration"
+          },
           "security": {
             "anyOf": [
               {
@@ -5841,6 +9877,28 @@
               }
             ],
             "title": "Security"
+          },
+          "setting_preference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setting Preference"
+          },
+          "source_api": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Api"
           },
           "uapsd_enabled": {
             "anyOf": [
@@ -5922,6 +9980,43 @@
         },
         "title": "WlanModel",
         "type": "object"
+      },
+      "WlanScheduleWindowModel": {
+        "additionalProperties": true,
+        "properties": {
+          "duration_minutes": {
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "start_days_of_week": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Start Days Of Week",
+            "type": "array"
+          },
+          "start_hour": {
+            "title": "Start Hour",
+            "type": "integer"
+          },
+          "start_minute": {
+            "title": "Start Minute",
+            "type": "integer"
+          }
+        },
+        "title": "WlanScheduleWindowModel",
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -5940,6 +10035,7 @@
   "paths": {
     "/v1/actions/{tool_name}": {
       "post": {
+        "description": "Read actions execute immediately. Mutations with `confirm=false` validate the request and return a non-mutating partial request preview with `requires_confirmation=true`; no mutation manager is invoked. It does not show freshly merged controller state. Send the same request with `confirm=true` to execute it; Manager-level validation runs during execution. Capability and argument checks apply to both paths.",
         "operationId": "post_action_v1_actions__tool_name__post",
         "parameters": [
           {
@@ -5986,7 +10082,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Post Action"
+        "summary": "Preview or execute a catalog action"
       }
     },
     "/v1/audit": {
@@ -6904,6 +11000,77 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/access-devices/{device_id}/configs": {
+      "get": {
+        "operationId": "get_device_configs_v1_sites__site_id__access_devices__device_id__configs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Device Configs V1 Sites  Site Id  Access Devices  Device Id  Configs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Device Configs",
+        "tags": [
+          "access/devices"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/access/activity-summary": {
       "get": {
         "operationId": "get_access_activity_summary_v1_sites__site_id__access_activity_summary_get",
@@ -7033,6 +11200,18 @@
                 }
               ],
               "title": "Cursor"
+            }
+          },
+          {
+            "description": "Access system-log topic: unlocks, access_denial, ring, updates, critical, admin, or admin_activity. Door history is under unlocks.",
+            "in": "query",
+            "name": "topic",
+            "required": false,
+            "schema": {
+              "default": "admin",
+              "description": "Access system-log topic: unlocks, access_denial, ring, updates, critical, admin, or admin_activity. Door history is under unlocks.",
+              "title": "Topic",
+              "type": "string"
             }
           },
           {
@@ -7639,6 +11818,7 @@
     },
     "/v1/sites/{site_id}/alarm-profiles": {
       "get": {
+        "description": "List configured alarm profiles, including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.",
         "operationId": "alarm_list_profiles_v1_sites__site_id__alarm_profiles_get",
         "parameters": [
           {
@@ -9794,6 +13974,218 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/detection-search": {
+      "get": {
+        "operationId": "search_detections_v1_sites__site_id__detection_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter labels of the form 'prefix:value' (e.g. ['vehicleType:truck', 'color:black']). At least one is required; all are applied together. Use the detection-search-labels endpoint to discover legal values.",
+            "in": "query",
+            "name": "labels",
+            "required": true,
+            "schema": {
+              "description": "Filter labels of the form 'prefix:value' (e.g. ['vehicleType:truck', 'color:black']). At least one is required; all are applied together. Use the detection-search-labels endpoint to discover legal values.",
+              "items": {
+                "type": "string"
+              },
+              "title": "Labels",
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Search Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "desc",
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_motion",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Exclude Motion",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_confidence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Confidence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SmartDetectionModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Detections",
+        "tags": [
+          "protect/recognition"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/detection-search-labels": {
+      "get": {
+        "operationId": "detection_search_labels_v1_sites__site_id__detection_search_labels_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetectionSearchLabelsModel"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detection Search Labels",
+        "tags": [
+          "protect/recognition"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/devices": {
       "get": {
         "operationId": "list_devices_v1_sites__site_id__devices_get",
@@ -10745,6 +15137,163 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/dynamic-dns": {
+      "get": {
+        "operationId": "list_dynamic_dns_v1_sites__site_id__dynamic_dns_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DynamicDnsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Dynamic Dns",
+        "tags": [
+          "network/dynamic_dns"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/dynamic-dns/{entry_id}": {
+      "get": {
+        "operationId": "get_dynamic_dns_entry_details_v1_sites__site_id__dynamic_dns__entry_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "title": "Entry Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_DynamicDnsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Dynamic Dns Entry Details",
+        "tags": [
+          "network/dynamic_dns"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/event-thumbnails/{event_id}": {
       "get": {
         "operationId": "get_event_thumbnail_v1_sites__site_id__event_thumbnails__event_id__get",
@@ -10854,7 +15403,7 @@
     },
     "/v1/sites/{site_id}/event-types": {
       "get": {
-        "description": "DETAIL \u2014 event_manager.get_event_type_prefixes (sync method, returns list).",
+        "description": "DETAIL \u2014 event_manager.get_event_types (async method, returns list).",
         "operationId": "get_event_types_v1_sites__site_id__event_types_get",
         "parameters": [
           {
@@ -11231,6 +15780,173 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/firewall/legacy-rules": {
+      "get": {
+        "operationId": "list_legacy_firewall_rules_v1_sites__site_id__firewall_legacy_rules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_LegacyFirewallRuleModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Legacy Firewall Rules",
+        "tags": [
+          "network/firewall"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/firewall/policy-ordering": {
+      "get": {
+        "description": "Returns the user-defined firewall policy ordering for a source/destination zone pair, sourced from the UniFi public integration API. Policy IDs in the response are integration-API UUIDs scoped to the ordering tool family \u2014 use them only with the matching reorder action; they do NOT correspond to the policy IDs returned by /firewall/rules or other controller-API endpoints. Requires a UniFi API key (UNIFI_API_KEY).",
+        "operationId": "get_firewall_policy_ordering_v1_sites__site_id__firewall_policy_ordering_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_firewall_zone_id",
+            "required": true,
+            "schema": {
+              "title": "Source Firewall Zone Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "destination_firewall_zone_id",
+            "required": true,
+            "schema": {
+              "title": "Destination Firewall Zone Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_FirewallPolicyOrderingModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get firewall policy ordering for a zone pair (integration API)",
+        "tags": [
+          "network/firewall"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/firewall/rules": {
       "get": {
         "operationId": "list_firewall_rules_v1_sites__site_id__firewall_rules_get",
@@ -11538,6 +16254,538 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/gateway-settings": {
+      "get": {
+        "operationId": "get_gateway_settings_v1_sites__site_id__gateway_settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_GatewaySettingsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Gateway Settings",
+        "tags": [
+          "network/gateway_settings"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/incident-evidence/network": {
+      "get": {
+        "description": "Collect bounded, read-only Network event evidence for one incident window. Returns a unifi-incident-evidence-view by default: every source's coverage, failures and budget usage plus bounded record citations, with omitted records counted; detail=full returns the whole unifi-incident-evidence document. The read stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear.",
+        "operationId": "get_network_incident_evidence_v1_sites__site_id__incident_evidence_network_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start, ISO 8601 with a UTC offset (inclusive)",
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "description": "Window start, ISO 8601 with a UTC offset (inclusive)",
+              "title": "Start",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end, ISO 8601 with a UTC offset (exclusive)",
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "description": "Window end, ISO 8601 with a UTC offset (exclusive)",
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact device MAC addresses; keeps only events naming one. Never device names",
+            "in": "query",
+            "name": "device_macs",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact device MAC addresses; keeps only events naming one. Never device names",
+              "title": "Device Macs"
+            }
+          },
+          {
+            "description": "Your label for the investigated location, recorded in source scope",
+            "in": "query",
+            "name": "location_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Your label for the investigated location, recorded in source scope",
+              "title": "Location Id"
+            }
+          },
+          {
+            "description": "Longest window to read; a longer window is not read (1-2592000)",
+            "in": "query",
+            "name": "max_window_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "description": "Longest window to read; a longer window is not read (1-2592000)",
+              "title": "Max Window Seconds",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most event rows to read, including rows outside the window (1-10000)",
+            "in": "query",
+            "name": "max_events",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "description": "Most event rows to read, including rows outside the window (1-10000)",
+              "title": "Max Events",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most HTTP requests to the controller, retries and the API probe included (1-100)",
+            "in": "query",
+            "name": "max_calls",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "description": "Most HTTP requests to the controller, retries and the API probe included (1-100)",
+              "title": "Max Calls",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most wall time, connecting included; a read still running is cancelled (1-120000)",
+            "in": "query",
+            "name": "max_elapsed_ms",
+            "required": false,
+            "schema": {
+              "default": 30000,
+              "description": "Most wall time, connecting included; a read still running is cancelled (1-120000)",
+              "title": "Max Elapsed Ms",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "JSON-encoded array of explicit exact-identifier assertions, each {entity, target, source} where entity and target are {kind, id_kind, id} and source is operator_input or product_inventory (at most 20)",
+            "in": "query",
+            "name": "mappings",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "JSON-encoded array of explicit exact-identifier assertions, each {entity, target, source} where entity and target are {kind, id_kind, id} and source is operator_input or product_inventory (at most 20)",
+              "title": "Mappings"
+            }
+          },
+          {
+            "description": "view: coverage plus bounded record citations; full: the whole evidence document",
+            "in": "query",
+            "name": "detail",
+            "required": false,
+            "schema": {
+              "default": "view",
+              "description": "view: coverage plus bounded record citations; full: the whole evidence document",
+              "title": "Detail",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Most record citations in the view (default 25, 1-50); omitted records stay in coverage. View only",
+            "in": "query",
+            "name": "max_records_returned",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Most record citations in the view (default 25, 1-50); omitted records stay in coverage. View only",
+              "title": "Max Records Returned"
+            }
+          },
+          {
+            "description": "record_selection.next_cursor from an earlier view of the same request; returns the records after it. View only",
+            "in": "query",
+            "name": "resume_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "record_selection.next_cursor from an earlier view of the same request; returns the records after it. View only",
+              "title": "Resume After"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_dict_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Network Incident Evidence",
+        "tags": [
+          "network/incident_evidence"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/incident-evidence/protect": {
+      "get": {
+        "description": "Collect bounded, read-only Protect event evidence for one incident window. Returns a unifi-incident-evidence-view by default: every source's coverage, failures and budget usage plus bounded record citations, with omitted records counted; detail=full returns the whole unifi-incident-evidence document. Each camera ID is its own source. The read stops at the first spent budget and says so; check coverage_complete before treating an empty result as an all-clear.",
+        "operationId": "get_protect_incident_evidence_v1_sites__site_id__incident_evidence_protect_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window start, ISO 8601 with a UTC offset (inclusive)",
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "description": "Window start, ISO 8601 with a UTC offset (inclusive)",
+              "title": "Start",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end, ISO 8601 with a UTC offset (exclusive)",
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "description": "Window end, ISO 8601 with a UTC offset (exclusive)",
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact Protect camera IDs (at most 5), each read as its own source; omit for every camera",
+            "in": "query",
+            "name": "camera_ids",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact Protect camera IDs (at most 5), each read as its own source; omit for every camera",
+              "title": "Camera Ids"
+            }
+          },
+          {
+            "description": "Your label for the investigated location, recorded in source scope",
+            "in": "query",
+            "name": "location_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Your label for the investigated location, recorded in source scope",
+              "title": "Location Id"
+            }
+          },
+          {
+            "description": "Longest window to read; a longer window is not read (1-2592000)",
+            "in": "query",
+            "name": "max_window_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "description": "Longest window to read; a longer window is not read (1-2592000)",
+              "title": "Max Window Seconds",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most event rows to read across cameras (1-10000)",
+            "in": "query",
+            "name": "max_events",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "description": "Most event rows to read across cameras (1-10000)",
+              "title": "Max Events",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most HTTP requests to the NVR across cameras, retries included (1-100)",
+            "in": "query",
+            "name": "max_calls",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "description": "Most HTTP requests to the NVR across cameras, retries included (1-100)",
+              "title": "Max Calls",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most wall time, connecting included; a read still running is cancelled (1-120000)",
+            "in": "query",
+            "name": "max_elapsed_ms",
+            "required": false,
+            "schema": {
+              "default": 30000,
+              "description": "Most wall time, connecting included; a read still running is cancelled (1-120000)",
+              "title": "Max Elapsed Ms",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "JSON-encoded array of explicit exact-identifier assertions, each {entity, target, source} where entity and target are {kind, id_kind, id} and source is operator_input or product_inventory (at most 20)",
+            "in": "query",
+            "name": "mappings",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "JSON-encoded array of explicit exact-identifier assertions, each {entity, target, source} where entity and target are {kind, id_kind, id} and source is operator_input or product_inventory (at most 20)",
+              "title": "Mappings"
+            }
+          },
+          {
+            "description": "view: coverage plus bounded record citations; full: the whole evidence document",
+            "in": "query",
+            "name": "detail",
+            "required": false,
+            "schema": {
+              "default": "view",
+              "description": "view: coverage plus bounded record citations; full: the whole evidence document",
+              "title": "Detail",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Most record citations in the view (default 25, 1-50); omitted records stay in coverage. View only",
+            "in": "query",
+            "name": "max_records_returned",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Most record citations in the view (default 25, 1-50); omitted records stay in coverage. View only",
+              "title": "Max Records Returned"
+            }
+          },
+          {
+            "description": "record_selection.next_cursor from an earlier view of the same request; returns the records after it. View only",
+            "in": "query",
+            "name": "resume_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "record_selection.next_cursor from an earlier view of the same request; returns the records after it. View only",
+              "title": "Resume After"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_dict_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Protect Incident Evidence",
+        "tags": [
+          "protect/incident_evidence"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/ips-events": {
       "get": {
         "operationId": "get_ips_events_v1_sites__site_id__ips_events_get",
@@ -11774,6 +17022,157 @@
           }
         },
         "summary": "List Known Faces",
+        "tags": [
+          "protect/recognition"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/known-license-plates": {
+      "get": {
+        "operationId": "list_known_license_plates_v1_sites__site_id__known_license_plates_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_confidence",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 100,
+              "minimum": 0,
+              "title": "Min Confidence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_interest",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Interest",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Explicit recognition group types to list. Supported values: known, interest, unknown. When set, this overrides include_interest.",
+            "in": "query",
+            "name": "group_types",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Explicit recognition group types to list. Supported values: known, interest, unknown. When set, this overrides include_interest.",
+              "title": "Group Types"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "default": "name",
+              "title": "Order By",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_direction",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "title": "Order Direction",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_KnownLicensePlateModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Known License Plates",
         "tags": [
           "protect/recognition"
         ]
@@ -12274,6 +17673,287 @@
         "summary": "Lookup Client By Ip",
         "tags": [
           "network/lookup"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/mdns-settings": {
+      "get": {
+        "operationId": "get_mdns_settings_v1_sites__site_id__mdns_settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_MdnsSettingsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mdns Settings",
+        "tags": [
+          "network/mdns"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/mgmt-settings": {
+      "get": {
+        "operationId": "get_mgmt_settings_v1_sites__site_id__mgmt_settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Mgmt Settings V1 Sites  Site Id  Mgmt Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mgmt Settings",
+        "tags": [
+          "network/mgmt"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/nat-rules": {
+      "get": {
+        "description": "List V2 NAT rules in descending controller ID order. These IDs are scoped to the V2 NAT tool family \u2014 do not pass them to port-forward or Integration API tools.",
+        "operationId": "list_nat_rules_v1_sites__site_id__nat_rules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_NatRuleModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Nat Rules",
+        "tags": [
+          "network/nat"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/nat-rules/{rule_id}": {
+      "get": {
+        "description": "Get a NAT rule by its V2 NAT-family ID; port-forward and Integration API IDs are not portable.",
+        "operationId": "get_nat_rule_v1_sites__site_id__nat_rules__rule_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "title": "Rule Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_NatRuleModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Nat Rule",
+        "tags": [
+          "network/nat"
         ]
       }
     },
@@ -15957,6 +21637,137 @@
         ]
       }
     },
+    "/v1/sites/{site_id}/threat-management-settings": {
+      "get": {
+        "operationId": "get_threat_management_settings_v1_sites__site_id__threat_management_settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_ThreatManagementSettingsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Threat Management Settings",
+        "tags": [
+          "network/threat_management"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/threat-posture": {
+      "get": {
+        "description": "Read CyberSecure posture. Gateway device IDs belong to the legacy Network device family.",
+        "operationId": "get_threat_posture_v1_sites__site_id__threat_posture_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "DAY",
+              "title": "Period",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_ThreatPostureModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Threat Posture",
+        "tags": [
+          "network/threat_posture"
+        ]
+      }
+    },
     "/v1/sites/{site_id}/top-clients": {
       "get": {
         "operationId": "get_top_clients_v1_sites__site_id__top_clients_get",
@@ -16044,6 +21855,236 @@
         "summary": "Get Top Clients",
         "tags": [
           "network/system"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/traffic-flow-statistics": {
+      "get": {
+        "operationId": "get_traffic_flow_statistics_v1_sites__site_id__traffic_flow_statistics_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "DAY",
+              "title": "Period",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "top",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Top",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Detail_TrafficFlowStatisticsModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Traffic Flow Statistics",
+        "tags": [
+          "network/traffic-flows"
+        ]
+      }
+    },
+    "/v1/sites/{site_id}/traffic-flows": {
+      "get": {
+        "operationId": "get_traffic_flows_v1_sites__site_id__traffic_flows_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "within_hours",
+            "required": false,
+            "schema": {
+              "default": 24,
+              "maximum": 8760,
+              "minimum": 1,
+              "title": "Within Hours",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "time_from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Time From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "time_to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Time To"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search_text",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search Text"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "description": "Controller UUID; omit to use default",
+            "in": "query",
+            "name": "controller",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Controller UUID; omit to use default",
+              "title": "Controller"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_TrafficFlowModel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Traffic Flows",
+        "tags": [
+          "network/traffic-flows"
         ]
       }
     },
@@ -16611,6 +22652,7 @@
     },
     "/v1/sites/{site_id}/visitors": {
       "get": {
+        "description": "List UniFi Access Developer API visitors. Returned UUIDs are scoped to the Access Developer API visitor family and must not be passed to other Access user or credential operations.",
         "operationId": "list_visitors_v1_sites__site_id__visitors_get",
         "parameters": [
           {
@@ -16701,6 +22743,7 @@
     },
     "/v1/sites/{site_id}/visitors/{visitor_id}": {
       "get": {
+        "description": "Get a UniFi Access Developer API visitor by a UUID returned from the visitor family. Do not pass IDs from other Access user or credential operations.",
         "operationId": "get_visitor_v1_sites__site_id__visitors__visitor_id__get",
         "parameters": [
           {

@@ -150,6 +150,18 @@ class AclManager:
             return existing
 
         merged_data = deep_merge(existing, update_data)
+        # Honor the mask-clear sentinel: to_controller_update emits mac_mask=None to
+        # mean "remove the mask" (the controller 400s on an empty string, and deep_merge
+        # cannot delete a key). Drop any None-valued mac_mask so the PUT omits it entirely.
+        # Only touch sides present in update_data — those are fresh dicts from deep_merge's
+        # recursion; an untouched side still aliases the cached rule (shallow base.copy()),
+        # so popping there could corrupt the in-process cache.
+        for side_key in ("traffic_source", "traffic_destination"):
+            if side_key not in update_data:
+                continue
+            side = merged_data.get(side_key)
+            if isinstance(side, dict) and side.get("mac_mask", "keep") is None:
+                side.pop("mac_mask", None)
         api_request = ApiRequestV2(method="put", path=f"/acl-rules/{rule_id}", data=merged_data)
         await self._connection.request(api_request)
         self._invalidate_cache()

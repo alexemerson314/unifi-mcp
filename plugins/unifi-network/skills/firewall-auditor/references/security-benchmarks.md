@@ -6,6 +6,41 @@ This document defines deterministic checks for the firewall auditor skill. Each 
 
 ## Segmentation Benchmarks
 
+> **Applies to both firewall engines.** SEG-01 through SEG-04 describe a security
+> *intent*, not a rule format. Determine the active engine first (see the skill's
+> "Determine which firewall engine the site runs" step), then evaluate the
+> benchmark against that engine's rules.
+>
+> **Zone-based (V2)** — read `unifi_list_firewall_policies` and
+> `unifi_list_firewall_zones`. Rules carry `action` in uppercase
+> (`ALLOW`/`BLOCK`/`REJECT`) and nested `source`/`destination` objects keyed by
+> `zone_id` with a `matching_target`.
+>
+> **Legacy (pre-zone-based)** — read `unifi_list_legacy_firewall_rules`. Rules
+> carry `action` in lowercase (`accept`/`drop`/`reject`), belong to a `ruleset`
+> (`LAN_IN`, `LAN_OUT`, `GUEST_IN`, `WAN_IN`, … including IPv6 variants such as
+> `LANv6_IN`), and express matching through flat fields: `src_address` /
+> `dst_address` (CIDR), `src_networkconf_id` / `dst_networkconf_id` (VLAN
+> references), `src_firewallgroup_ids` / `dst_firewallgroup_ids` (address/port
+> group references), and `src_port` / `dst_port`. Evaluation order is
+> `rule_index` ascending within a ruleset, so "positioned before" means a lower
+> `rule_index` in the same ruleset.
+>
+> A legacy rule satisfies a segmentation benchmark when it is `enabled`, its
+> `action` is `drop` or `reject`, and its source and destination match the VLANs
+> the benchmark names — whether expressed as a CIDR, a network reference, or a
+> firewall group.
+>
+> **Remediation differs.** The `unifi_create_firewall_policy` templates below
+> create zone-based policies and will not work on a legacy site — this server has
+> no legacy firewall write path. For a legacy site, report the gap and direct the
+> user to the UniFi UI, or to migrating to the zone-based firewall. Note that
+> migration is one-way with no in-product rollback, so present it as a decision
+> rather than a recommended fix.
+>
+> **Never emit a segmentation finding for an engine you did not read.** An empty
+> result from the engine that is not in use is not evidence of a missing rule.
+
 ### SEG-01: IoT VLAN Inter-VLAN Isolation
 
 **Name:** IoT-to-LAN block rule exists
@@ -13,9 +48,10 @@ This document defines deterministic checks for the firewall auditor skill. Each 
 **What to check:** Verify at least one enabled firewall rule exists that blocks traffic from the IoT VLAN (source) to RFC 1918 private address ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), excluding the IoT subnet itself. The rule must be enabled and positioned before any allow rules for the same traffic.
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve all firewall rules
-- `list_networks` — identify IoT VLAN subnet and VLAN ID
-- `list_firewall_groups` — check if RFC 1918 ranges are grouped
+- `unifi_list_firewall_policies` — retrieve all firewall rules
+- `unifi_list_legacy_firewall_rules` — retrieve legacy rules (the only source on a pre-zone-based site)
+- `unifi_list_networks` — identify IoT VLAN subnet and VLAN ID
+- `unifi_list_firewall_groups` — check if RFC 1918 ranges are grouped
 
 **Severity:** critical
 
@@ -44,9 +80,10 @@ unifi_create_firewall_policy:
 **What to check:** Verify the guest VLAN has an enabled firewall rule blocking access to all private/local subnets (RFC 1918). Additionally verify no allow rules exist for guest-to-LAN traffic above the block rule in rule index order.
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve all rules, check ruleset, action, source, destination
-- `list_networks` — identify guest network VLAN and subnet
-- `list_wlans` — confirm which WLAN maps to the guest network
+- `unifi_list_firewall_policies` — retrieve all rules, check ruleset, action, source, destination
+- `unifi_list_legacy_firewall_rules` — retrieve legacy rules (the only source on a pre-zone-based site)
+- `unifi_list_networks` — identify guest network VLAN and subnet
+- `unifi_list_wlans` — confirm which WLAN maps to the guest network
 
 **Severity:** critical
 
@@ -75,9 +112,10 @@ unifi_create_firewall_policy:
 **What to check:** Verify the management VLAN has an inbound rule that blocks traffic from non-management VLANs. Check that only explicitly whitelisted source IPs or groups (admin workstations) are permitted to initiate connections to the management VLAN.
 
 **MCP tools needed:**
-- `list_firewall_rules` — find rules referencing management VLAN as destination
-- `list_networks` — identify management VLAN subnet and VLAN ID
-- `list_firewall_groups` — check for admin workstation IP group definitions
+- `unifi_list_firewall_policies` — find rules referencing management VLAN as destination
+- `unifi_list_legacy_firewall_rules` — retrieve legacy rules (the only source on a pre-zone-based site)
+- `unifi_list_networks` — identify management VLAN subnet and VLAN ID
+- `unifi_list_firewall_groups` — check for admin workstation IP group definitions
 
 **Severity:** critical
 
@@ -116,7 +154,7 @@ unifi_create_firewall_policy:
     network_ids: [<management network ID>]
 ```
 
-**MAC-based admin allow list:** If the admin sources are identified by client MAC rather than IP, V2 firewall policies cannot match by client MAC — use `unifi_create_acl_rule` instead. The example below restricts management-VLAN access to a specific set of admin workstations by MAC:
+**MAC-based admin allow list:** If the admin sources are identified by client MAC rather than IP, a V2 firewall policy can match them directly with `source.matching_target: CLIENT` and `source.client_macs: [...]` (see the firewall-manager schema reference). Use `unifi_create_acl_rule` instead when the enforcement must happen on the switch (L2, without passing through the gateway). The example below restricts management-VLAN access to a specific set of admin workstations by MAC at the switch:
 
 ```yaml
 # Security intent: only the listed admin MACs may originate traffic on the management VLAN.
@@ -150,12 +188,13 @@ Choose the firewall path or the ACL path based on how admin identity is actually
 
 **Name:** No implicit allow between VLANs
 
-**What to check:** For every VLAN pair (source, destination) identified in `list_networks`, verify that at least one explicit firewall rule exists governing traffic between them (either allow or block). A pair with no matching rule relies on default behavior — flag this as a finding. Exclude the VLAN's own subnet (intra-VLAN traffic is out of scope).
+**What to check:** For every VLAN pair (source, destination) identified in `unifi_list_networks`, verify that at least one explicit firewall rule exists governing traffic between them (either allow or block). A pair with no matching rule relies on default behavior — flag this as a finding. Exclude the VLAN's own subnet (intra-VLAN traffic is out of scope).
 
 **MCP tools needed:**
-- `list_networks` — enumerate all VLANs and their subnets
-- `list_firewall_rules` — enumerate all rules and map coverage
-- `list_firewall_groups` — resolve group memberships for rule sources/destinations
+- `unifi_list_networks` — enumerate all VLANs and their subnets
+- `unifi_list_firewall_policies` — enumerate all rules and map coverage
+- `unifi_list_legacy_firewall_rules` — retrieve legacy rules (the only source on a pre-zone-based site)
+- `unifi_list_firewall_groups` — resolve group memberships for rule sources/destinations
 
 **Severity:** warning
 
@@ -218,45 +257,23 @@ unifi_create_firewall_policy:
 
 ### EGR-02: DNS Forced Through Approved Resolvers
 
-**Name:** DNS traffic redirected to approved resolvers
+**Name:** DNS forced through approved resolvers
 
-**What to check:** Verify a LAN-in or LAN-local rule exists that intercepts DNS traffic (UDP/TCP port 53) from client VLANs and either blocks external DNS or redirects to an approved resolver IP. Check that no rule explicitly allows port 53 to arbitrary destinations before such a rule.
+**What to check:** Map the intended client networks, approved resolver addresses, and unauthorized DNS destinations. Inspect V2 zone policies and NAT rules for UDP/TCP port 53 coverage, resolver exemptions, and conflicting rule order. Configuration readback establishes persistence; client-side queries establish enforcement.
 
 **MCP tools needed:**
-- `list_firewall_rules` — check for port 53 rules in LAN_IN and LAN_LOCAL rulesets
-- `list_networks` — enumerate client-facing VLANs
+- `unifi_list_firewall_policies` and `unifi_list_firewall_zones` — inspect zone-based port matching and coverage
+- `unifi_list_networks` — resolve client and resolver networks
+- `unifi_list_nat_rules` and `unifi_get_nat_rule` — inspect native DNS translation and its source/destination scope
+- `unifi_create_nat_rule`, `unifi_update_nat_rule`, `unifi_delete_nat_rule` — preview, apply and clean up an approved scoped test
 
 **Severity:** warning
 
-**How to fix:** This benchmark cannot be fully enforced through the firewall surface alone. V2 zone-based firewall policies do not match on port, so a literal "block UDP/TCP 53 except to approved resolvers" rule isn't expressible at this layer. The benchmark therefore splits into a **partial firewall fix** (what MCP can do today) and a **manual UniFi UI step** (the rest):
+**How to fix:** For native IPv4 redirection, follow the [tested DNS redirect recipe](dns-redirect.md). It provides disabled DNAT/SNAT previews, explicit enable approval, same-subnet return-path handling, resolver source exclusion, UDP/TCP packet checks and cleanup. Start with the documented single-client/synthetic-destination scope; obtain approval and verify traffic again before expanding a policy.
 
-**Part 1 — partial firewall fix (programmatic):** Allow client traffic to reach approved resolver IPs externally. This handles the legitimate-DNS path but does not block port-53 traffic to other destinations.
+V2 zone policies also support port matching (`SPECIFIC` with `port`, or `OBJECT` with `port_group_id`). An allow rule for approved resolver IPs alone does not enforce DNS egress. Blocking policies and NAT redirection have different packet paths; verify the chosen policy's actual coverage and ordering.
 
-```yaml
-# Security intent: clients may reach the approved DNS resolver IPs externally.
-# This is the firewall-layer half of the benchmark.
-unifi_create_firewall_policy:
-  name: "EGR-02 Allow approved DNS resolvers"
-  action: ALLOW
-  enabled: true
-  source:
-    zone_id: <client zone ID>
-    matching_target: ANY
-  destination:
-    zone_id: <External zone ID>
-    matching_target: IP
-    matching_target_type: SPECIFIC
-    ips: [<approved resolver IP>, ...]
-```
-
-**Part 2 — full enforcement (operator action in the UniFi UI):** To block direct egress on port 53 to non-approved resolvers and prevent client-side DNS bypass, configure either:
-
-- A **traffic rule** (UniFi UI: Settings → Security → Traffic Rules) that drops outbound TCP/UDP port 53 from client networks, OR
-- A **DNS-redirect** policy (UniFi UI: Settings → Security → DNS Filtering or Network → DNS) that intercepts all client DNS and forwards to the approved resolver.
-
-Neither is currently exposed through MCP tooling. Tracked separately for future MCP coverage.
-
-**Auditing this benchmark:** A programmatic audit can confirm Part 1 (the firewall ALLOW rule exists pointing at approved resolver IPs). Part 2 cannot be confirmed via MCP today and must be checked manually in the UniFi UI. Flag the benchmark as `partial-pass` if Part 1 is satisfied but Part 2 cannot be verified programmatically.
+**Audit note:** Score `pass` only when saved rules cover the intended client networks and unauthorized DNS destinations, UDP/TCP traffic checks succeed, direct approved DNS remains usable, and resolver-origin traffic is excluded from redirection. Score `partial-pass` for configuration-only evidence or the recipe's narrower test scope. Record IPv6 and encrypted-DNS coverage separately; this IPv4 recipe does not prove them. MCP can manage native NAT rules, but a controller read cannot replace a controllable client/resolver traffic test.
 
 
 ---
@@ -268,8 +285,8 @@ Neither is currently exposed through MCP tooling. Tracked separately for future 
 **What to check:** Verify at least one IP group exists named with a threat/block indicator (e.g., contains "threat", "block", "malicious", or "blacklist" in the name). Verify that IP group is referenced in at least one enabled WAN_OUT or LAN_IN drop rule. An empty IP group with no associated rule is also a finding.
 
 **MCP tools needed:**
-- `list_firewall_groups` — find threat-related groups, check member count
-- `list_firewall_rules` — verify group is referenced in enabled drop rules
+- `unifi_list_firewall_groups` — find threat-related groups, check member count
+- `unifi_list_firewall_policies` — verify group is referenced in enabled drop rules
 
 **Severity:** informational
 
@@ -303,7 +320,7 @@ unifi_create_firewall_policy:
 **What to check:** For every disabled firewall rule, check whether an enabled rule exists with an identical or overlapping source, destination, port, and action. If a disabled rule's traffic is fully covered by an enabled rule, the disabled rule is redundant. Report the disabled rule name and the matching enabled rule name.
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve all rules with enabled status, source, destination, port, action fields
+- `unifi_list_firewall_policies` — retrieve all rules with enabled status, source, destination, port, action fields
 
 **Severity:** warning
 
@@ -323,7 +340,7 @@ delete_firewall_rule:
 **What to check:** For each pair of enabled rules with overlapping or identical source/destination/port criteria, check whether their actions conflict (one allows, one drops). When a conflict exists, determine whether rule index ordering resolves the conflict predictably. Flag cases where index order causes the less restrictive rule to win.
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve all enabled rules with index, action, source, destination, port fields
+- `unifi_list_firewall_policies` — retrieve all enabled rules with index, action, source, destination, port fields
 
 **Severity:** critical
 
@@ -341,12 +358,12 @@ update_firewall_rule:
 
 **Name:** All rule references resolve to valid objects
 
-**What to check:** For every firewall rule that references a network ID or IP group ID in its source or destination, verify that the referenced object exists in `list_networks` or `list_firewall_groups` respectively. Also verify that referenced IP groups have at least one member. Report any rule with a dangling reference.
+**What to check:** For every firewall rule that references a network ID or IP group ID in its source or destination, verify that the referenced object exists in `unifi_list_networks` or `unifi_list_firewall_groups` respectively. Also verify that referenced IP groups have at least one member. Report any rule with a dangling reference.
 
 **MCP tools needed:**
-- `list_firewall_rules` — extract network and IP group references from each rule
-- `list_networks` — validate network IDs exist
-- `list_firewall_groups` — validate group IDs exist and are non-empty
+- `unifi_list_firewall_policies` — extract network and IP group references from each rule
+- `unifi_list_networks` — validate network IDs exist
+- `unifi_list_firewall_groups` — validate group IDs exist and are non-empty
 
 **Severity:** warning
 
@@ -366,7 +383,7 @@ delete_firewall_rule:
 **What to check:** Inspect the name/description field of every firewall rule. Flag rules whose names match default patterns: empty string, "Rule", "New Rule", "Untitled", numeric-only names, or names matching the pattern `Rule \d+`. A rule with no human-readable description is informational; a rule with a default placeholder name is a warning.
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve name and description fields for all rules
+- `unifi_list_firewall_policies` — retrieve name and description fields for all rules
 
 **Severity:** warning
 
@@ -388,7 +405,7 @@ update_firewall_rule:
 **What to check:** For each pair of enabled rules in the same ruleset, check whether a rule with a lower index has a source/destination/port that is a superset of a rule with a higher index and the same action. The higher-index rule is then unreachable (shadowed). Also flag cases where a higher-index specific allow rule is preceded by a lower-index broad drop rule (rendering the specific allow dead).
 
 **MCP tools needed:**
-- `list_firewall_rules` — retrieve all enabled rules with index, action, source, destination, port, and ruleset fields
+- `unifi_list_firewall_policies` — retrieve all enabled rules with index, action, source, destination, port, and ruleset fields
 
 **Severity:** warning
 
@@ -408,10 +425,10 @@ update_firewall_rule:
 
 **Name:** No adopted devices in offline state
 
-**What to check:** Retrieve all devices via `list_devices`. For every device with `state != 1` (not connected/online), report it as a finding. Include the device name, MAC address, device type, and last-seen timestamp in the finding detail.
+**What to check:** Retrieve all devices via `unifi_list_devices`. For every device with `state != 1` (not connected/online), report it as a finding. Include the device name, MAC address, device type, and last-seen timestamp in the finding detail.
 
 **MCP tools needed:**
-- `list_devices` — retrieve all devices with state, name, mac, type, last_seen fields
+- `unifi_list_devices` — retrieve all devices with state, name, mac, type, last_seen fields
 
 **Severity:** critical
 
@@ -429,10 +446,10 @@ get_device_details:
 
 **Name:** No devices with available firmware upgrades pending
 
-**What to check:** Retrieve all devices via `list_devices`. For every device where `upgradeable = true`, report it as a finding with the device name, current firmware version, and available firmware version. Devices running outdated firmware may have known security vulnerabilities.
+**What to check:** Retrieve all devices via `unifi_list_devices`. For every device where `upgradeable = true`, report it as a finding with the device name, current firmware version, and available firmware version. Devices running outdated firmware may have known security vulnerabilities.
 
 **MCP tools needed:**
-- `list_devices` — retrieve all devices with upgradeable, version, upgrade_to_firmware fields
+- `unifi_list_devices` — retrieve all devices with upgradeable, version, upgrade_to_firmware fields
 
 **Severity:** warning
 
@@ -449,12 +466,12 @@ upgrade_device_firmware:
 
 **Name:** All switch uplinks carry consistent VLAN trunk configurations
 
-**What to check:** For each managed switch, retrieve its port configuration via `list_switch_ports` or `get_device_details`. For each trunk/uplink port, verify that the set of allowed VLANs matches the expected set defined by the connected VLANs in `list_networks`. Flag any uplink that is missing a VLAN that exists on the network, or carries a VLAN not defined in `list_networks`.
+**What to check:** For each managed switch, retrieve its port configuration via `unifi_get_switch_ports` or `unifi_get_device_details`. For each trunk/uplink port, verify that the set of allowed VLANs matches the expected set defined by the connected VLANs in `unifi_list_networks`. Flag any uplink that is missing a VLAN that exists on the network, or carries a VLAN not defined in `unifi_list_networks`.
 
 **MCP tools needed:**
-- `list_devices` — identify managed switches by type
-- `get_device_details` — retrieve port profiles and VLAN assignments per port
-- `list_networks` — enumerate defined VLANs
+- `unifi_list_devices` — identify managed switches by type
+- `unifi_get_device_details` — retrieve port profiles and VLAN assignments per port
+- `unifi_list_networks` — enumerate defined VLANs
 
 **Severity:** warning
 
@@ -473,12 +490,12 @@ update_device_port_profile:
 
 **Name:** All defined port profiles are in use
 
-**What to check:** Retrieve all port profiles via `list_port_profiles`. For each profile, check whether it is referenced by at least one port on at least one switch (via `get_device_details`). Any profile with zero references across all devices is orphaned. Report profile name and ID.
+**What to check:** Retrieve all port profiles via `unifi_list_port_profiles`. For each profile, check whether it is referenced by at least one port on at least one switch (via `unifi_get_device_details`). Any profile with zero references across all devices is orphaned. Report profile name and ID.
 
 **MCP tools needed:**
-- `list_port_profiles` — retrieve all defined port profiles with IDs and names
-- `list_devices` — enumerate managed switches
-- `get_device_details` — retrieve per-port profile assignments
+- `unifi_list_port_profiles` — retrieve all defined port profiles with IDs and names
+- `unifi_list_devices` — enumerate managed switches
+- `unifi_get_device_details` — retrieve per-port profile assignments
 
 **Severity:** informational
 

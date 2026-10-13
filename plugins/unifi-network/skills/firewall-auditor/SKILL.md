@@ -5,6 +5,38 @@ description: Audit UniFi firewall policies for conflicts, redundancies, security
 
 # Firewall Policy Auditor
 
+## Dependencies
+
+Requires: network
+Optional: none
+
+Verify required tools through MCP discovery before collecting data; discovery alone
+does not prove controller connectivity or authorization. If a required server/tool
+is missing or a required read fails, stop and report it unavailable. Optional sources
+may be skipped only when the report visibly names the missing source and resulting
+coverage limits. Verify Network tool discovery with `unifi_tool_index`; if it is
+unavailable, stop and use `unifi-network-setup` for connection help. Never request secrets.
+
+## Coverage and Limitations
+
+Every report must include a **Coverage and Limitations** section: name each requested
+source and its status (available, unavailable, partial, or capped), requested time
+window/timezone or current-state collection time, actual filters, returned counts,
+limits, pagination, and any failed calls or unknown fields. Counts describe retrieved
+records, not totals unless completeness is established. A successful empty query is
+an observation; a failed or missing source is unavailable, never an empty result.
+If a limit is reached, label the source capped unless further bounded reads establish
+coverage. If completeness cannot be established, label it partial. Do not claim
+complete coverage, all-clear, or overall health from unavailable, partial, or capped
+data; say “No concerning activity found in the retrieved records” when appropriate.
+
+Separate **Observations** (cite source/tool, record ID and timestamp when available),
+**Hypotheses** (correlations and alternative explanations), and **Identity** (only
+explicit source-backed credential/account attribution, with its limits). Timing,
+similar names, proximity, or absence of a matching event alone proves neither
+identity nor cause. A credential event identifies the recorded account, not who
+physically used it. Missing mappings or clock uncertainty limit correlations.
+
 You audit the firewall configuration on a UniFi network. Your job is to dispatch the right MCP tool calls, evaluate the results against a documented rubric, score the audit deterministically, and present prioritised findings.
 
 The work is split between you and one tiny CLI:
@@ -16,12 +48,6 @@ There is no Python script doing the audit for you. There is no HTTP sidecar. You
 
 ---
 
-## Required MCP Server
-
-This skill requires the `unifi-network` MCP server. If `unifi_tool_index` is unavailable, stop and direct the user to the `unifi-network-setup` skill.
-
----
-
 ## Procedure
 
 ### 1. Gather data in parallel
@@ -30,14 +56,33 @@ Dispatch these tool calls in **a single batch** (multiple tool uses in one assis
 
 - `unifi_list_firewall_policies`
 - `unifi_list_firewall_zones`
+- `unifi_list_legacy_firewall_rules`
 - `unifi_list_networks`
 - `unifi_list_firewall_groups`
 - `unifi_list_devices`
 - `unifi_get_dpi_stats` *(optional but useful for HYG-05 / EGR-03 context)*
 
-If a tool returns `success=false`, stop the audit and surface the error. Do not partial-report.
+If a required tool returns `success=false`, stop scoring and report the unavailable source in Coverage and Limitations. Optional DPI failure limits only the affected benchmarks. Do not turn missing evidence into a passing benchmark.
 
 For richer per-policy detail (needed by HYG-02 conflict detection and HYG-05 shadowing), follow up with `unifi_get_firewall_policy_details` for each policy returned by `unifi_list_firewall_policies`. Batch these calls in parallel as well.
+
+### 1a. Determine which firewall engine the site runs
+
+**Do this before evaluating any benchmark.** UniFi has two firewall engines and a site runs exactly one:
+
+| Signal | Engine |
+|---|---|
+| `unifi_list_firewall_policies` and `unifi_list_firewall_zones` return entries | **zone-based** (V2, UniFi Network 9.0+ after migration) |
+| Both return zero entries and `unifi_list_legacy_firewall_rules` returns entries | **legacy** (pre-zone-based) |
+| All three return zero entries | **indeterminate** — see below |
+
+The zone-based tools do not error on a legacy site. They return empty, which is indistinguishable from "no firewall rules configured" unless you check the legacy tool too. Both list tools also return a `note` field when the controller reports nothing; treat its presence as a prompt to check the legacy engine, not as a finding in itself.
+
+Record the detected engine and state it in the report header, so a reader knows which ruleset was actually examined.
+
+**Never score segmentation from an engine you did not read.** If the site is legacy, evaluate SEG-01 through SEG-04 against the legacy rules, not against the empty zone-based result. Reporting "no VLAN segmentation enforced" because the zone-based endpoints were empty is a false critical — it is the specific failure this step exists to prevent.
+
+If the engine is **indeterminate** (all three empty), do not emit segmentation criticals. Emit a single `info` finding stating that no firewall configuration could be retrieved and that segmentation could not be assessed, and continue with the non-segmentation benchmarks as partial coverage. Withhold the overall score/status and history entry when any benchmark cannot be assessed; report only supported findings. An audit that cannot see the rules must say so rather than score them as absent.
 
 ### 2. Evaluate the 16 benchmarks
 
@@ -93,6 +138,9 @@ The CLI returns:
 
 Do not compute the score yourself. The CLI is stable across versions; your arithmetic is not.
 
+Only score and append history when every scored benchmark has sufficient evidence.
+A partial audit must not receive a healthy overall score.
+
 ### 4. Append to history
 
 Maintain a single audit history file at `${UNIFI_SKILLS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/unifi-mcp/skills}/audit-history.json`. The file is a JSON array of `{timestamp, overall_score, overall_status, rubric_version}` entries.
@@ -139,9 +187,12 @@ Format depends on user intent:
 
 **Default (interactive):** human-readable summary
 - Overall score and status (with the trend)
+- **The firewall engine that was audited** (`zone-based`, `legacy`, or `indeterminate`)
 - Per-category scores
 - Critical findings called out first, then warnings, then info
 - Top 3–5 prioritised recommendations with the `fix` tool name
+
+State the engine explicitly. A reader needs to know which ruleset was examined to trust a segmentation score, and on a legacy site the zone-based remediation templates do not apply.
 
 **On request ("give me JSON" / "machine-readable"):** emit the full report as JSON with this shape:
 
@@ -150,6 +201,7 @@ Format depends on user intent:
   "timestamp": "...",
   "overall_score": 73,
   "overall_status": "needs_attention",
+  "firewall_engine": "zone-based",
   "categories": { ... from CLI ... },
   "findings": [ ... all per-instance findings ... ],
   "trend": { "previous_score": 68, "change": "+5" }
@@ -188,3 +240,5 @@ For each finding, do **not** call mutating tools yourself. The auditor reads; th
 - **Per-instance counting matters.** Five offline devices is five TOP-01 findings, not one.
 - **Severity comes from the benchmark, not the situation.** The reference defines the default severity for each benchmark. Don't downgrade a critical finding because the user "isn't worried about it" — record it accurately and let them decide what to act on.
 - **Skip the trend on rubric changes.** A `rubric_version` mismatch with the prior history entry means the math changed; report the new baseline and explain why no trend is shown.
+- **Empty is not absent.** Zero zone-based policies means either "no policies" or "this site runs the legacy engine". Never resolve that ambiguity by assuming the first — check `unifi_list_legacy_firewall_rules`. Scoring a legacy site as having no segmentation is the single most damaging false positive this audit can produce, because it reports a correctly-segmented network as critically exposed.
+- **Call out an engine change in the trend.** If the detected engine differs from the previous history entry (typically a legacy-to-zone-based migration), the two audits examined different rulesets. Report the new baseline and note the migration rather than presenting a score delta as if the security posture changed.

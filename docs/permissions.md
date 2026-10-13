@@ -97,6 +97,12 @@ UNIFI_POLICY_NETWORK_FIREWALL_POLICIES_UPDATE=true
 
 The most specific variable wins, so the category-level override takes effect.
 
+The Claude Code plugins expose only the server-level gates
+(`UNIFI_POLICY_<SERVER>_<ACTION>`) as plugin options, so per-category overrides
+are not available there. Allow the action server-wide with confirmation mode
+on, or keep it off. Codex, OpenClaw and directly launched servers accept every
+level.
+
 ---
 
 ## Practical Scenarios
@@ -166,7 +172,11 @@ Or in a Claude Desktop / MCP client config:
 | Denied tools visible to agents? | No — hidden at registration | Yes — always visible |
 | Where is access checked? | At server startup (registration) | At call time |
 | Agent feedback on denied action | Tool doesn't exist | Clear error with fix instructions |
-| Requires server restart to change? | Yes | No |
+| Restart after changing the launcher environment? | Yes | Yes — the new process must inherit it |
+
+Call-time enforcement means a denied tool stays discoverable and receives a
+fresh policy check on every invocation. It does not let a running process see
+environment changes made later in its parent shell or container configuration.
 
 ---
 
@@ -210,13 +220,30 @@ Pass `confirm=true` in any mutating tool call to execute immediately, regardless
 ## Troubleshooting
 
 ### "Action is disabled by policy" error
-The relevant policy gate is set to `false`. The error message includes the exact variable to set. Enable it and re-call — no server restart required.
+The relevant policy gate is set to `false`. The error message includes the exact
+variable to set. Enable it, restart the server so it inherits the updated
+environment, and re-call the tool.
 
 ### Mutation executed without asking for confirmation
 `UNIFI_TOOL_PERMISSION_MODE` (or the server-specific variant) is set to `bypass`, or the legacy `UNIFI_AUTO_CONFIRM=true` is present. Remove or set to `confirm` to re-enable the preview step.
 
 ### Tool not appearing in tool index at all
-All tools are always indexed. If a tool is missing, the manifest may be stale. Run `make network-manifest` to regenerate it. This is unrelated to permissions.
+Policy gates never remove tools from registration or discovery. Index contents
+depend on the registration mode: `lazy` uses the generated manifest for the
+full catalog, `eager` indexes the registered catalog, and `meta_only` initially
+indexes only meta-tools. Executing a known domain tool in `meta_only` lazily
+registers its module, so later index results can include those loaded tools. If
+a tool is missing in `lazy` mode, the relevant manifest may be stale. From the
+repository root, run `make -C apps/network manifest`,
+`make -C apps/protect manifest`, or `make -C apps/access manifest` for the
+affected server.
+
+### A `UNIFI_POLICY_` variable not taking effect
+At startup each server compares every `UNIFI_POLICY_*` variable with the gates its tools
+register and logs a warning naming each variable no gate matches, with the closest valid
+names. Check stderr for `[policy] Unrecognized env var`. The `<CATEGORY>` segment is the
+server's config key from its `permissions.md` (`CAMERAS`, `CLIENT_GROUPS`), not the
+`permission_category` shorthand in `tools_manifest.json` (`camera`, `client_group`).
 
 ### Legacy variables not taking effect
 Ensure the variable name matches the old format exactly (`UNIFI_PERMISSIONS_<CAT>_<ACTION>`). Check stderr logs for the deprecation warning confirming the variable was detected. If the new `UNIFI_POLICY_` variable is also set, the new one takes precedence.

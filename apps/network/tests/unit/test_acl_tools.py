@@ -116,6 +116,14 @@ class TestAclRuleModel:
         assert result["mac_acl_network_id"] == "net999"
         assert "network_id" not in result
 
+    def test_update_action_case_insensitive(self):
+        """Lowercase action is accepted on update (parity with create) and emitted uppercase."""
+        from unifi_core.network.models.acl import to_controller_update, validate_update_fields
+
+        ok, _ = validate_update_fields({"action": "allow"})
+        assert ok is True
+        assert to_controller_update({"action": "block"})["action"] == "BLOCK"
+
     def test_mutable_fields_excludes_read_only(self):
         """MUTABLE_FIELDS does not contain read-only fields."""
         from unifi_core.network.models.acl import MUTABLE_FIELDS, READ_ONLY_FIELDS
@@ -128,6 +136,324 @@ class TestAclRuleModel:
 
         assert "id" in READ_ONLY_FIELDS
         assert "source_macs" not in READ_ONLY_FIELDS
+
+
+class TestAclNetmask:
+    """Netmask handling: the UI's 'Netmask' dropdown number <-> controller bitmask."""
+
+    def test_netmask_bitmask_converters_round_trip(self):
+        from unifi_core.network.models.acl import mac_mask_to_netmask, netmask_to_mac_mask
+
+        assert netmask_to_mac_mask(24) == "ff:ff:ff:00:00:00"
+        assert netmask_to_mac_mask(48) == "ff:ff:ff:ff:ff:ff"
+        assert netmask_to_mac_mask(0) == "00:00:00:00:00:00"
+        assert mac_mask_to_netmask("ff:ff:ff:00:00:00") == 24
+        assert mac_mask_to_netmask("ff:ff:ff:ff:ff:ff") == 48
+        # non-contiguous and malformed masks have no prefix length
+        assert mac_mask_to_netmask("ff:00:ff:00:00:00") is None
+        assert mac_mask_to_netmask("not-a-mask") is None
+
+    def test_from_controller_reads_netmask_and_raw_mask(self):
+        """A masked rule surfaces both the friendly number and the raw bitmask."""
+        from unifi_core.network.models.acl import from_controller
+
+        raw = {
+            "_id": "r1",
+            "name": "multicast",
+            "acl_index": 1,
+            "action": "ALLOW",
+            "enabled": True,
+            "mac_acl_network_id": "net1",
+            "traffic_source": {"specific_mac_addresses": [], "type": "CLIENT_MAC"},
+            "traffic_destination": {
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "type": "CLIENT_MAC",
+            },
+        }
+        rule = from_controller(raw)
+        assert rule.destination_netmask == 24
+        assert rule.destination_mac_mask == "ff:ff:ff:00:00:00"
+        assert rule.source_netmask is None
+        assert rule.source_mac_mask is None
+
+    def test_non_contiguous_mask_stays_visible(self):
+        """A mask the number can't express still round-trips via the read-only raw field."""
+        from unifi_core.network.models.acl import from_controller
+
+        raw = {
+            "_id": "r2",
+            "name": "weird",
+            "acl_index": 1,
+            "action": "ALLOW",
+            "enabled": True,
+            "mac_acl_network_id": "net1",
+            "traffic_source": {"specific_mac_addresses": [], "type": "CLIENT_MAC"},
+            "traffic_destination": {
+                "specific_mac_addresses": ["aa:bb:cc:dd:ee:ff"],
+                "mac_mask": "ff:00:ff:00:00:00",
+                "type": "CLIENT_MAC",
+            },
+        }
+        rule = from_controller(raw)
+        assert rule.destination_netmask is None
+        assert rule.destination_mac_mask == "ff:00:ff:00:00:00"
+
+    def test_create_converts_netmask_to_bitmask(self):
+        from unifi_core.network.models.acl import AclRule, to_controller_create
+
+        rule = AclRule(
+            name="oui",
+            acl_index=1,
+            action="ALLOW",
+            network_id="net1",
+            destination_macs=["01:00:5e:00:00:00"],
+            destination_netmask=24,
+        )
+        payload = to_controller_create(rule)
+        assert payload["traffic_destination"]["mac_mask"] == "ff:ff:ff:00:00:00"
+        # unset side carries no mask key (exact match)
+        assert "mac_mask" not in payload["traffic_source"]
+
+    def test_update_netmask_only_is_partial(self):
+        """Updating just the netmask must not clobber the existing MACs (deep-merge preserves them)."""
+        from unifi_core.network.models.acl import to_controller_update
+
+        result = to_controller_update({"destination_netmask": 16})
+        assert result["traffic_destination"]["mac_mask"] == "ff:ff:00:00:00:00"
+        assert "specific_mac_addresses" not in result["traffic_destination"]
+
+    def test_update_netmask_none_is_no_op(self):
+        """netmask=None means 'leave unchanged', NOT clear-to-'' (the controller 400s on '')."""
+        from unifi_core.network.models.acl import to_controller_update
+
+        # netmask=None alone produces no traffic_destination block at all (pure no-op).
+        result = to_controller_update({"destination_netmask": None})
+        assert "traffic_destination" not in result
+        # netmask=None alongside a MAC change updates the MACs but never touches the mask.
+        result = to_controller_update({"destination_macs": ["aa:bb:cc:dd:ee:ff"], "destination_netmask": None})
+        assert result["traffic_destination"]["specific_mac_addresses"] == ["aa:bb:cc:dd:ee:ff"]
+        assert "mac_mask" not in result["traffic_destination"]
+
+    def test_update_source_and_dest_netmask(self):
+        """Both sides translate independently; source path is exercised too (not just dest)."""
+        from unifi_core.network.models.acl import to_controller_update
+
+        result = to_controller_update({"source_netmask": 24, "destination_netmask": 16})
+        assert result["traffic_source"]["mac_mask"] == "ff:ff:ff:00:00:00"
+        assert result["traffic_destination"]["mac_mask"] == "ff:ff:00:00:00:00"
+
+    def test_update_macs_and_netmask_together(self):
+        """A single update setting both MACs and netmask populates both sub-keys."""
+        from unifi_core.network.models.acl import to_controller_update
+
+        result = to_controller_update({"source_macs": ["01:00:5e:00:00:00"], "source_netmask": 24})
+        assert result["traffic_source"]["specific_mac_addresses"] == ["01:00:5e:00:00:00"]
+        assert result["traffic_source"]["mac_mask"] == "ff:ff:ff:00:00:00"
+
+    def test_create_source_netmask(self):
+        """The source-side create path (separate from destination) converts correctly."""
+        from unifi_core.network.models.acl import AclRule, to_controller_create
+
+        rule = AclRule(
+            name="oui",
+            acl_index=1,
+            action="ALLOW",
+            network_id="net1",
+            source_macs=["01:00:5e:00:00:00"],
+            source_netmask=24,
+        )
+        payload = to_controller_create(rule)
+        assert payload["traffic_source"]["mac_mask"] == "ff:ff:ff:00:00:00"
+        assert "mac_mask" not in payload["traffic_destination"]
+
+    def test_non_contiguous_mask_preserved_on_recreate(self):
+        """from_controller -> to_controller_create must NOT drop a non-contiguous mask
+        (netmask is None for it, so the raw mac_mask fallback carries it)."""
+        from unifi_core.network.models.acl import from_controller, to_controller_create
+
+        raw = {
+            "_id": "r",
+            "name": "weird",
+            "acl_index": 1,
+            "action": "ALLOW",
+            "enabled": True,
+            "mac_acl_network_id": "net1",
+            "traffic_source": {"specific_mac_addresses": [], "type": "CLIENT_MAC"},
+            "traffic_destination": {
+                "specific_mac_addresses": ["aa:bb:cc:dd:ee:ff"],
+                "mac_mask": "ff:00:ff:00:00:00",
+                "type": "CLIENT_MAC",
+            },
+        }
+        payload = to_controller_create(from_controller(raw))
+        assert payload["traffic_destination"]["mac_mask"] == "ff:00:ff:00:00:00"
+
+    def test_netmask_to_mac_mask_rejects_out_of_range(self):
+        """The converter raises rather than silently producing a match-everything/garbage mask."""
+        import pytest as _pytest
+
+        from unifi_core.network.models.acl import netmask_to_mac_mask
+
+        with _pytest.raises(ValueError):
+            netmask_to_mac_mask(-1)
+        with _pytest.raises(ValueError):
+            netmask_to_mac_mask(49)
+
+    def test_mac_mask_to_netmask_rejects_malformed(self):
+        """Non-string, wrong octet count, and lenient int forms (0x/whitespace) return None, not a bogus number."""
+        from unifi_core.network.models.acl import mac_mask_to_netmask
+
+        assert mac_mask_to_netmask(["ff", "ff"]) is None  # non-string -> no AttributeError
+        assert mac_mask_to_netmask(None) is None
+        assert mac_mask_to_netmask("ff:ff:ff") is None  # wrong octet count
+        assert mac_mask_to_netmask("0xff:00:00:00:00:00") is None  # 0x-prefixed token
+        assert mac_mask_to_netmask(" ff:ff:ff:ff:ff:ff ") is None  # surrounding whitespace
+        assert mac_mask_to_netmask("ff:ff:f:00:00:00") is None  # single-digit octet rejected (strict 2-digit)
+        assert mac_mask_to_netmask("FF:FF:FF:00:00:00") == 24  # uppercase still accepted
+        assert mac_mask_to_netmask("ff:ff:ff:00:00:00") == 24  # the valid form still works
+
+    def test_converter_partial_octet_boundaries(self):
+        """Off-by-one in the intra-octet shift/mask math would only show at non-byte-aligned widths."""
+        from unifi_core.network.models.acl import mac_mask_to_netmask, netmask_to_mac_mask
+
+        for bits, mask in [(1, "80:00:00:00:00:00"), (9, "ff:80:00:00:00:00"), (47, "ff:ff:ff:ff:ff:fe")]:
+            assert netmask_to_mac_mask(bits) == mask, bits
+            assert mac_mask_to_netmask(mask) == bits, bits
+
+    def test_field_validator_rejects_on_construction(self):
+        """The model's own field_validator (the create/from_controller path) rejects out-of-range,
+        independently of validate_update_fields (the update path)."""
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from unifi_core.network.models.acl import AclRule
+
+        with _pytest.raises(ValidationError):
+            AclRule(name="x", acl_index=1, action="ALLOW", network_id="n", source_netmask=99)
+
+    def test_netmask_zero_round_trips_as_match_any(self):
+        """netmask=0 is accepted and means match-any (all bits wildcarded), distinct from omit/None."""
+        from unifi_core.network.models.acl import AclRule, mac_mask_to_netmask, to_controller_create
+
+        rule = AclRule(name="z", acl_index=1, action="ALLOW", network_id="n", destination_netmask=0)
+        payload = to_controller_create(rule)
+        assert payload["traffic_destination"]["mac_mask"] == "00:00:00:00:00:00"
+        assert mac_mask_to_netmask("00:00:00:00:00:00") == 0
+
+    def test_update_macs_only_preserves_existing_mask(self):
+        """Updating only MACs emits no mac_mask, so the manager's deep_merge keeps the existing one."""
+        from unifi_core.merge import deep_merge
+        from unifi_core.network.models.acl import to_controller_update
+
+        existing = {
+            "traffic_destination": {
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "type": "CLIENT_MAC",
+            }
+        }
+        partial = to_controller_update({"destination_macs": ["aa:bb:cc:dd:ee:ff"]})
+        assert "mac_mask" not in partial["traffic_destination"]
+        merged = deep_merge(existing, partial)
+        assert merged["traffic_destination"]["mac_mask"] == "ff:ff:ff:00:00:00"  # preserved
+        assert merged["traffic_destination"]["specific_mac_addresses"] == ["aa:bb:cc:dd:ee:ff"]  # updated
+
+    def test_clear_netmask_sentinel_and_manager_pop(self):
+        """clear_<side>_netmask emits a None sentinel that the manager turns into key removal,
+        clearing the mask while preserving the MACs."""
+        from unifi_core.merge import deep_merge
+        from unifi_core.network.models.acl import to_controller_update
+
+        partial = to_controller_update({"clear_destination_netmask": True})
+        assert partial["traffic_destination"]["mac_mask"] is None  # sentinel
+        existing = {
+            "traffic_destination": {
+                "mac_mask": "ff:ff:ff:00:00:00",
+                "specific_mac_addresses": ["01:00:5e:00:00:00"],
+                "type": "CLIENT_MAC",
+            }
+        }
+        merged = deep_merge(existing, partial)
+        # replicate the manager's pop-None-mask step
+        for sk in ("traffic_source", "traffic_destination"):
+            s = merged.get(sk)
+            if isinstance(s, dict) and s.get("mac_mask", "keep") is None:
+                s.pop("mac_mask", None)
+        assert "mac_mask" not in merged["traffic_destination"]  # cleared
+        assert merged["traffic_destination"]["specific_mac_addresses"] == ["01:00:5e:00:00:00"]  # MACs kept
+
+    def test_update_clear_and_set_macs_same_side(self):
+        """Clearing the mask AND changing MACs on the same side in one update: both apply
+        (clear wins over any netmask, MACs still written)."""
+        from unifi_core.network.models.acl import to_controller_update
+
+        r = to_controller_update({"destination_macs": ["aa:bb:cc:dd:ee:ff"], "clear_destination_netmask": True})
+        assert r["traffic_destination"]["specific_mac_addresses"] == ["aa:bb:cc:dd:ee:ff"]
+        assert r["traffic_destination"]["mac_mask"] is None  # clear sentinel emitted
+
+    @pytest.mark.asyncio
+    async def test_update_tool_clear_netmask(self):
+        """The update tool's clear flag reaches the manager as a None mac_mask sentinel."""
+        with patch("unifi_network_mcp.tools.acl.acl_manager") as mock_mgr:
+            mock_mgr.update_acl_rule = AsyncMock(return_value={"name": "r"})
+
+            from unifi_network_mcp.tools.acl import update_acl_rule
+
+            result = await update_acl_rule(rule_id="r1", rule_data={}, clear_destination_netmask=True, confirm=True)
+        assert result["success"] is True
+        rule_id_arg, payload = mock_mgr.update_acl_rule.call_args[0]
+        assert payload["traffic_destination"]["mac_mask"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_tool_rejects_bad_netmask_gracefully(self):
+        """An out-of-range netmask returns a {'success': False} dict, not an unhandled exception."""
+        from unifi_network_mcp.tools.acl import create_acl_rule
+
+        result = await create_acl_rule(
+            name="bad",
+            acl_index=1,
+            action="ALLOW",
+            network_id="net001",
+            destination_netmask=99,
+            confirm=True,
+        )
+        assert result["success"] is False
+        assert "netmask" in result["error"].lower()
+
+    def test_netmask_mutable_mask_read_only(self):
+        from unifi_core.network.models.acl import MUTABLE_FIELDS, READ_ONLY_FIELDS
+
+        assert {"source_netmask", "destination_netmask"} <= MUTABLE_FIELDS
+        assert {"source_mac_mask", "destination_mac_mask"} <= READ_ONLY_FIELDS
+
+    def test_netmask_out_of_range_rejected(self):
+        from unifi_core.network.models.acl import validate_update_fields
+
+        ok, _ = validate_update_fields({"destination_netmask": 24})
+        assert ok is True
+        bad, msg = validate_update_fields({"destination_netmask": 99})
+        assert bad is False and "netmask" in msg
+
+    @pytest.mark.asyncio
+    async def test_create_tool_passes_netmask(self):
+        with patch("unifi_network_mcp.tools.acl.acl_manager") as mock_mgr:
+            mock_mgr.create_acl_rule = AsyncMock(return_value=SAMPLE_CONTROLLER_RULE)
+
+            from unifi_network_mcp.tools.acl import create_acl_rule
+
+            result = await create_acl_rule(
+                name="oui",
+                acl_index=5,
+                action="ALLOW",
+                network_id="net001",
+                destination_macs=["01:00:5e:00:00:00"],
+                destination_netmask=24,
+                confirm=True,
+            )
+        assert result["success"] is True
+        payload = mock_mgr.create_acl_rule.call_args[0][0]
+        assert payload["traffic_destination"]["mac_mask"] == "ff:ff:ff:00:00:00"
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +826,7 @@ class TestListAclRules:
     async def test_list_and_create_field_symmetry(self):
         """Every mutable field in list output is accepted by create_acl_rule.
 
-        This is the structural guarantee from #137 — round-tripping works
+        This is the structural guarantee — round-tripping works
         by construction because both tools derive from the same model.
         """
         import inspect

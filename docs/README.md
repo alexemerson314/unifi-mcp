@@ -8,7 +8,11 @@ Complete documentation for the UniFi MCP ecosystem.
 
 - **[Main README](../README.md)** - Project overview and installation
 - **[Quick Start](../QUICKSTART.md)** - Get started in 5 minutes
+- **[Plugin Support Matrix](plugin-support.md)** - Plugin prerequisites, versions and client verification status
+- **[Plugin Upgrade Guide](plugin-upgrade.md)** - Updating existing plugin installs, including the 1.0.0 Claude Code settings migration
+- **[Plugin Acceptance Procedure](plugin-acceptance.md)** - How real-client evidence for the support matrix is produced
 - **[Architecture](ARCHITECTURE.md)** - Monorepo layout and package responsibilities
+- **[API Server](../apps/api/)** - REST, GraphQL, actions, and SSE for custom applications and MCP adapters
 - **[Worker Gateway](../apps/worker/)** - Cloudflare Worker gateway and npm CLI
 - **[Relay Sidecar](../packages/unifi-mcp-relay/)** - Local sidecar for cloud relay mode
 - **[Sponsor UniFi MCP](sponsor/)** - Support maintenance, AI costs, compatibility testing, and releases
@@ -17,9 +21,15 @@ Complete documentation for the UniFi MCP ecosystem.
 
 ## MCP Discovery and Lazy Tool Loading
 
+The Python servers run on MCP SDK 2.x and negotiate per connection. Current
+clients use the Discover-era protocol (`2026-07-28`), while clients that still
+use the Initialize handshake continue to negotiate the legacy protocol
+(`2025-11-25`) against the same server process. No process-level protocol
+switch is required.
+
 Standard MCP discovery is still `tools/list` followed by `tools/call`. The
 UniFi `*_tool_index`, `*_execute`, `*_batch`, and `*_load_tools` surfaces are
-compatibility extensions for large catalogs and lazy loading, not replacements
+optional lazy-loading extensions for filtered discovery and indirect execution, not replacements
 for the protocol path.
 
 The server now supports three tool registration modes:
@@ -41,6 +51,12 @@ export UNIFI_TOOL_REGISTRATION_MODE=lazy  # default, recommended
 
 ### Core Guides
 
+#### [Sanitized Support Bundles](support-bundles.md)
+Generate, review, and share privacy-bounded Network, Protect, or Access troubleshooting evidence without treating ordinary diagnostic logs as public-safe.
+
+#### [Credential Providers](credential-providers.md)
+Keep the controller password and API key out of the MCP client's environment with the `_FILE` and `_COMMAND` spellings, and the contract the command provider runs under: supported platforms, executable resolution, and process lifecycle.
+
 #### [Context Optimization Comparison](context-optimization-comparison.md)
 Visual guide comparing eager vs lazy vs meta-only modes:
 - Side-by-side token usage diagrams
@@ -49,7 +65,7 @@ Visual guide comparing eager vs lazy vs meta-only modes:
 
 **TLDR:** Lazy mode = 96% token savings + seamless UX = best of both worlds!
 
-#### [MCP Discovery and UniFi Meta-Tools](tool-index.md)
+#### [MCP Discovery and Lazy-Loading Meta-Tools](tool-index.md)
 Documentation for standard MCP discovery and the UniFi meta-tool extension path:
 - How `tools/list` maps to lazy, eager, and meta-only modes
 - How to query the compatibility tool index
@@ -58,18 +74,6 @@ Documentation for standard MCP discovery and the UniFi meta-tool extension path:
 **TLDR:** Use `tools/list` when your client can handle the direct tool catalog. Use
 `*_tool_index` and `*_execute` when lazy loading or context limits make a compact
 manifest-backed catalog more practical.
-
-#### [MCP Tasks Alignment](mcp-tasks.md)
-Design note for mapping UniFi compatibility jobs to experimental MCP Tasks:
-- How `jobId` and batch status map to `taskId` and Task states
-- Why batch execution is the safest first native Tasks workflow
-- What must be implemented before advertising task capabilities
-
-#### [MCP Resources and Subscriptions Alignment](mcp-resources-subscriptions.md)
-Design note for mapping UniFi event buffers and snapshot surfaces to MCP resources:
-- Current Protect and Access MCP resource inventory
-- Which surfaces fit `resources/read` and resource templates
-- Why protocol resource subscriptions are not advertised until update notifications can be delivered safely
 
 #### [Permissions](permissions.md) 🔐 **SECURITY**
 Complete guide to the permission system:
@@ -93,7 +97,9 @@ Complete guide to the permission system:
 → See [Main README - Configuration](../README.md#configuration)
 
 **...build automation scripts**
-→ See [examples/python/](../examples/python/)
+→ For a custom application or service, use [`unifi-api-server`](../apps/api/).
+For scripts driven by an existing MCP client, see
+[examples/python/](../examples/python/).
 
 **...use with Claude Desktop**
 → See [examples/CLAUDE_DESKTOP.md](../examples/CLAUDE_DESKTOP.md)
@@ -111,7 +117,7 @@ UNIFI_TOOL_REGISTRATION_MODE=lazy  # lazy (default), eager, meta_only
 # UniFi controller connection
 UNIFI_HOST=192.168.1.1
 UNIFI_USERNAME=admin
-UNIFI_PASSWORD=your-password
+UNIFI_PASSWORD=your-password   # or UNIFI_PASSWORD_FILE=<path> / UNIFI_PASSWORD_COMMAND=<absolute argv>
 UNIFI_PORT=443
 UNIFI_SITE=default
 
@@ -122,6 +128,8 @@ UNIFI_CONTROLLER_TYPE=auto  # auto (default), proxy, direct
 UNIFI_MCP_HTTP_ENABLED=false
 UNIFI_MCP_DIAGNOSTICS=false
 ```
+
+The `_FILE` and `_COMMAND` spellings keep the secret out of the MCP client's environment; their trust boundary, and the command provider's platform, executable-resolution and process-lifecycle contract, are in [credential-providers.md](credential-providers.md).
 
 Full Network server defaults are in [config.yaml](../apps/network/src/unifi_network_mcp/config/config.yaml). Protect and Access keep their own defaults under `apps/protect/` and `apps/access/`.
 
@@ -171,6 +179,12 @@ See [CLAUDE.md](../CLAUDE.md) for project development guidelines.
 
 ### Core Documentation (docs/)
 - [context-optimization-comparison.md](context-optimization-comparison.md) - Mode comparison
+- [credential-providers.md](credential-providers.md) - Credential indirection contract
+- [agent-install.md](agent-install.md) - Installing UniFi MCP with an agent, per client
+- [plugin-support.md](plugin-support.md) - Plugin support matrix
+- [plugin-upgrade.md](plugin-upgrade.md) - Plugin upgrade guide
+- [plugin-acceptance.md](plugin-acceptance.md) - Real-client plugin acceptance procedure
+- [support-bundles.md](support-bundles.md) - Sanitized support-bundle workflow and privacy contract
 - [tool-index.md](tool-index.md) - Tool index documentation
 - [sponsor/](sponsor/) - Sponsorship landing page
 

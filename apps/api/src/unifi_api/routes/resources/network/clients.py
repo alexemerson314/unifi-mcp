@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from unifi_core.exceptions import UniFiNotFoundError
+from unifi_core.exceptions import UniFiNotFoundError, UniFiOperationError
 
 from unifi_api.auth.middleware import require_scope
 from unifi_api.auth.scopes import Scope
@@ -34,6 +34,7 @@ def _client_key(obj) -> tuple:
 @router.get(
     "/sites/{site_id}/clients",
     response_model=Page[to_pydantic_model(Client)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/clients"],
 )
@@ -53,10 +54,8 @@ async def list_clients(
             controller.id,
             "network",
             "client_manager",
+            site=site_id,
         )
-        cm = await factory.get_connection_manager(session, controller.id, "network")
-        if cm.site != site_id:
-            await cm.set_site(site_id)
         all_clients = await mgr.get_clients()
 
     cursor_obj = None
@@ -87,6 +86,7 @@ async def list_clients(
 @router.get(
     "/sites/{site_id}/clients/{mac}",
     response_model=Detail[to_pydantic_model(Client)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/clients"],
 )
@@ -106,13 +106,14 @@ async def get_client(
                 controller.id,
                 "network",
                 "client_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             client = await mgr.get_client_details(mac)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except UniFiOperationError as exc:
+        # The per-MAC lookup failed, so existence is undetermined: not a 404.
+        raise HTTPException(status_code=502, detail=str(exc))
     if client is None:
         raise HTTPException(status_code=404, detail="client not found")
 

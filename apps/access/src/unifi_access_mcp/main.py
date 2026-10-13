@@ -3,15 +3,17 @@
 
 Responsibilities:
 - configure permissions wrappers
-- initialise UniFi Access connection
-- start FastMCP (stdio)
+- start FastMCP (stdio) and connect to UniFi Access in the background
 """
+
+import asyncio
+from contextlib import suppress
 
 from unifi_access_mcp.bootstrap import (
     UNIFI_TOOL_REGISTRATION_MODE,
     logger,
 )  # ensures logging/env setup early
-from unifi_access_mcp.categories import ACCESS_CATEGORY_MAP, TOOL_MODULE_MAP, setup_lazy_loading
+from unifi_access_mcp.categories import ACCESS_CATEGORY_MAP, TOOL_MODULE_MAP, policy_gates, setup_lazy_loading
 from unifi_access_mcp.jobs import get_job_status, start_async_tool
 
 # Shared singletons
@@ -20,6 +22,7 @@ from unifi_access_mcp.runtime import (
     connection_manager,
     event_manager,
     server,
+    support_bundle_service,
 )
 from unifi_access_mcp.tool_index import register_tool, tool_index_handler
 from unifi_access_mcp.utils.config_helpers import parse_config_bool
@@ -43,80 +46,128 @@ setup_permissioned_tool(
 logger.debug("Access MCP server module loaded; singletons initialised.")
 
 
+async def _start_event_listener() -> None:
+    """Start the websocket event listener when enabled and connected."""
+    ws_enabled_raw = config.access.events.get("websocket_enabled", True) if hasattr(config, "access") else True
+    if not parse_config_bool(ws_enabled_raw):
+        logger.info("Access event websocket disabled via config.")
+        return
+    try:
+        event_manager.set_server(server)
+        # start_listening needs an API client: the Access websocket is
+        # key-authenticated, and a proxy-only session cannot open it.
+        # It logs that condition itself and returns without raising, so
+        # a proxy-only deployment keeps working with REST queries and
+        # an empty recent-events buffer.
+        await event_manager.start_listening()
+    except Exception as ws_exc:
+        logger.error(
+            "Failed to start event websocket listener: %s. Real-time events will be unavailable; REST queries still work.",
+            ws_exc,
+            exc_info=True,
+        )
+
+
+async def connect_at_startup() -> bool:
+    """Connect to UniFi Access in the background while the server answers MCP requests.
+
+    Manager operations wait for this connection within a bound.
+    """
+    logger.info("Connecting to UniFi Access in the background...")
+    try:
+        connected = await connection_manager.initialize()
+    except Exception as exc:
+        # Nothing awaits this task's result; a failure must still be reported.
+        logger.error("Unexpected error while connecting at startup: %s", type(exc).__name__)
+        connected = False
+    if not connected:
+        logger.error(
+            "Failed to connect to UniFi Access. Tools report the connection error and try to reconnect on later calls."
+        )
+        return False
+    logger.info("Global Access connection initialized successfully.")
+    await _start_event_listener()
+    return True
+
+
 async def main_async():
     """Main asynchronous function to setup and run the server."""
-    from unifi_core.policy_gate import check_deprecated_env_vars
-    from unifi_mcp_shared.bootstrap import assert_credentials_configured
+    from unifi_core.policy_gate import check_deprecated_env_vars, check_unknown_policy_env_vars
     from unifi_mcp_shared.server_lifecycle import apply_log_level, install_asyncio_exception_handler
+    from unifi_mcp_shared.setup_required import controller_host_configured, serve_setup_required
     from unifi_mcp_shared.tool_registration import register_tools_for_mode
     from unifi_mcp_shared.transport import resolve_http_config, run_transports
 
     install_asyncio_exception_handler(logger)
     apply_log_level(config, "unifi-access-mcp")
     check_deprecated_env_vars("access", logger)
-    assert_credentials_configured(config, plugin_name="unifi-access", env_prefix="ACCESS", logger=logger)
+    check_unknown_policy_env_vars("access", logger, policy_gates(), ACCESS_CATEGORY_MAP)
+    if not controller_host_configured(config):
+        # Answer initialize and explain setup instead of exiting; register no
+        # controller tools and open no controller connection.
+        await serve_setup_required(
+            server=server,
+            config=config,
+            plugin_name="unifi-access",
+            env_prefix="ACCESS",
+            tool_prefix="access",
+            default_port=3002,
+            logger=logger,
+        )
+        return
 
-    # Initialize the global Access connection
-    logger.info("Initializing global Access connection from main_async...")
-    if not await connection_manager.initialize():
-        logger.error("Failed to connect to UniFi Access. Tool functionality may be impaired.")
-    else:
-        logger.info("Global Access connection initialized successfully from main_async.")
-
-        # Start the websocket event listener if enabled and connection succeeded
-        ws_enabled_raw = config.access.events.get("websocket_enabled", True) if hasattr(config, "access") else True
-        ws_enabled = parse_config_bool(ws_enabled_raw)
-        if ws_enabled:
-            try:
-                event_manager.set_server(server)
-                # TODO: Implement websocket event listening for Access
-                logger.info("Access event websocket listener not yet implemented.")
-            except Exception as ws_exc:
-                logger.error(
-                    "Failed to start event websocket listener: %s. "
-                    "Real-time events will be unavailable; REST queries still work.",
-                    ws_exc,
-                    exc_info=True,
-                )
-        else:
-            logger.info("Access event websocket disabled via config.")
-
-    # ---- Register MCP resources ----
+    startup_connect = None
     try:
-        import unifi_access_mcp.resources.events  # noqa: F401
+        # A controller that was down at startup is reconnected on demand by the
+        # managers; start the listener then, as a successful startup would.
+        connection_manager.add_reconnect_callback(_start_event_listener)
+        # Answer initialize before reaching the controller: clients enforce a
+        # short startup timeout.
+        startup_connect = asyncio.create_task(connect_at_startup(), name="access-startup-connect")
 
-        logger.info("MCP resources registered (events).")
-    except Exception as res_exc:
-        logger.error("Failed to register MCP resources: %s", res_exc, exc_info=True)
+        # ---- Register MCP resources ----
+        try:
+            import unifi_access_mcp.resources.events  # noqa: F401
 
-    # ---- Register tools ----
-    await register_tools_for_mode(
-        mode=UNIFI_TOOL_REGISTRATION_MODE,
-        server=server,
-        original_tool_decorator=_original_tool_decorator,
-        tool_index_handler=tool_index_handler,
-        start_async_tool=start_async_tool,
-        get_job_status=get_job_status,
-        register_tool=register_tool,
-        tool_module_map=TOOL_MODULE_MAP,
-        setup_lazy_loading=setup_lazy_loading,
-        base_package="unifi_access_mcp.tools",
-        config=config,
-        logger=logger,
-        prefix="access",
-        server_label="UniFi Access",
-    )
+            logger.info("MCP resources registered (events).")
+        except Exception as res_exc:
+            logger.error("Failed to register MCP resources: %s", res_exc, exc_info=True)
 
-    # ---- Start transports ----
-    http_enabled, http_transport, host, port = resolve_http_config(config.server, default_port=3002, logger=logger)
-    await run_transports(
-        server=server,
-        http_enabled=http_enabled,
-        host=host,
-        port=port,
-        http_transport=http_transport,
-        logger=logger,
-    )
+        # ---- Register tools ----
+        await register_tools_for_mode(
+            mode=UNIFI_TOOL_REGISTRATION_MODE,
+            server=server,
+            original_tool_decorator=_original_tool_decorator,
+            tool_index_handler=tool_index_handler,
+            start_async_tool=start_async_tool,
+            get_job_status=get_job_status,
+            register_tool=register_tool,
+            tool_module_map=TOOL_MODULE_MAP,
+            setup_lazy_loading=setup_lazy_loading,
+            base_package="unifi_access_mcp.tools",
+            config=config,
+            logger=logger,
+            support_bundle_handler=support_bundle_service.generate,
+            prefix="access",
+            server_label="UniFi Access",
+        )
+
+        # ---- Start transports ----
+        http_enabled, http_transport, host, port = resolve_http_config(config.server, default_port=3002, logger=logger)
+        await run_transports(
+            server=server,
+            http_enabled=http_enabled,
+            host=host,
+            port=port,
+            http_transport=http_transport,
+            logger=logger,
+        )
+    finally:
+        if startup_connect is not None and not startup_connect.done():
+            startup_connect.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_connect
+        await connection_manager.close()
 
 
 def main():

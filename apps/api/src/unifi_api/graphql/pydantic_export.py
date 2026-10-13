@@ -12,9 +12,11 @@ import datetime
 from typing import Any, get_args, get_origin
 
 import strawberry
-from pydantic import BaseModel, ConfigDict, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from strawberry.types.base import StrawberryList, StrawberryOptional
 from strawberry.types.private import StrawberryPrivate
+
+from unifi_api.graphql.scalars import BigInt
 
 _MODEL_CACHE: dict[type, type[BaseModel]] = {}
 
@@ -57,6 +59,9 @@ def _strawberry_type_to_pydantic(strawberry_type_obj: Any) -> Any:
 
     if strawberry_type_obj is strawberry.ID:
         return str
+
+    if strawberry_type_obj is BigInt:
+        return int
 
     if hasattr(strawberry_type_obj, "__strawberry_definition__"):
         return to_pydantic_model(strawberry_type_obj)
@@ -104,7 +109,8 @@ def to_pydantic_model(strawberry_type: type) -> type[BaseModel]:
             # strawberry.Private — internal context, not in to_dict()
             continue
         annotation = _strawberry_type_to_pydantic(field.type)
-        fields[field.python_name] = (annotation, None)
+        default = Field(default=None, description=field.description) if field.description else None
+        fields[field.python_name] = (annotation, default)
 
     model = create_model(
         f"{strawberry_type.__name__}Model",

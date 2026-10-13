@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
 from strawberry.types import Info
+from unifi_core.redaction import redact_sensitive_fields, redact_value
 
 if TYPE_CHECKING:
     from unifi_api.graphql.types.protect.events import Event
@@ -51,10 +52,13 @@ class Camera:
     model: str | None
     type: str | None
     state: str | None
+    firmware_version: str | None
     is_recording: bool | None
     is_motion_detected: bool | None
     is_smart_detected: bool | None
     host: str | None
+    smart_detect_types: list[str] | None
+    is_ptz: bool | None
     channels: strawberry.scalars.JSON | None  # type: ignore[name-defined]
     ir_led_mode: str | None
     hdr_mode: str | None
@@ -86,10 +90,13 @@ class Camera:
             model=_get(obj, "model"),
             type=_get(obj, "type"),
             state=_get(obj, "state"),
+            firmware_version=_get(obj, "firmware_version"),
             is_recording=_get(obj, "is_recording"),
             is_motion_detected=_get(obj, "is_motion_detected"),
             is_smart_detected=_get(obj, "is_smart_detected"),
             host=_get(obj, "ip_address") or _get(obj, "host"),
+            smart_detect_types=_get(obj, "smart_detect_types"),
+            is_ptz=_get(obj, "is_ptz"),
             channels=_get(obj, "channels") or [],
             ir_led_mode=_get(obj, "ir_led_mode"),
             hdr_mode=_get(obj, "hdr_mode"),
@@ -211,12 +218,16 @@ class CameraStreams:
         return {"kind": kind}
 
     @classmethod
-    def from_manager_output(cls, obj: Any) -> "CameraStreams":
+    def from_manager_output(cls, obj: Any, *, redact_sensitive: bool = True) -> "CameraStreams":
         return cls(
             camera_id=_get(obj, "camera_id"),
             camera_name=_get(obj, "camera_name"),
-            channels=_get(obj, "channels") or {},
-            rtsps_streams=_get(obj, "rtsps_streams") or {},
+            channels=redact_sensitive_fields(_get(obj, "channels") or {}, redact_sensitive=redact_sensitive),
+            rtsps_streams=redact_value(
+                "rtsps_streams",
+                _get(obj, "rtsps_streams") or {},
+                redact_sensitive=redact_sensitive,
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -240,6 +251,8 @@ class Snapshot:
     content_type: str | None
     captured_at: str | None
     url: str | None = None
+    snapshot_url: str | None = None
+    image_base64: str | None = None
 
     # Tracks which branch produced the instance so to_dict() can re-emit the
     # exact original dict shape — bytes -> {size,content_type,captured_at};
@@ -258,15 +271,22 @@ class Snapshot:
                 content_type="image/jpeg",
                 captured_at=datetime.now(timezone.utc).isoformat(),
                 url=None,
+                snapshot_url=None,
+                image_base64=None,
             )
             inst._source = "bytes"
             return inst
         if isinstance(obj, dict):
+            content_type = obj.get("content_type")
+            if content_type is None and "snapshot_url" not in obj:
+                content_type = "image/jpeg"
             inst = cls(
                 size_bytes=obj.get("size_bytes"),
-                content_type=obj.get("content_type", "image/jpeg"),
+                content_type=content_type,
                 captured_at=obj.get("captured_at"),
                 url=obj.get("url"),
+                snapshot_url=obj.get("snapshot_url"),
+                image_base64=obj.get("image_base64"),
             )
             inst._source = "dict"
             return inst
@@ -275,6 +295,8 @@ class Snapshot:
             content_type=None,
             captured_at=None,
             url=None,
+            snapshot_url=None,
+            image_base64=None,
         )
         inst._source = "other"
         return inst
@@ -287,12 +309,15 @@ class Snapshot:
                 "captured_at": self.captured_at,
             }
         if self._source == "dict":
-            return {
+            payload = {
                 "size_bytes": self.size_bytes,
                 "content_type": self.content_type,
                 "captured_at": self.captured_at,
                 "url": self.url,
+                "snapshot_url": self.snapshot_url,
+                "image_base64": self.image_base64,
             }
+            return {key: value for key, value in payload.items() if value is not None}
         return {
             "size_bytes": None,
             "content_type": None,

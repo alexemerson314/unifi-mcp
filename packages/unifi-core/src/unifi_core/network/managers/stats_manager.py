@@ -2,14 +2,17 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from aiounifi.errors import RequestError
 from aiounifi.models.api import ApiRequest, ApiRequestV2
 from aiounifi.models.dpi_restriction_app import DPIRestrictionApp  # Import DPIApp model
 from aiounifi.models.dpi_restriction_group import (
     DPIRestrictionGroup,
 )  # Import DPIGroup model
 
+from unifi_core.mac import mac_equal, normalize_mac
 from unifi_core.network.managers.client_manager import ClientManager  # Needed for get_top_clients
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.network.managers.device_manager import DeviceManager
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -108,6 +111,7 @@ class StatsManager:
         self, client_mac: str, duration_hours: int = 1, granularity: str = "hourly"
     ) -> List[Dict[str, Any]]:
         """Get statistics for a specific client."""
+        client_mac = normalize_mac(client_mac) or client_mac
         granularity = _resolve_granularity(granularity)
         cache_key = f"{CACHE_PREFIX_STATS_CLIENT}_{client_mac}_{duration_hours}_{granularity}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=300)  # 5 minute cache
@@ -144,6 +148,22 @@ class StatsManager:
             logger.error("Error getting stats for client %s: %s", client_mac, e)
             raise
 
+    async def get_client_stats_for_identifier(
+        self,
+        client_id: str,
+        duration_hours: int = 1,
+        granularity: str = "hourly",
+    ) -> List[Dict[str, Any]]:
+        """Resolve a public MAC-or-id client identifier before fetching stats."""
+        client = await self._client_manager.get_client_details(client_id, existence_only=True)
+        raw = client.raw if hasattr(client, "raw") else client
+        client_mac = raw.get("mac", client_id)
+        return await self.get_client_stats(
+            client_mac,
+            duration_hours=duration_hours,
+            granularity=granularity,
+        )
+
     async def get_device_stats(
         self,
         device_mac: str,
@@ -159,6 +179,7 @@ class StatsManager:
             granularity: Report granularity (5minutes, hourly, daily, monthly).
             device_type: Device type for endpoint routing (ap, gw, or dev).
         """
+        device_mac = normalize_mac(device_mac) or device_mac
         granularity = _resolve_granularity(granularity)
         cache_key = (
             f"{CACHE_PREFIX_STATS_DEVICE}_{device_mac}_{duration_hours}_{granularity}"
@@ -222,6 +243,25 @@ class StatsManager:
         except Exception as e:
             logger.error("Error getting stats for device %s: %s", device_mac, e)
             raise
+
+    async def get_device_stats_for_identifier(
+        self,
+        device_id: str,
+        duration_hours: int = 1,
+        granularity: str = "hourly",
+    ) -> List[Dict[str, Any]]:
+        """Resolve a public MAC-or-id device identifier and select its report family."""
+        device = await DeviceManager(self._connection).get_device_details(device_id)
+        raw = device.raw if hasattr(device, "raw") else device
+        device_mac = raw.get("mac", device_id)
+        device_type = raw.get("type", "unknown")
+        report_type = {"uap": "ap", "ugw": "gw", "udm": "gw"}.get(device_type, "dev")
+        return await self.get_device_stats(
+            device_mac,
+            duration_hours=duration_hours,
+            granularity=granularity,
+            device_type=report_type,
+        )
 
     async def get_top_clients(self, duration_hours: int = 24, limit: int = 10) -> List[Dict[str, Any]]:
         """Get top clients by usage.
@@ -289,8 +329,8 @@ class StatsManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            await self._connection.controller.dpi_apps.update()
-            await self._connection.controller.dpi_groups.update()
+            await self._connection.refresh_handler("dpi_apps")
+            await self._connection.refresh_handler("dpi_groups")
 
             dpi_apps: List[DPIRestrictionApp] = list(self._connection.controller.dpi_apps.values())
             dpi_groups: List[DPIRestrictionGroup] = list(self._connection.controller.dpi_groups.values())
@@ -298,8 +338,10 @@ class StatsManager:
             self._connection._update_cache(cache_key, result, timeout=900)
             return result
         except Exception as e:
-            logger.error("Error getting DPI stats: %s", e)
-            raise
+            logger.error("Error getting DPI stats: %s", type(e).__name__)
+            # REST/GraphQL call this manager directly and may log tracebacks.
+            # Keep the original controller text out of every caller surface.
+            raise RequestError(f"DPI stats refresh failed ({type(e).__name__}).") from None
 
     async def get_alerts(self, include_archived: bool = False) -> List[Dict[str, Any]]:
         """Get alerts from the controller."""
@@ -314,7 +356,17 @@ class StatsManager:
             alerts = await self._get_alerts_v2()
         except Exception as v2_error:
             logger.debug("V2 alert lookup failed, falling back to legacy alarms: %s", v2_error)
-            alerts = await self._get_alerts_legacy(include_archived)
+            try:
+                alerts = await self._get_alerts_legacy(include_archived)
+            except Exception as legacy_error:
+                # Report both. Current controllers have removed /stat/alarm, so the
+                # legacy error is usually a 404 that says nothing about the real
+                # problem — which is whatever made the v2 lookup fail.
+                raise RuntimeError(
+                    f"/stat/alarm failed ({legacy_error}) after the v2 system-log lookup failed "
+                    f"({v2_error}). On current UniFi Network versions the legacy endpoint no longer "
+                    "exists, so the v2 failure is the one to act on."
+                ) from legacy_error
 
         if not include_archived:
             alerts = [a for a in alerts if not a.get("archived", False)]
@@ -468,6 +520,7 @@ class StatsManager:
             client_mac: MAC address of the client.
             by: Grouping type, e.g. 'by_app' or 'by_cat'.
         """
+        client_mac = normalize_mac(client_mac) or client_mac
         cache_key = f"{CACHE_PREFIX_STATS_CLIENT_DPI}_{client_mac}_{by}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=900)  # 15 minute cache
         if cached_data is not None:
@@ -482,8 +535,8 @@ class StatsManager:
             self._connection._update_cache(cache_key, result, timeout=900)
             return result
         except Exception as e:
-            logger.error("Error getting DPI traffic for client %s: %s", client_mac, e)
-            raise
+            logger.error("Client DPI traffic read failed: %s", type(e).__name__)
+            raise RequestError(f"Client DPI traffic read failed ({type(e).__name__}).") from None
 
     async def get_ips_events(self, duration_hours: int = 24, limit: int = 50) -> List[Dict[str, Any]]:
         """Get IPS/IDS events.
@@ -515,6 +568,22 @@ class StatsManager:
             except Exception as legacy_error:
                 logger.debug("Legacy IPS endpoint failed, falling back to v2 security logs: %s", legacy_error)
                 response = await self._get_security_events_v2(start_time, end_time, limit)
+            else:
+                # A controller that has moved IPS events to the v2 system log answers
+                # this endpoint 200 with an empty list rather than failing, so the
+                # fallback above never fires on the versions it exists for.
+                if not isinstance(response, list) or not response:
+                    logger.debug("Legacy IPS endpoint returned no events, trying v2 security logs")
+                    try:
+                        response = await self._get_security_events_v2(start_time, end_time, limit)
+                    except Exception as v2_error:
+                        # Deliberately not raising, unlike the branch above: legacy did
+                        # answer here, and a controller old enough to have no v2 endpoint
+                        # answers exactly this way. Returning early leaves the result
+                        # uncached, so a transient v2 outage is retried on the next call
+                        # rather than held as "no threats" for the whole TTL.
+                        logger.debug("v2 security log fallback failed: %s", v2_error)
+                        return []
             result = response if isinstance(response, list) else []
             self._connection._update_cache(cache_key, result, timeout=300)
             return result
@@ -561,6 +630,7 @@ class StatsManager:
             duration_hours: Number of hours to look back.
             limit: Maximum number of sessions to return.
         """
+        client_mac = normalize_mac(client_mac) or client_mac
         mac_part = client_mac or "all"
         cache_key = f"{CACHE_PREFIX_STATS_SESSIONS}_{mac_part}_{duration_hours}_{limit}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=300)  # 5 minute cache
@@ -587,8 +657,8 @@ class StatsManager:
             self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
-            logger.error("Error getting client sessions: %s", e)
-            raise
+            logger.error("Client sessions read failed: %s", type(e).__name__)
+            raise RequestError(f"Client sessions read failed ({type(e).__name__}).") from None
 
     async def get_dashboard(self, history_seconds: int = 86400) -> List[Dict[str, Any]]:
         """Get the site dashboard aggregate (health, WiFi standards, ISP metrics).
@@ -661,6 +731,7 @@ class StatsManager:
         Returns:
             Dict with WiFi detail fields, or None if client not found.
         """
+        client_mac = normalize_mac(client_mac) or client_mac
         cache_key = f"{CACHE_PREFIX_STATS_CLIENT_WIFI}_{client_mac}_{self._connection.site}"
         cached_data = self._connection.get_cached(cache_key, timeout=300)  # 5 minute cache
         if cached_data is not None:
@@ -674,9 +745,8 @@ class StatsManager:
             response = await self._connection.request(api_request)
 
             clients = response if isinstance(response, list) else []
-            target = client_mac.lower()
             raw = next(
-                (c for c in clients if isinstance(c, dict) and str(c.get("mac", "")).lower() == target),
+                (c for c in clients if isinstance(c, dict) and mac_equal(c.get("mac"), client_mac)),
                 None,
             )
             if raw is None:
@@ -710,5 +780,5 @@ class StatsManager:
             self._connection._update_cache(cache_key, result, timeout=300)
             return result
         except Exception as e:
-            logger.error("Error getting WiFi details for client %s: %s", client_mac, e)
-            raise
+            logger.error("Client WiFi details read failed: %s", type(e).__name__)
+            raise RequestError(f"Client WiFi details read failed ({type(e).__name__}).") from None

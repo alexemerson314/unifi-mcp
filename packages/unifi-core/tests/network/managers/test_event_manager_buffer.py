@@ -2,7 +2,28 @@
 
 import time
 
-from unifi_core.network.managers.event_manager import EventBuffer
+import pytest
+from unifi_core.network.managers.event_manager import EventBuffer, EventManager
+
+
+def test_event_manager_parses_positive_buffer_config() -> None:
+    manager = EventManager(object(), config={"buffer_size": "5", "buffer_ttl_seconds": "60"})
+
+    assert manager.buffer_capacity == 5
+    assert manager._buffer._ttl == 60
+
+
+@pytest.mark.parametrize(
+    ("key", "env_var"),
+    [
+        ("buffer_size", "UNIFI_NETWORK_EVENT_BUFFER_SIZE"),
+        ("buffer_ttl_seconds", "UNIFI_NETWORK_EVENT_BUFFER_TTL"),
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, "0", "-1", "invalid", True, 1.5, None])
+def test_event_manager_rejects_invalid_buffer_config(key: str, env_var: str, value: object) -> None:
+    with pytest.raises(ValueError, match=env_var):
+        EventManager(object(), config={key: value})
 
 
 def test_buffer_add_and_get_recent() -> None:
@@ -39,6 +60,21 @@ def test_buffer_filter_by_event_type() -> None:
     buf.add({"id": "e3", "key": "EVT_LU_Connected"})
     out = buf.get_recent(event_type="EVT_LU_Connected")
     assert {e["id"] for e in out} == {"e1", "e3"}
+
+
+def test_buffer_event_type_filter_requires_exact_key() -> None:
+    buf = EventBuffer(max_size=10, ttl_seconds=300)
+    buf.add({"id": "e1", "key": "CLIENT_CONNECTED_WIRELESS_2"})
+
+    assert buf.get_recent(event_type="CLIENT_CONNECTED") == []
+
+
+def test_buffer_limit_zero_returns_empty() -> None:
+    """An explicit limit=0 means zero results, not unlimited."""
+    buf = EventBuffer(max_size=10, ttl_seconds=300)
+    buf.add({"id": "e1", "key": "EVT_LU_Connected"})
+    buf.add({"id": "e2", "key": "EVT_LU_Disconnected"})
+    assert buf.get_recent(limit=0) == []
 
 
 def test_buffer_clear() -> None:

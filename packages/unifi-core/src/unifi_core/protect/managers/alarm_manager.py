@@ -1,16 +1,31 @@
 """Alarm Manager control for UniFi Protect.
 
-Wraps the private ``/proxy/protect/api/arm/*`` endpoints used by the
-UniFi Protect Alarm Manager (Protect 6.1+) to arm/disarm the system.
-The ``uiprotect`` library does not expose these endpoints natively, so
-this manager calls them directly via ``ProtectApiClient.api_request``.
+Wraps the private ``/proxy/protect/api/arm/*`` and
+``/proxy/protect/api/automations`` endpoints used by the UniFi Protect
+Alarm Manager (Protect 6.1+) to arm/disarm the system and to manage
+the underlying alarm rules (automations).
+
+The ``uiprotect`` library does not expose either set natively, so this
+manager calls them directly via ``ProtectApiClient.api_request``.
 
 Endpoints (verified against Protect 7.0)
 -----------------------------------------
-- ``GET  arm/profiles``    -- list all arm profile definitions
-- ``PATCH arm``            -- select active profile, body ``{"armProfileId": "..."}``
-- ``POST arm/enable``      -- arm the system (empty body)
-- ``POST arm/disable``     -- disarm the system (empty body)
+Arm/disarm:
+  - ``GET  arm/profiles``    -- list all arm profile definitions
+  - ``PATCH arm``            -- select active profile, body ``{"armProfileId": "..."}``
+  - ``POST arm/enable``      -- arm the system (empty body)
+  - ``POST arm/disable``     -- disarm the system (empty body)
+
+Rules (automations):
+  - ``GET    automations``         -- list all alarm rules
+  - ``GET    automations/{id}``    -- 404s on this controller; there is no
+                                      per-rule GET, so ``get_rule`` fetches the
+                                      list and filters by id
+  - ``POST   automations``         -- create a new rule (body = full payload)
+  - ``PATCH  automations/{id}``    -- update a rule (body = full payload;
+                                      Protect rejects partial bodies, so callers
+                                      should read-modify-write)
+  - ``DELETE automations/{id}``    -- delete a rule
 
 Current armed state lives in ``nvr.armMode`` (single state per system,
 not per-profile):
@@ -35,12 +50,22 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from uiprotect.exceptions import BadRequest
+
+from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.protect.managers.connection_manager import ProtectConnectionManager
 
 logger = logging.getLogger(__name__)
 
 # Values of ``nvr.armMode.status`` that mean "not armed".
 _DISARMED_STATUSES = {"disabled", "disarmed", "off", "inactive"}
+_LEGACY_PROFILE_ID_NOT_FOUND_ERROR = (
+    "The legacy Protect arm endpoint did not recognize this profile_id. Alarm Manager "
+    "v2 ids returned by protect_alarm_list_profiles are not accepted by that endpoint; "
+    "use a profile marked arm_compatible=true, or omit profile_id to use the currently "
+    "selected legacy profile. A v2 arming endpoint is not implemented because its "
+    "contract has not been verified."
+)
 
 
 class AlarmManager:
@@ -156,11 +181,16 @@ class AlarmManager:
 
     async def _select_profile(self, profile_id: str) -> None:
         """PATCH ``arm`` to set which profile is active."""
-        await self._cm.client.api_request(
-            "arm",
-            method="patch",
-            json={"armProfileId": profile_id},
-        )
+        try:
+            await self._cm.client.api_request(
+                "arm",
+                method="patch",
+                json={"armProfileId": profile_id},
+            )
+        except BadRequest as exc:
+            if _is_arm_profile_not_found(exc):
+                raise ValueError(_LEGACY_PROFILE_ID_NOT_FOUND_ERROR) from exc
+            raise
 
     # ------------------------------------------------------------------
     # Preview (for confirm=false tool responses)
@@ -300,6 +330,115 @@ class AlarmManager:
 
         return {"armed": False}
 
+    # ------------------------------------------------------------------
+    # Rule (automation) CRUD
+    # ------------------------------------------------------------------
+
+    async def list_rules(self) -> List[Dict[str, Any]]:
+        """Return every alarm rule defined under Alarm Manager.
+
+        ``GET automations`` returns a flat array of rule payloads. Each entry
+        is passed through largely as-is; the tool/model layer is responsible
+        for coercing into :class:`AlarmRule`.
+        """
+        data = await self._cm.client.api_request("automations", method="get")
+        if not isinstance(data, list):
+            logger.warning("Unexpected automations shape: %r", type(data))
+            return []
+        return [r for r in data if isinstance(r, dict)]
+
+    async def get_rule(self, rule_id: str) -> Dict[str, Any]:
+        """Fetch a single alarm rule by id.
+
+        The controller exposes no per-rule GET endpoint — ``GET
+        automations/{id}`` returns 404 — so the full payload is only available
+        from the list endpoint. We fetch ``GET automations`` and filter by id.
+
+        Raises ``ValueError`` on empty id, ``UniFiNotFoundError`` if no rule
+        with that id exists.
+        """
+        rule_id = _require_rule_id(rule_id)
+        for rule in await self.list_rules():
+            if rule.get("id") == rule_id:
+                return rule
+        raise UniFiNotFoundError("alarm rule", rule_id)
+
+    async def update_rule(self, rule_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an alarm rule via PATCH.
+
+        Protect's ``PATCH automations/{id}`` expects the FULL rule body
+        (verified via JeffSteinbok/hass-uiprotectalarms implementation).
+        Callers must perform a read-modify-write: call :meth:`get_rule`
+        first, mutate the returned dict, then pass it back here.
+        """
+        rule_id = _require_rule_id(rule_id)
+        _require_dict_body(body, "body")
+        data = await self._cm.client.api_request(f"automations/{rule_id}", method="patch", json=body)
+        if not isinstance(data, dict):
+            # PATCH usually echoes the updated rule; if the controller returns
+            # something else, surface it but coerce to a safe shape so callers
+            # don't crash.
+            logger.warning(
+                "PATCH automations/%s returned non-dict %r; coercing to {} ",
+                rule_id,
+                type(data),
+            )
+            return {}
+        return data
+
+    async def create_rule(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new alarm rule via POST.
+
+        Body must be a full rule payload matching the Protect ``automations``
+        schema (sources / conditions / actions / cooldown / etc.). The server
+        assigns the rule ``id`` and returns the created rule.
+        """
+        _require_dict_body(body, "body")
+        data = await self._cm.client.api_request("automations", method="post", json=body)
+        if not isinstance(data, dict):
+            logger.warning(
+                "POST automations returned non-dict %r; coercing to {}",
+                type(data),
+            )
+            return {}
+        return data
+
+    async def delete_rule(self, rule_id: str) -> Dict[str, Any]:
+        """Delete an alarm rule by id.
+
+        The controller returns an empty body on a successful delete, so we use
+        ``api_request_raw`` (which does not attempt to decode JSON) to avoid a
+        spurious "Could not decode JSON" error on an otherwise-successful call.
+        """
+        rule_id = _require_rule_id(rule_id)
+        await self._cm.client.api_request_raw(f"automations/{rule_id}", method="delete")
+        return {"deleted": True, "rule_id": rule_id}
+
+    # ------------------------------------------------------------------
+    # Rule preview helpers (for confirm=false tool responses)
+    # ------------------------------------------------------------------
+
+    async def preview_update_rule(self, rule_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Return current vs. proposed rule state for an update preview."""
+        rule_id = _require_rule_id(rule_id)
+        _require_dict_body(body, "body")
+        current = await self.get_rule(rule_id)
+        return {
+            "rule_id": rule_id,
+            "current": current,
+            "proposed": body,
+        }
+
+    async def preview_delete_rule(self, rule_id: str) -> Dict[str, Any]:
+        """Return current rule + delete intent for a delete preview."""
+        rule_id = _require_rule_id(rule_id)
+        current = await self.get_rule(rule_id)
+        return {
+            "rule_id": rule_id,
+            "current_name": current.get("name"),
+            "proposed_changes": {"deleted": True},
+        }
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -317,3 +456,40 @@ def _ms_to_iso(value: Any) -> Optional[str]:
     if ms <= 0:
         return None
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _is_arm_profile_not_found(exc: BaseException) -> bool:
+    """Return true when Protect rejected a legacy arm profile selection."""
+    if any(_payload_is_arm_profile_not_found(arg) for arg in exc.args):
+        return True
+    text = str(exc)
+    return "armProfile" in text and ("NOT_FOUND" in text or "Status: 404" in text or "not found" in text.lower())
+
+
+def _payload_is_arm_profile_not_found(value: Any) -> bool:
+    if isinstance(value, dict):
+        entity = value.get("entity")
+        name = value.get("name")
+        error = str(value.get("error") or "")
+        return entity == "armProfile" and (name == "NOT_FOUND" or "not found" in error.lower())
+    if isinstance(value, (list, tuple)):
+        return any(_payload_is_arm_profile_not_found(item) for item in value)
+    return False
+
+
+def _require_rule_id(rule_id: Any) -> str:
+    """Validate ``rule_id`` is a non-empty string and return it stripped.
+
+    Returning the stripped value lets callers rebind ``rule_id`` so a padded id
+    like ``" rule-001 "`` matches the controller's id during list filtering
+    instead of silently missing.
+    """
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise ValueError("rule_id must be a non-empty string")
+    return rule_id.strip()
+
+
+def _require_dict_body(body: Any, name: str) -> None:
+    """Validate that ``body`` is a dict (Protect rule payloads are objects)."""
+    if not isinstance(body, dict):
+        raise TypeError(f"{name} must be a dict, got {type(body).__name__}")

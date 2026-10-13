@@ -5,7 +5,9 @@ from pydantic import ValidationError
 from unifi_core.protect.models._actions import (
     AcknowledgeEventInput,
     AlarmArmInput,
+    AlarmCreateRuleInput,
     AlarmDisarmInput,
+    AlarmUpdateRuleInput,
     DeleteLiveviewInput,
     DeleteRecordingInput,
     ExportClipInput,
@@ -16,6 +18,53 @@ from unifi_core.protect.models._actions import (
     ToggleRecordingInput,
     TriggerChimeInput,
 )
+
+
+def _valid_rule_body(actions: list | None = None) -> dict:
+    """Minimum body shape that satisfies the create/update validators.
+
+    Real Protect bodies are richer (sources/conditions/cooldown/etc.); we
+    only need enough here to drive the actions-non-empty validator.
+    """
+    return {
+        "name": "Test",
+        "enable": False,
+        "actions": [{"type": "HTTP_REQUEST", "metadata": {"url": "https://example.test/wh"}}]
+        if actions is None
+        else actions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# AlarmCreateRuleInput / AlarmUpdateRuleInput — shape validation only
+# ---------------------------------------------------------------------------
+
+
+class TestAlarmCreateRuleInput:
+    def test_action_input_flag(self) -> None:
+        assert AlarmCreateRuleInput.__action_input__ is True
+
+    def test_valid_with_actions(self) -> None:
+        m = AlarmCreateRuleInput(body=_valid_rule_body())
+        assert m.body["actions"]
+
+    def test_allows_body_without_actions_guard_lives_in_facade(self) -> None:
+        m = AlarmCreateRuleInput(body={"title": "x"})
+        assert m.body == {"title": "x"}
+
+
+class TestAlarmUpdateRuleInput:
+    def test_action_input_flag(self) -> None:
+        assert AlarmUpdateRuleInput.__action_input__ is True
+
+    def test_valid_with_actions(self) -> None:
+        m = AlarmUpdateRuleInput(rule_id="r-1", body=_valid_rule_body())
+        assert m.rule_id == "r-1"
+
+    def test_allows_partial_update_without_actions_guard_lives_in_facade(self) -> None:
+        m = AlarmUpdateRuleInput(rule_id="r-1", body={"title": "x"})
+        assert m.body == {"title": "x"}
+
 
 # ---------------------------------------------------------------------------
 # PtzMoveInput

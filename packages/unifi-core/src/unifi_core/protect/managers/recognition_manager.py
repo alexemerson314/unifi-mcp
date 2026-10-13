@@ -11,7 +11,13 @@ from typing import Any, Dict, Literal
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.protect.managers.connection_manager import ProtectConnectionManager
-from unifi_core.protect.models.recognition import from_controller, links_from_controller, to_controller_update
+from unifi_core.protect.models.recognition import (
+    from_controller,
+    license_plate_from_controller,
+    links_from_controller,
+    to_controller_plate_update,
+    to_controller_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +111,68 @@ class RecognitionManager:
             "links": links,
         }
 
+    async def list_known_license_plates(
+        self,
+        *,
+        page: int | None = None,
+        page_size: int = 100,
+        min_confidence: int = 30,
+        include_interest: bool = True,
+        group_types: list[str] | None = None,
+        order_by: str = "name",
+        order_direction: Literal["asc", "desc"] = "asc",
+    ) -> Dict[str, Any]:
+        """Return Protect license-plate recognition groups.
+
+        Uses the private ``recognition/vehicle/groups`` endpoint, which mirrors
+        ``recognition/face/groups`` in shape and params. Pass ``group_types`` to
+        explicitly include other group types (e.g. unlabeled/unknown plate
+        clusters). Image bytes are never fetched — only reference paths.
+        """
+        if page is not None and page < 1:
+            raise ValueError("page must be greater than or equal to 1")
+        if page_size < 1 or page_size > 1000:
+            raise ValueError("page_size must be between 1 and 1000")
+        if min_confidence < 0 or min_confidence > 100:
+            raise ValueError("min_confidence must be between 0 and 100")
+        if order_by not in _VALID_ORDER_BY:
+            raise ValueError(f"order_by must be one of {sorted(_VALID_ORDER_BY)}")
+        if order_direction not in _VALID_ORDER_DIRECTION:
+            raise ValueError("order_direction must be 'asc' or 'desc'")
+
+        labels = _build_group_labels(group_types, include_interest)
+        params: dict[str, Any] = {
+            "labels": labels,
+            "minConfidence": min_confidence,
+            "orderBy": order_by,
+            "orderDirection": order_direction,
+            "pageSize": page_size,
+        }
+        if page is not None:
+            params["page"] = page
+
+        data = await self._cm.client.api_request("recognition/vehicle/groups", method="get", params=params)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected recognition/vehicle/groups shape: %r", type(data))
+            data = {}
+
+        groups = data.get("groups")
+        if not isinstance(groups, list):
+            groups = []
+
+        plates = [
+            license_plate_from_controller(group).model_dump(exclude_none=True)
+            for group in groups
+            if isinstance(group, dict)
+        ]
+        links = links_from_controller(data.get("links")).model_dump(exclude_none=True)
+
+        return {
+            "license_plates": plates,
+            "count": len(plates),
+            "links": links,
+        }
+
     async def get_known_face(self, face_id: str) -> Dict[str, Any]:
         """Return one Protect face recognition group by id."""
         raw = await self._get_known_face_raw(face_id)
@@ -157,9 +225,15 @@ class RecognitionManager:
         }
 
     async def apply_merge_known_faces(self, source_face_id: str, target_face_id: str) -> Dict[str, Any]:
-        """Merge one Protect face group into another."""
+        """Merge one Protect face group into another.
+
+        The merge-group endpoint returns an empty body on success, so use
+        ``api_request_raw`` (not ``api_request``) to avoid a spurious
+        'Could not decode JSON' error after the merge has already succeeded.
+        Mirrors the recognition-group delete paths; the response is unused.
+        """
         preview = await self.merge_known_faces(source_face_id, target_face_id)
-        await self._cm.client.api_request(
+        await self._cm.client.api_request_raw(
             "recognition/v2/merge-group",
             method="post",
             json={"fromGroupIds": [source_face_id], "toGroupId": target_face_id},
@@ -184,9 +258,14 @@ class RecognitionManager:
         }
 
     async def apply_delete_known_face(self, face_id: str) -> Dict[str, Any]:
-        """Delete a Protect face group after confirmation."""
+        """Delete a Protect face group after confirmation.
+
+        The controller returns an empty body on success, so use ``api_request_raw``
+        (not ``api_request``) to avoid a spurious 'Could not decode JSON' error
+        after the delete has already succeeded. Mirrors the vehicle-group delete.
+        """
         preview = await self.delete_known_face(face_id)
-        await self._cm.client.api_request(
+        await self._cm.client.api_request_raw(
             f"recognition/face/groups/{face_id}",
             method="delete",
         )
@@ -222,6 +301,97 @@ class RecognitionManager:
             if isinstance(group, dict) and group.get("id") == face_id:
                 return group
         raise UniFiNotFoundError("known face", face_id)
+
+    async def get_known_license_plate(self, plate_id: str) -> Dict[str, Any]:
+        """Return one Protect license-plate recognition group by id."""
+        raw = await self._get_known_license_plate_raw(plate_id)
+        return license_plate_from_controller(raw).model_dump(exclude_none=True)
+
+    async def update_known_license_plate(self, plate_id: str, fields: dict[str, Any]) -> Dict[str, Any]:
+        """Return current and proposed Known License Plate metadata for preview."""
+        to_controller_plate_update(fields)
+        current = await self.get_known_license_plate(plate_id)
+        return {
+            "plate_id": plate_id,
+            "plate_name": _display_name(current),
+            "current_state": {key: current.get(key) for key in fields},
+            "proposed_changes": dict(fields),
+        }
+
+    async def apply_update_known_license_plate(self, plate_id: str, fields: dict[str, Any]) -> Dict[str, Any]:
+        """Apply a partial Known License Plate metadata update."""
+        await self._get_known_license_plate_raw(plate_id)
+        payload = to_controller_plate_update(fields)
+        updated = await self._cm.client.api_request(
+            f"recognition/vehicle/groups/{plate_id}",
+            method="patch",
+            json=payload,
+        )
+        if not isinstance(updated, dict):
+            updated = {}
+
+        plate = license_plate_from_controller(updated).model_dump(exclude_none=True)
+        return {
+            "plate_id": plate_id,
+            "updated_fields": list(fields.keys()),
+            "license_plate": plate,
+        }
+
+    async def delete_known_license_plate(self, plate_id: str) -> Dict[str, Any]:
+        """Return group metadata for a destructive delete preview."""
+        plate = await self.get_known_license_plate(plate_id)
+        return {
+            "license_plate": _merge_summary(plate),
+            "warnings": [
+                "This removes the selected license-plate group from Protect.",
+                "Deleted recognition groups may not be recoverable through MCP.",
+            ],
+        }
+
+    async def apply_delete_known_license_plate(self, plate_id: str) -> Dict[str, Any]:
+        """Delete a Protect license-plate group after confirmation.
+
+        The controller returns an empty body on success, so use ``api_request_raw``
+        (not ``api_request``) to avoid a spurious 'Could not decode JSON' error
+        after the delete has already succeeded.
+        """
+        preview = await self.delete_known_license_plate(plate_id)
+        await self._cm.client.api_request_raw(
+            f"recognition/vehicle/groups/{plate_id}",
+            method="delete",
+        )
+        return {
+            "plate_id": plate_id,
+            "deleted": True,
+            "license_plate": preview["license_plate"],
+        }
+
+    async def _get_known_license_plate_raw(self, plate_id: str) -> dict[str, Any]:
+        if not plate_id:
+            raise ValueError("plate_id is required")
+
+        data = await self._cm.client.api_request(
+            "recognition/vehicle/groups",
+            method="get",
+            params={
+                "ids": plate_id,
+                "minConfidence": 30,
+                "orderBy": "name",
+                "orderDirection": "asc",
+                "pageSize": 1,
+            },
+        )
+        if not isinstance(data, dict):
+            data = {}
+
+        groups = data.get("groups")
+        if not isinstance(groups, list):
+            groups = []
+
+        for group in groups:
+            if isinstance(group, dict) and group.get("id") == plate_id:
+                return group
+        raise UniFiNotFoundError("known license plate", plate_id)
 
 
 def _display_name(face: dict[str, Any]) -> str | None:

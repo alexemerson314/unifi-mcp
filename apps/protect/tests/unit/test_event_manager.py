@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from uiprotect.data import EventType, ModelType, SmartDetectObjectType, WSAction
+from uiprotect.data import Event, EventType, ModelType, SmartDetectObjectType, WSAction
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.protect.managers.event_manager import EventManager
@@ -48,6 +48,7 @@ def _make_connection_manager(events=None) -> MagicMock:
     cm.client.get_event = AsyncMock()
     cm.client.get_event_thumbnail = AsyncMock()
     cm.client.api_request = AsyncMock(return_value={"groups": []})
+    cm.client.api_request_raw = AsyncMock(return_value=b"")
     cm.client.subscribe_websocket = MagicMock(return_value=MagicMock())  # unsub callable
     return cm
 
@@ -364,6 +365,44 @@ class TestEventManagerGetEvent:
         cm.client.get_events.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_backfills_plate_metadata_from_list_path(self):
+        """get_event's detail endpoint drops the plate group id (keeps text +
+        confidence); recover the stable group id from the list/search path,
+        mirroring the face backfill."""
+        detail_event = _make_event(
+            id="evt-lpr-1",
+            type=EventType.SMART_DETECT,
+            smart_detect_types=[SmartDetectObjectType.LICENSE_PLATE, SmartDetectObjectType.VEHICLE],
+            # detail thumbnail carries the plate text + confidence but NO group.id
+            metadata={"detectedThumbnails": [{"type": "vehicle", "name": "ABC123", "confidence": 90}]},
+        )
+        list_event = _make_event(
+            id="evt-lpr-1",
+            type=EventType.SMART_DETECT,
+            smart_detect_types=[SmartDetectObjectType.LICENSE_PLATE, SmartDetectObjectType.VEHICLE],
+            metadata={
+                "detectedThumbnails": [
+                    {
+                        "type": "vehicle",
+                        "name": "ABC123",
+                        "group": {"id": "plate-group-1", "matchedName": "ABC123", "confidence": 91},
+                    }
+                ]
+            },
+        )
+        cm = _make_connection_manager()
+        cm.client.get_event = AsyncMock(return_value=detail_event)
+        cm.client.get_events = AsyncMock(return_value=[list_event])
+        mgr = EventManager(cm)
+
+        result = await mgr.get_event("evt-lpr-1")
+
+        assert result["recognized_plate_text"] == "ABC123"
+        assert result["recognized_plate_group_id"] == "plate-group-1"
+        assert result["recognized_plate_confidence"] == 91
+        cm.client.get_events.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_not_found(self):
         cm = _make_connection_manager()
         cm.client.get_event = AsyncMock(side_effect=Exception("404 Not Found"))
@@ -565,7 +604,39 @@ class TestEventManagerAcknowledgeEvent:
         result = await mgr.apply_acknowledge_event("evt-1")
         assert result["acknowledged"] is True
         assert result["is_favorite"] is True
-        event.save_device.assert_awaited_once()
+        cm.client.api_request_raw.assert_awaited_once_with("favorite-events/evt-1", method="post")
+
+    @pytest.mark.asyncio
+    async def test_apply_is_a_noop_when_already_acknowledged(self):
+        event = _make_event(id="evt-1", is_favorite=True)
+        cm = _make_connection_manager()
+        cm.client.get_event = AsyncMock(return_value=event)
+        mgr = EventManager(cm)
+
+        result = await mgr.apply_acknowledge_event("evt-1")
+
+        assert result["acknowledged"] is True
+        cm.client.api_request_raw.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_does_not_use_unsupported_sdk_event_save(self):
+        event = Event(
+            id="evt-1",
+            type=EventType.MOTION,
+            start=datetime(2026, 3, 16, 12, 0, tzinfo=timezone.utc),
+            is_favorite=False,
+        )
+        cm = _make_connection_manager()
+        cm.client.get_event = AsyncMock(return_value=event)
+        mgr = EventManager(cm)
+
+        with patch.object(Event, "save_device", autospec=True) as save_device:
+            result = await mgr.apply_acknowledge_event("evt-1")
+
+        assert result["acknowledged"] is True
+        assert result["is_favorite"] is True
+        save_device.assert_not_awaited()
+        cm.client.api_request_raw.assert_awaited_once_with("favorite-events/evt-1", method="post")
 
     @pytest.mark.asyncio
     async def test_apply_not_found(self):

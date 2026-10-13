@@ -1,7 +1,19 @@
 ---
 name: myco:monorepo-release-pipeline
 description: >-
-  Covers the full release pipeline for the unifi-mcp monorepo: determining release scope by analyzing changed packages, scoping hatch-vcs version tag globs per Python package to prevent sibling-tag contamination, pushing tags in strict dependency order (unifi-core → unifi-mcp-shared → app servers → relay → worker when needed), configuring scripts/generate_release_notes.py path scoping per package, wiring per-package publish workflows for OIDC trusted publishing, coordinating cross-package version bumps in pyproject.toml, understanding app vs. library versioning and writeback behavior, and validating releases post-tag. Apply this skill when cutting any release, adding a new package, bumping unifi-core, or debugging a versioning or publish-workflow failure — even if the user does not explicitly ask about tag ordering or release notes. CRITICAL: All PRs require pin-alignment CI gate before merge (automated, cannot be skipped).
+  Covers the full release pipeline for the unifi-mcp monorepo: determining release scope by
+  analyzing changed packages, scoping hatch-vcs version tag globs per Python package to prevent
+  sibling-tag contamination, batching independent release tags while preserving real dependency
+  edges, releasing plugins (independent versions, client update paths, writebacks), configuring
+  scripts/generate_release_notes.py path scoping per package, wiring per-package publish workflows
+  for OIDC trusted publishing,
+  coordinating cross-package version bumps in pyproject.toml, understanding app vs. library
+  versioning and writeback behavior, validating releases post-tag, and verifying shared package
+  architecture constraints (DI-only rule, scope gate, relay sync) before releasing shared packages.
+  The single authoritative procedure for releasing anything in this repo, plugins included.
+  Apply when cutting any release, changing shipped plugin files, bumping unifi-core, or
+  debugging a versioning failure.
+  CRITICAL: All PRs require pin-alignment CI gate before merge (automated, cannot be skipped).
 managed_by: myco
 user-invocable: true
 allowed-tools: Read, Edit, Write, Bash, Grep, Glob
@@ -11,8 +23,8 @@ allowed-tools: Read, Edit, Write, Bash, Grep, Glob
 
 The unifi-mcp repo ships seven independently versioned Python packages plus the
 Node/TypeScript worker app: `unifi-core`
-and `unifi-mcp-shared` live under `packages/`; `unifi-mcp-network`, `unifi-mcp-protect`,
-`unifi-mcp-access`, and `unifi-api-server` live under `apps/`; `unifi-mcp-relay` lives under `packages/`
+and `unifi-mcp-shared` live under `packages/`; `unifi-network-mcp`, `unifi-protect-mcp`,
+`unifi-access-mcp`, and `unifi-api-server` live under `apps/`; `unifi-mcp-relay` lives under `packages/`
 alongside core and shared; `unifi-mcp-worker` lives under `apps/worker/` and publishes to npm.
 Each has its own package identity, tag namespace, publish workflow, and release-notes scope. Getting the release sequence wrong leaves downstream
 packages referencing non-existent PyPI versions or produces contaminated release notes
@@ -21,9 +33,10 @@ that bleed across package boundaries.
 ## Prerequisites
 
 - All feature PRs for the release are merged to `main`.
-- **All PRs targeting main must pass the pin-alignment CI gate (automated blocker).** This gate
-  runs on every PR and blocks stale transitive dependency pins that would cause fresh
-  installs to fail. See Procedure D, Step 0 for details.
+- **PRs that change any package's `pyproject.toml` or `src/` must pass the pin-alignment CI gate
+  (automated blocker).** The gate builds the workspace wheels and installs them the way a user
+  would, so a downstream floor that cannot work on PyPI fails before release. See Procedure D,
+  Step 0 for exactly what it covers and what it cannot see.
 - Working tree is clean: `git status` shows nothing staged or modified.
 - Remote is current: `git fetch origin && git log origin/main..HEAD` shows nothing.
 - PyPI credentials are **not** stored locally — publishing is handled entirely by
@@ -32,19 +45,26 @@ that bleed across package boundaries.
 
 ## Package Map
 
-| Package | Directory | Tag namespace | Publish workflow |
+| Package | Directory | PyPI Name | Tag namespace |
 |---|---|---|---|
-| `unifi-core` | `packages/unifi-core/` | `core/v*` | `release-core.yml` |
-| `unifi-mcp-shared` | `packages/unifi-mcp-shared/` | `shared/v*` | `release-shared.yml` |
-| `unifi-mcp-network` | `apps/network/` | `network/v*` | `release-network.yml` |
-| `unifi-mcp-protect` | `apps/protect/` | `protect/v*` | `release-protect.yml` |
-| `unifi-mcp-access` | `apps/access/` | `access/v*` | `release-access.yml` |
-| `unifi-api-server` | `apps/api/` | `api/v*` | `release-api.yml` |
-| `unifi-mcp-relay` | `packages/unifi-mcp-relay/` | `relay/v*` | `release-relay.yml` |
-| `unifi-mcp-worker` | `apps/worker/` | `worker/v*` | `release-worker.yml` |
+| `unifi-core` | `packages/unifi-core/` | `unifi-core` | `core/v*` |
+| `unifi-mcp-shared` | `packages/unifi-mcp-shared/` | `unifi-mcp-shared` | `shared/v*` |
+| `unifi-mcp-network` | `apps/network/` | `unifi-network-mcp` | `network/v*` |
+| `unifi-mcp-protect` | `apps/protect/` | `unifi-protect-mcp` | `protect/v*` |
+| `unifi-mcp-access` | `apps/access/` | `unifi-access-mcp` | `access/v*` |
+| `unifi-api-server` | `apps/api/` | `unifi-api-server` | `api/v*` |
+| `unifi-mcp-relay` | `packages/unifi-mcp-relay/` | `unifi-mcp-relay` | `relay/v*` |
+| `unifi-mcp-worker` | `apps/worker/` | `unifi-mcp-worker` (npm, unscoped) | `worker/v*` |
 
-When adding a new package, extend this table and the release-notes path configuration
-before pushing any tag.
+**Critical:** PyPI package names differ from directory names. Always reference the PyPI name when
+installing or checking versions. Example: `pip install unifi-network-mcp` (not `unifi-mcp-network`).
+The worker's npm package name is also unscoped: `npm install -g unifi-mcp-worker` (not
+`@unifi-mcp/worker`) — confirmed by `apps/worker/src/commands/upgrade.mjs`'s `npm view unifi-mcp-worker version` call.
+
+When adding a new package, extend this table, update the release-notes path configuration,
+and add a new `release-<package>.yml` workflow before pushing any tag.
+
+---
 
 ## Procedure A: Determine Release Scope
 
@@ -62,130 +82,109 @@ git log --oneline core/v$(git tag -l 'core/v*' | sort -V | tail -1)..HEAD -- pac
 git log --oneline network/v$(git tag -l 'network/v*' | sort -V | tail -1)..HEAD -- apps/network/ packages/unifi-mcp-shared/
 ```
 
+### Post-merge scope verification
+
+After a PR is merged but before tagging, confirm which files actually landed:
+
+```bash
+# Replace <pre-merge-sha> with the commit SHA immediately before the merge commit
+git diff <pre-merge-sha>..HEAD --name-only
+```
+
+This is the most reliable way to scope which packages need a release — PR descriptions
+can lag or overstate changes.
+
 ### Apply scope rules
 
 | What changed | Tags required |
 |---|---|
-| `packages/unifi-mcp-shared/` only | `shared/v*` → then `network/v*`, `protect/v*`, `access/v*`, `relay/v*` |
-| `packages/unifi-core/` only | `core/v*` → then `shared/v*` → then all downstream packages, including `api/v*` |
+| `packages/unifi-mcp-shared/` only | Always `shared/v*`; add affected downstream tags under the selectivity framework, then use Procedure F for batch boundaries |
+| `packages/unifi-core/` only | Scope includes `core/v*` and affected downstream packages, including `api/v*`; Procedure F decides batch boundaries |
 | One app only (e.g., `apps/protect/`) | `protect/v*` only |
-| Multiple apps | One tag per changed app, in dependency order |
-| Plugin-only changes (manifest/config updates) | Patch release for cache invalidation (e.g., `network/v0.14.13` → `network/v0.14.14`) |
+| Multiple apps | One tag per changed app; put independent tags in the same release batch |
+| Plugin-only changes (any shipped file) | Independent plugin manifest bump; no package tag (Procedure E) |
 | Worker (`apps/worker/`) | `worker/v*` |
+
+**Negative corollary (skip-unchanged rule):** Do NOT tag a package simply because an upstream dependency was bumped, if the package's own code did not change AND its existing `pyproject.toml` bounds already accommodate the new upstream version. Check the declared version range in `pyproject.toml` first — if the new upstream version already satisfies the existing bounds and the app code is unchanged, no new tag is required.
 
 ### Tagging Selectivity Framework
 
-Depending on the scope and confidence of the release, choose one of three tagging strategies:
+**Minimal (lowest risk):** Tag ONLY packages with code changes in their own directory.
 
-**Minimal (lowest risk, most conservative):**
-- Tag ONLY packages with code changes in their own directory.
-- Do not auto-tag downstream packages unless they explicitly changed.
-- Use case: Security patch in a transitive dependency (e.g., Pillow) that affects only one app.
-- Risk: Manual tag selection can miss packages. Confidence: high only if you've audited the
-  dependency chain and know exactly which app uses the patched library.
-- Example: `git tag protect/v0.3.5` (Access unchanged, Network unchanged — only Protect uses
-  the patched Pillow version)
+**Standard (recommended):** Tag all packages with code changes PLUS all downstream dependents to ensure they pick up shared library bumps. Use for any bump to `unifi-core` or `unifi-mcp-shared`.
 
-**Standard (recommended, balanced):**
-- Tag all packages with code changes PLUS all downstream dependents (even if they didn't
-  change code) to ensure they pick up shared library bumps.
-- Use case: Any bump to `unifi-core` or `unifi-mcp-shared`; new resource in any app.
-- Risk: Creates spurious patch releases for apps that only changed transitively. Builds
-  redundancy into the release (some wheel metadata will be stale). Confidence: high.
-- Example: Shared gains new validators → tag `shared/v*`, then `network/v*`, `protect/v*`,
-  `access/v*`, `relay/v*` (even if Network, Protect, Access, Relay only changed their
-  dependency bounds, not their code).
+**Full (maximum redundancy):** Tag all seven packages every release. Use for scheduled releases or recovering from a prior broken release sequence.
 
-**Full (maximum redundancy, CI safeguard):**
-- Tag all seven packages every release.
-- Use case: Scheduled releases, coordinated team releases, recovering from a prior broken
-  release sequence.
-- Risk: Creates unnecessary artifact churn; every package publishes even if unchanged.
-- Benefit: Rebuilds all wheels, catches stale pinning across the board, guaranteed CI runs
-  all workflows.
-- Example: `for p in core shared network protect access api relay; do git tag $p/v<version>; done`
+**Decision rule:** Default to Minimal. Escalate to Standard when a shared library change requires every dependent to ship a new wheel. Use Full when recovering from a release failure.
 
-**Decision rule:** Start with Standard (accounts for the shared library rule and downstream
-dependency bumps). Use Minimal only if you've verified the transitive dependency chain and
-are confident of your scope. Use Full when recovering from a release failure or for
-scheduled releases.
+### Plugin releases
 
-### Plugin-only Release and Cache Invalidation
-
-When only the plugin manifest (e.g., `plugins/*/plugin.json`) changes with no code changes, a patch release must still be cut — not as code update, but to invalidate the marketplace cache and force existing users to pick up the new manifest.
-
-**The mechanism:** Plugin users cache the manifest JSON locally. Existing deployed users remain pinned to their cached version until the server publishes a **new tagged release**. A main-only merge (no tag) is invisible to existing users — they see no update available.
-
-**When this arises:** Security policy updates, feature flag toggles, or capability declaration changes that don't touch code.
-
-**Example:**
-```bash
-# manifests/plugin.json was updated (policy change); no code changes
-git tag network/v0.14.14  # patch bump despite no code changes
-git push origin network/v0.14.14
-# All existing deployed instances will now see v0.14.14 as available and pick up the new manifest
-```
+Plugins release by merge, not by tag. Follow Procedure E.
 
 ### Shared package rule
 
-Any change to `packages/unifi-mcp-shared/` underpins all server apps. Tag `shared` first, then all server apps — even if their own code didn't change — so the next build picks up the shared bump.
+Any change to `packages/unifi-mcp-shared/` requires a Shared release. Add a downstream app or Relay
+tag when its own code changed, it needs the new Shared API or metadata floor, or the release plan
+explicitly selects Standard or Full coverage. Under the default Minimal strategy, unchanged
+dependents whose existing bounds accept the new Shared version do not need tags. Procedure F decides
+batch boundaries after scope is settled.
 
 ### CVE / transitive dependency changes
 
-A security patch in a transitive dependency may only affect one app. Trace the dependency chain before tagging everything:
+Trace the dependency chain before tagging everything:
 
 ```bash
-# Identify the patched package from CVE advisory (e.g., Pillow)
 grep -ri "pillow" apps/*/pyproject.toml packages/*/pyproject.toml
-
-# Trace: if only apps/protect/ imports uiprotect (which depends on Pillow),
-# then only protect/v* needs a new tag
-```
-
-Confirm with tests before tagging:
-```bash
-cd apps/protect && pytest --tb=short
 ```
 
 Tag only the affected app(s). Unnecessary tags create spurious releases.
 
+---
+
+## Procedure A.5: Patch-Bump Lockstep Avoidance
+
+When releasing multiple packages in one coordination, avoid bumping major versions for multiple packages simultaneously. This prevents accidental lockstep coupling.
+
+**Strategy:** When releasing shared with core, give core the larger bump (minor/major as needed) while keeping shared's bump narrow (patch-only, staying within its current minor). Defer shared's next minor bump to a future cycle. Downstream apps can adopt the new core version while keeping the prior shared minor pinned, then adopt the new shared minor independently later.
+
+**Verify current floor bounds before citing an example** — they shift every release. Re-check the live dependency line with `grep unifi-core packages/unifi-mcp-shared/pyproject.toml` rather than trusting a hardcoded version string from this skill.
+
+**When to break the rule:** Only when breaking API changes are required in both packages with no feasible bridge, all downstream maintainers are coordinated, and you can support a temporary dual-version install guide.
+
+---
+
 ## Procedure B: App vs. Library Versioning and Writeback Behavior
 
-Understanding the difference between library and app package versioning is essential because writeback behavior differs, and missing writeback from an app package is a bug — while missing writeback from a library package is correct.
+### Library packages (unifi-core, unifi-mcp-shared, relay, api)
 
-### Library packages (unifi-core, unifi-mcp-shared, relay)
+Use `dynamic = ["version"]` with hatch-vcs. Version is derived from the git tag at build time — no `_version.py` is ever committed. When a library tag is pushed, `bump-plugin-versions.yml` outputs `No version changes to commit` — this is **correct and expected**.
 
-These packages use `dynamic = [\"version\"]` in `pyproject.toml` with hatch-vcs. Version is derived from the git tag **at build time** — no `_version.py` is ever committed to the repo. When a library tag is pushed:
-
-- The publish workflow builds and publishes the tagged commit as-is
-- `bump-plugin-versions.yml` runs and outputs: `No version changes to commit`
-- This is **correct and expected** — not a bug or a missed step
-- There is no manifest file to update (no plugin.json or server.json)
+**`unifi-api-server` is a library package**, not an app package. It publishes to PyPI only and has no plugin manifest assets. Expect no writeback on `api/v*` tags.
 
 ### App packages (network, protect, access)
 
-These packages have writable manifest assets that get updated on tag:
-
+These have writable manifest assets updated on tag:
 - `plugins/unifi-network/.claude-plugin/plugin.json`
 - `plugins/unifi-protect/.claude-plugin/plugin.json`
+- Corresponding `.codex-plugin/plugin.json` and `.mcp.codex.json`
 - `plugins/unifi-access/.claude-plugin/plugin.json`
-- `apps/{network,protect,access}/server.json`
+- `apps/*/server.json` (server package version)
 
-When an app tag is pushed, the workflow commits a version writeback to these files.
-If the writeback commit is missing, the manifests will be stale and users will see
-the wrong version reported by the tool.
+**Rule:** Never expect writeback from a library package tag (core, shared, relay, api). Never accept a missing writeback from an app package tag (network, protect, access).
 
-**Rule:** Never expect writeback from a library package tag. Never accept a
-missing writeback from an app package tag.
+### Version bump selection
+
+Use **patch** for bug fixes and backwards-compatible internal changes. Use **minor** when adding
+new functionality that is additive but could affect downstream consumers — even if technically
+backwards-compatible, a minor bump signals to dependents that review is warranted. Use **major**
+for breaking API changes. Dependency bound updates for upstream packages must land on `main`
+(and pass CI) **before** pushing the corresponding version tags.
+
+---
 
 ## Procedure C: hatch-vcs Tag Glob Scoping
 
-hatch-vcs derives each package's version from git tags at build time. Without a
-per-package `git_describe_command --match` glob, any tag reachable in the repo can
-influence any package's version — a `network/v0.14.13` tag will contaminate
-`protect`'s version if `protect`'s `git_describe_command` matches all tags.
-
-### Correct tag patterns per package
+Without a per-package `git_describe_command --match` glob, any tag reachable in the repo can influence any package's version.
 
 | Package | Match pattern |
 |---|---|
@@ -197,444 +196,412 @@ influence any package's version — a `network/v0.14.13` tag will contaminate
 | unifi-mcp-shared | `shared/v*` |
 | api | `api/v*` |
 
-### pyproject.toml configuration
+Each package must declare both `tag_regex` and `git_describe_command` scoped to its own prefix. Never share or widen the `--match` pattern across packages.
 
-Each package must declare both a `tag_regex` (to extract the version number) and a
-`git_describe_command` scoped to its own prefix:
-
-```toml
-# packages/unifi-core/pyproject.toml
-[tool.hatch.version]
-source = "vcs"
-raw-options.root = "../.."
-raw-options.tag_regex = "^core/v(?P<version>\\d+(?:\\.\\d+)*)(?:\\S*)$"
-raw-options.git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "core/v*"]
-raw-options.fallback_version = "0.0.0"
-
-# apps/network/pyproject.toml
-[tool.hatch.version]
-source = "vcs"
-raw-options.root = "../.."
-raw-options.tag_regex = "^(?:network/v|v)(?P<version>\\d+(?:\\.\\d+)*)(?:\\S*)$"
-raw-options.git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "network/v*"]
-raw-options.fallback_version = "0.0.0"
-```
-
-Each package's `--match` pattern must be scoped to its own tag prefix from the
-Package Map. Never share or widen the `--match` pattern across packages.
+---
 
 ## Procedure D: Pin-Alignment CI Gate + Align Cross-Package Dependency Bounds Before Tagging
 
 ### Step 0: Pin-Alignment CI Gate (Automated Blocker)
 
-**Critical:** The pin-alignment CI gate (PR #286) runs on every PR targeting `main` and
-**cannot be skipped**. This gate prevents the stale-pin incident (#283, 2026-05-17) from
-recurring. It automatically validates that every downstream package's dependency bounds
-in `pyproject.toml` permit the versions of upstream packages (`unifi-core`,
-`unifi-mcp-shared`) that exist on main.
+The pin-alignment CI gate (`scripts/check_pin_alignment.py`, workflow `check-pin-alignment.yml`) runs on a PR that touches any of: a package's `pyproject.toml`, anything under `apps/*/src/**` or `packages/*/src/**` (core, shared, relay and every app), the API's force-included `alembic` files, the gate script, the workflow, or `scripts/generate_api_action_catalog.py`. If your PR fails: read the CI output for the failing package and module, update the offending bounds in `pyproject.toml` (or split the change, see the floor-bump sequencing gotcha), commit and push.
 
-**How it works:**
-- On every PR, the gate builds all wheels and extracts their `Requires-Dist` metadata.
-- For each declared upstream dependency (e.g., `unifi-mcp-shared>=0.4.5,<0.5`), the gate
-  validates that the bound permits the actual version currently in use by the workspace.
-- If bounds are too narrow (e.g., `<0.5` when shared is actually 0.5.0 on main), the gate
-  **fails the PR** and you must fix the pins before merge.
+**What the gate proves, against PyPI plus the workspace-built upstream wheels:**
 
-**Your action:** The gate blocks PRs automatically. If your PR fails the pin-alignment gate:
-1. Look at the CI job output for the specific package and bound that failed.
-2. Update the offending bounds in `pyproject.toml` (e.g., change `<0.5` to `<0.6`).
-3. Commit and push the fix.
-4. The gate re-runs automatically on push and must pass before merge is allowed.
+1. Every built wheel declares the advisory-safe dependency floors, the Network and API wheels exactly pin `aiounifi` / `aiohttp` consistently, and the prior vulnerable resolutions upgrade to safe versions.
+2. Each downstream wheel installs into a clean venv, with the declared ranges resolved from PyPI. Then **every module the wheel ships is imported**. The module list comes from the installed distribution's file list, so directories without an `__init__.py` (Network's `tools/` and `utils/`) are included. Any `ImportError` fails the gate: an undeclared dependency (`ModuleNotFoundError`) and a symbol the resolved upstream does not provide (`cannot import name`). Other import-time exceptions are ignored.
+3. Each downstream wheel is installed again against **exactly its declared minimum** `unifi-core` (and, for Protect, Access and Relay, its declared minimum `unifi-mcp-shared`). The same full module import runs against those floors, so a symbol imported from a newer upstream than the floor admits fails even though the latest upstream has it.
+4. An AST scan of the installed downstream source resolves every attribute reached through an `unifi_core` / `unifi_mcp_shared` import (`import unifi_core.x as x; x.new_helper`, `from unifi_core.x import Cls; Cls.new_method`) against those floor versions. This covers use that only fails when the line runs.
+5. Network and API additionally run manager-call contracts against the Core floor: every direct `<name>_manager.<method>` call in the Network tool modules, and every API catalog binding, must exist with a compatible signature.
 
-This is **not optional** and there is no override. The gate exists to prevent broken
-releases from landing on main.
+**What the gate cannot see (verify these by hand):**
+
+- **Calls on objects the scan cannot resolve statically.** Attribute access on instances, parameters, return values, or any name that is rebound in the same file (`client = Cls(); client.new_method()`) is skipped. Network and API are covered for manager calls by their contracts; Protect, Access and Relay have no equivalent, so a new Core method called on a manager instance without a floor bump passes. Review any PR that starts calling new upstream methods against the upstream's changelog.
+- **Behavior changes with the same API shape.** A floor is checked for symbol existence and signatures, not semantics.
+- **The Shared floor of Network and API.** Network is installed with the branch-built Shared candidate (the release being cut), and the API wheel declares no direct Shared dependency, so neither is tested against its minimum published Shared.
+- **Transitive chains.** Only each package's own declared bounds are validated; see the coverage limit below.
+- **Imports that do not run at import time.** An import inside a function body never runs when the module is imported, and an import under `try/except ImportError` has its failure swallowed; the attribute scan resolves neither. A symbol absent from the floor that is only imported that way passes.
+- **Import-time exceptions other than `ImportError`** (for example a module that needs a live controller at import) are ignored, so that module's imports after the failure point go unchecked.
 
 ### Align Cross-Package Dependency Bounds Before Tagging
 
-Before creating release tags, inspect every downstream `pyproject.toml` dependency
-range for packages being released together. Tag order only solves publication timing;
-the wheel metadata must also allow the newly published upstream version.
+Before creating release tags, inspect every downstream `pyproject.toml` for packages being released together. Tag order only solves publication timing; the wheel metadata must also allow the newly published upstream version.
 
-**Rule:** If a downstream package requires code that is only present in the new
-`unifi-core` or `unifi-mcp-shared` release, update its dependency range before
-placing tags. Do not assume pip installs the newest upstream release. It installs
-the newest version permitted by the downstream wheel metadata.
-
-Examples:
-
-```toml
-# New Protect/API code needs unifi-core 0.3.x models and managers.
-"unifi-core[protect]>=0.3,<0.4"
-"unifi-core[network,protect,access]>=0.3,<0.4"
-
-# New app code needs unifi-mcp-shared 0.5.x helpers.
-"unifi-mcp-shared>=0.5,<0.6"
-```
-
-### Dependency-bound checklist
-
+**Dependency-bound checklist:**
 1. Identify upstream packages that changed (`unifi-core`, `unifi-mcp-shared`).
 2. Identify downstream packages being tagged because they use that upstream code.
-3. Update downstream dependency ranges in `apps/*/pyproject.toml` and
-   `packages/unifi-mcp-relay/pyproject.toml` as needed.
-4. **Verify the new pin range with the wheel-metadata check below.** `uv lock --check`
-   passes even when the pin is wrong — workspace sources override the range locally.
+3. Update downstream dependency ranges in `apps/*/pyproject.toml` and `packages/unifi-mcp-relay/pyproject.toml`.
+4. Verify with wheel-metadata check (see below). `uv lock --check` is insufficient — see below.
 5. Commit dependency-bound changes before creating local tags.
-
-If dependency bounds are stale, the release can publish successfully but install an
-older upstream package that lacks the required API surface. Treat dependency-bound
-alignment as part of the release artifact, not as optional cleanup.
 
 ### Why `uv lock --check` is not a sufficient gate
 
-Every downstream `pyproject.toml` declares `[tool.uv.sources] unifi-mcp-shared = { workspace = true }`
-(and the equivalent for `unifi-core`). In workspace contexts, that source override takes
-precedence over the version range in `[project.dependencies]` — `uv sync` and `uv lock`
-always resolve to the local checkout regardless of whether the declared range still
-allows the upstream version being released. **`uv lock --check`, `pytest`, and every CI
-job in this repo pass cleanly even when the published wheel's `requires_dist` will reject
-the just-released upstream package.**
+Workspace `[tool.uv.sources]` overrides take precedence over the version range during `uv sync`/`uv lock` — every CI job passes cleanly even when the published wheel's `requires_dist` will reject the just-released upstream package. The pin only fails when pip/uv resolves the published wheel against PyPI on a user's machine. Docker images also bypass the failure. This is a **PyPI-only** failure mode.
 
-The pin only takes effect when pip/uv resolves the published wheel against PyPI — i.e.,
-on a fresh `uvx <pkg>@latest` or `pip install <pkg>` on a user's machine, with no
-workspace context. That is exactly the path users hit and CI does not.
+### check_pin_alignment.py Coverage Limit
 
-Docker images built from this repo are also unaffected, because the Dockerfiles use
-`uv sync --frozen --package <pkg>` against the workspace lock and bundle the local
-shared checkout. The pin mismatch is a **PyPI-only** failure mode.
+`scripts/check_pin_alignment.py` validates the direct dependency bounds declared in each package's own `pyproject.toml` — it does not walk the full transitive/nested dependency chain (e.g., relay → shared → core, multiple hops deep). A downstream package can pass the gate while a deeper transitive package in the chain is still misaligned. When releasing a change that touches a multi-hop dependency chain, manually trace and verify bounds at each hop rather than trusting a single green run of this script.
 
-### Pre-tag wheel-metadata check (the gate that actually works)
+### Running one floor check locally: `--network-core-floor-only` and `--api-core-floor-only`
 
-Before pushing any tag whose dependency range was just edited, build the wheel and read
-its `Requires-Dist` to confirm the published artifact will permit the upstream version
-being released:
+The full gate takes several minutes because it builds every wheel and builds a venv per downstream. When a PR changes only how Network or the API uses upstream code, run just that wheel's floor check:
 
 ```bash
-# After bumping pins, BEFORE pushing tags:
+uv run scripts/check_pin_alignment.py --network-core-floor-only
+uv run scripts/check_pin_alignment.py --api-core-floor-only
+```
+
+Each mode builds that one wheel, installs it against exactly its declared `unifi-core` minimum, and runs the manager-call contract, the full module import, and the upstream attribute scan described in Step 0. A failure means the code was written against an upstream API newer than the floor admits: either raise the floor (after the upstream version is on PyPI) or remove the use. Protect, Access and Relay have no single-package flag; they are checked by the full gate.
+
+### Pre-tag wheel-metadata check
+
+```bash
 rm -rf /tmp/wheelcheck && mkdir -p /tmp/wheelcheck
 for app in apps/network apps/protect apps/access packages/unifi-mcp-relay; do
   echo "=== $app ==="
   uv build --wheel "$app" --out-dir /tmp/wheelcheck/$(basename $app) 2>&1 | tail -2
   whl=$(ls /tmp/wheelcheck/$(basename $app)/*.whl | tail -1)
   python -m zipfile -e "$whl" /tmp/wheelcheck/extracted/$(basename $app)/
-  grep -h 'Requires-Dist.*\\(unifi-mcp-shared\\|unifi-core\\)' \\
+  grep -h 'Requires-Dist.*\(unifi-mcp-shared\|unifi-core\)' \
     /tmp/wheelcheck/extracted/$(basename $app)/*.dist-info/METADATA
 done
 ```
 
-For each output line, confirm the range is `>=<new-upstream-version>` and `<<next-major>`.
-A stale `<0.5` upper bound on a release that needs shared 0.5.0+ is the canonical failure
-mode — see "PyPI pin masked by workspace source" in Cross-Cutting Gotchas.
+---
 
-A fast supplementary grep that catches the most common shape:
+## Procedure E: Plugin Releases
+
+A plugin release is a plugin version bump landing on `main`. There is no publish
+step: every client reads the default branch unless the user pins a ref. Python
+packages and the Worker still release only by tag.
+
+### Triggers
+
+- **Plugin-only release:** a PR that bumps the plugin version merges to `main`.
+- **Server release:** a Network, Protect or Access tag runs `bump-plugin-versions.yml`,
+  which moves the server pin and bumps the plugin in one writeback commit.
+
+### Clients
+
+| Client | Reads | Detects an update by | Users update with |
+|---|---|---|---|
+| Claude Code | Marketplace on the default branch unless added as `owner/repo#ref` | Manifest `version`; the cache is keyed by it | `claude plugin marketplace update unifi-plugins`, then `claude plugin update <plugin>@unifi-plugins` (or `/plugin` → Installed → Update now), then a new session: the SessionStart notice does not run on `/reload-plugins`. Auto-update is off by default for our marketplace; a user can turn it on under `/plugin` → Marketplaces, and it then installs releases in the background during a session and prompts for `/reload-plugins`, which also skips the notice. |
+| Codex | `.agents/plugins/marketplace.json` on remote HEAD unless added as `owner/repo@ref` | Manifest `version`: Codex re-clones configured Git marketplaces at the start of every session (and on `codex plugin marketplace upgrade`) and reinstalls a plugin only on a version change | Nothing: Codex runs the bundled server, which reads the per-user settings file setup writes (`UNIFI_SETTINGS_FILE`), so a pin bump starts in the session after the one that installs the release. A `[mcp_servers.<plugin>]` entry from setup before plugin 1.0.0 shadows the bundled server until the user runs setup with `--refresh` once |
+| OpenClaw | `git:owner/repo[@ref]` or our Claude-format marketplace; treats the bundle as a Codex bundle and runs the server in `.mcp.codex.json`, merging in a root `.mcp.json` if one ships (so none does) | Commits, not `version` | `openclaw plugins update <id>` or `openclaw plugins update --all`; it asks for capability consent, or needs `--accept-capabilities` without a terminal. The bundled server reads the per-user settings file setup writes, so the pin moves at the next agent turn, without a Gateway restart. An `mcp.servers.<plugin>` entry from setup before plugin 1.0.0 replaces the bundled server until the user runs setup with `--target openclaw --refresh` once |
+| Hermes Agent | Cannot load the current layout (needs a root `plugin.json`, `skills/` and `mcp.json`) | Commits | Not supported |
+
+Sources: [Claude Code host a marketplace](https://code.claude.com/docs/en/plugins/host-marketplace.md),
+[loading](https://code.claude.com/docs/en/plugins/loading.md),
+[install](https://code.claude.com/docs/en/plugins/install.md),
+[marketplace reference](https://code.claude.com/docs/en/plugins/marketplace-reference.md);
+[Codex plugins](https://developers.openai.com/plugins/build/plugins) and openai/codex
+`core-plugins/src/marketplace_upgrade.rs`, `loader.rs`;
+[OpenClaw install](https://docs.openclaw.ai/cli/plugins/install),
+[update](https://docs.openclaw.ai/cli/plugins/uninstall-and-update),
+[bundles](https://docs.openclaw.ai/plugins/bundles);
+Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
+
+### Rules
+
+- **One release, one merge.** Land every plugin change that makes up one release on
+  `main` together, never as a string of separate merges. Commit-tracking clients
+  (OpenClaw, Hermes) deliver every commit to their users.
+- **Never ahead of the server.** Land plugin content (skills, references, setup, MCP
+  config) that depends on a server feature only when, or after, that server version is
+  tagged and the pin moves; usually in or after the writeback.
+- **Enforcement.** `make check-plugin-versions` admits version bumps and pins;
+  `make check-plugin-tool-refs` fails when a shipped plugin file names a tool absent
+  from the release tag its product's plugin pins (cross-product: the product pins plus
+  the latest released relay). Both run in `make pre-commit` and in the generated-artifacts
+  CI job. Never weaken either check to pass a PR; fix the plugin text or move the pin.
+- **Counts and references follow the pin.** Plugin skill tool counts and the generated
+  `references/*-tools.md` come from the manifest of the release tag each plugin pins
+  (`git show <tag>:<manifest>`), never the workspace: a server PR that adds a tool leaves
+  them unchanged, and the plugin release that moves the pin (the writeback runs
+  `generate_skill_references.py`) updates them. A new tool category needs its
+  `<!-- AUTO:tools:<category> -->` marker section added in that release.
+
+### Versioning
+
+- Each plugin has an independent SemVer describing everything it ships, separate from
+  the server pin. Set the same `version` in every existing Claude and Codex manifest
+  (at least one). The unlisted `cross-product` bundle uses its Claude manifest only.
+  Keep `version` out of marketplace entries.
+- Bump every affected plugin in the same PR whenever any file under `plugins/<name>/`
+  changes, including skills, references, setup scripts, MCP configs and docs. Version-only
+  bumps are allowed.
+- Patch: plugin-only fixes or docs, and patch server pin moves. Minor: new
+  skills/capabilities, and minor server pin moves. Major: breaking setup/configuration,
+  and major server pin moves. Before 1.0, breaking changes advance minor and additive
+  changes advance patch (SemVer 0.x).
+- Keep the server pin identical in the inline Claude `mcpServers` of
+  `.claude-plugin/plugin.json` and in `.mcp.codex.json`; it must name a release tag.
+  Never ship a root `.mcp.json`: OpenClaw would merge it into the server it runs.
+- Writeback: `bump-plugin-versions.yml` runs
+  `python3 scripts/plugin_versions.py sync --releasing <package-tag>`. It moves the inline
+  Claude pin and the `.mcp.codex.json` pin, bumps the plugin by the size of the server move,
+  and regenerates `apps/<product>/server.json` with the **server** version. Retrying an
+  already-synced pin does not bump again. Core, Shared and Relay triggers only coalesce
+  outstanding product tags, otherwise they write nothing.
+- `make check-plugin-versions` runs `scripts/plugin_versions.py check --base origin/main`;
+  PR CI uses the PR base SHA. Fetch base history and tags first; a missing base fails.
+  Changed plugin versions must be valid SemVer, agree across manifests and exceed the
+  merge-base version. Pins must agree and name release tags; only the workflow's exact
+  `--releasing` tag may stand in for a tag not yet discovered locally.
+
+### Release checklist
+
+1. Bump the version by the rules above and write the user-visible changes in the PR
+   description; the squash commit carries them as the release notes.
+2. Run `make pre-commit` (both plugin checks included).
+3. Merge as one squash merge.
+4. Tell users how to update, per the client table: Claude Code users update the
+   marketplace and plugin themselves (unless they turned on auto-update), then start a
+   new session; Codex installs the release and its pinned server at the next session
+   start (users whose `config.toml` entry predates plugin 1.0.0 run setup with
+   `--refresh` once);
+   OpenClaw users run
+   `openclaw plugins update`.
+5. From `main`, after the merge, run the real-client acceptance procedure in
+   `docs/plugin-acceptance.md`.
+6. Roll back by reverting the merge, then bumping the version again above the bad
+   release; the version guard requires the higher version and clients keyed by version
+   need the change to reinstall.
+
+## Procedure F: Dependency-Aware Release Batching
+
+Build a dependency and writeback graph before pushing tags. A package has a hard dependency edge on
+an upstream release when its wheel metadata must name the new upstream version, its code requires
+an API that exists only in that version, or its release workflow installs the new version from
+PyPI. Existing bounds that already accept the upstream release do not create an edge by themselves.
+
+Add a writeback exclusion between Worker and any tag namespace configured in
+`bump-plugin-versions.yml`. The Worker release and plugin-version sync both checkout and push
+`main`, but they do not share a concurrency group or retry a non-fast-forward push. Keep Worker out
+of those batches. Wait for the plugin writeback to finish, fetch `main`, and then push Worker; an
+API-only tag may share the Worker batch because it does not start the plugin writeback.
+
+Put every tag whose incoming edges are already satisfied into the same batch. Create the tags from
+the intended release commit, then push each tag in its own command back-to-back. Separate push
+commands reliably trigger every tag workflow; one multi-ref `git push` can omit triggers.
 
 ```bash
-# Confirm no downstream pyproject still pins below the new upstream major.minor.
-# Example: releasing shared 0.5.0 — every match below should be empty.
-grep -n "unifi-mcp-shared" apps/*/pyproject.toml packages/*/pyproject.toml \\
-  | grep -v 'workspace = true' \\
-  | grep -v '>=0.5'
+# Include only packages in this batch. Each variable is the reviewed version without the v prefix.
+release_tags=(
+  "core/v${CORE_VERSION:?Set CORE_VERSION}"
+  "shared/v${SHARED_VERSION:?Set SHARED_VERSION}"
+  "network/v${NETWORK_VERSION:?Set NETWORK_VERSION}"
+  "protect/v${PROTECT_VERSION:?Set PROTECT_VERSION}"
+  "access/v${ACCESS_VERSION:?Set ACCESS_VERSION}"
+  "api/v${API_VERSION:?Set API_VERSION}"
+  "relay/v${RELAY_VERSION:?Set RELAY_VERSION}"
+  "worker/v${WORKER_VERSION:?Set WORKER_VERSION}"
+)
+
+# Each loop iteration is a separate push. Do not wait for its workflow before the next iteration.
+for tag in "${release_tags[@]}"; do
+  git tag "$tag" || exit 1
+done
+
+for tag in "${release_tags[@]}"; do
+  git push origin "$tag" || exit 1
+done
 ```
 
-### Verification before tagging
+Monitor every workflow in the batch concurrently. Wait at a dependency boundary only: confirm the
+upstream workflow and PyPI artifact before pushing a later batch that consumes that artifact. If one
+workflow fails, let unrelated workflows finish, but hold every downstream batch that depends on the
+failure.
 
-Before pushing a tag, verify the version would resolve correctly by running the
-scoped git describe command explicitly:
+### Consolidated plugin-manifest writebacks
 
-```bash
-# For network package, verify the --match pattern is scoped
-cd apps/network
-git describe --dirty --tags --long --match network/v*
-# Expected: network/v0.14.13-0-g<hash> (or similar with no sibling tags)
+`bump-plugin-versions.yml` reads the current release tags and synchronizes all Network, Protect, and
+Access server pins and independently bumps each changed plugin. Its concurrency policy coalesces a burst of tags: earlier sync runs may be
+cancelled, and the last run writes one commit containing every app version visible at that point.
+Cancelled superseded runs are expected; the final run must succeed.
 
-# Test the actual version that would be reported at build time
-pip install -e ".[dev]"
-python -c "import importlib.metadata; print(importlib.metadata.version('unifi-mcp-network'))"
-# Expected: exactly matches the tag version, e.g. 0.14.13
-```
+After a batch containing at least one namespace configured under
+`bump-plugin-versions.yml`'s `on.push.tags`:
 
-If the version does NOT match what you're about to tag, the `--match` pattern is
-still contaminated by sibling tags. Example failure modes:
+1. Wait for the last `bump-plugin-versions.yml` run to complete.
+2. For a batch with Network, Protect, or Access tags, fetch `origin/main`, inspect the consolidated
+   writeback commit, and verify `apps/<app>/server.json` and both MCP configs contain
+   each released server version; existing plugin manifests must agree on the independently bumped
+   plugin version. Run `make check-plugin-versions` against the parent of the writeback commit.
+3. For a library-only trigger batch containing Core, Shared, or Relay, require the sync run to
+   succeed but allow `No version changes to commit`. Inspect a commit only if the run found an
+   outstanding app-version change.
+4. Start another batch from a writeback commit only when one was created and a later tag actually
+   consumes those committed manifests or a new dependency pin. Independent tags can share the
+   original release commit.
 
-```bash
-# WRONG — picks up protect/v0.3.5 because --match is too broad
-git describe --tags --long --match v*
-# network/v0.14.13-125-g... (125 commits past a wrong tag)
+For example, direct security floors added independently to Shared, Network, Protect, Access, API,
+and Relay form one batch when no cross-package floor changes. A new Core API plus downstream code
+that requires it forms at least two batches: publish Core first, then publish the downstream wheels
+after Core is available and their reviewed metadata floors are correct.
 
-# CORRECT — scoped to network/ prefix only
-git describe --tags --long --match network/v*
-# network/v0.14.13-0-g...
-```
+> **Floor-bump sequencing gotcha:** Open downstream `pyproject.toml` floor-bump PRs (raising the minimum version bound on an upstream package) **only after** the upstream tag is confirmed on PyPI. Committing the floor-bump PR before the upstream version exists on PyPI causes the pin-alignment CI gate on that PR to fail — the gate tries to resolve the declared lower bound but the version does not yet exist.
 
-**Gotcha — tag resolution is at build time, not install time.** hatch-vcs reads
-tags when the package is built (during CI), not when it is installed. The tag must
-be reachable on the exact commit being built. If CI triggers before the tag propagates
-to GitHub, the version will be wrong even if the tag exists locally.
+> **Floor-bump local staging:** While waiting for PyPI to confirm the upstream version, stage the floor-bump work locally — create the branch, update downstream `pyproject.toml` version floors, and commit locally. Hold `git push` and PR creation until PyPI confirms the version exists. This decouples preparation from the PyPI propagation gate and eliminates idle waiting between confirmation and branch push.
 
-## Procedure E: Manifest Bumper — args[2] vs args[0] Correction
+> **Post-hoc branch-split at package boundary:** If a shared/core change was developed inline inside a larger feature branch that also touches a downstream package (e.g., `unifi-api-server`), split the reviewed core change into its own clean branch and PR before merging the downstream work. Verify the core PR independently, squash-merge and tag it first, then continue the downstream package's PR on top of the merged core change. This preserves the dependency-ordered tag sequence above even when development didn't originally follow package boundaries.
 
-The manifest bumper workflow (`bump-plugin-versions.yml`) rewrites version fields in
-`plugin.json` and `server.json` files after a successful publish. A past bug (PR #227)
-corrupted the bumper to target `args[0]` (the flag name) instead of `args[2]` (the
-version pin value).
-
-### Correct bumper configuration
-
-In `bump-plugin-versions.yml`, the version replacement must target the third positional
-argument — the version pin field, not the flag name:
-
-```yaml
-# WRONG — corrupts the flag name
-- run: python scripts/bump_version.py ${{ ... }} --json-path '$.version' --index 0
-
-# CORRECT — targets the version pin value
-- run: python scripts/bump_version.py ${{ ... }} --json-path '$.version' --index 2
-```
-
-The bumper script reads the manifest JSON, extracts the version bump from the publish
-output, and replaces it at the specified index. Index 2 is the version string itself;
-index 0 would corrupt the flag or field name.
-
-**Atomic manifest sync — all plugin marketplaces:** When the bumper runs after a publish,
-it must atomically update version fields in ALL plugin manifest copies that get deployed
-to end users:
-- `plugins/unifi-network/.claude-plugin/plugin.json` (Claude plugin marketplace)
-- `plugins/unifi-network/.openai/plugin.json` (if deployed to OpenAI agents marketplace)
-- `plugins/unifi-network/.mcp.json` (MCP server manifest, if exposed as standalone server)
-- Same for protect, access, etc.
-
-The bumper workflow must commit a single atomic update across all copies. If some manifest
-files are updated and others are not, users will see version mismatches or stale metadata
-in non-updated marketplaces.
-
-**Verification:** After a release workflow completes and the bumper runs, check the
-manifest commit in GitHub. All `plugin.json` and `.mcp.json` files should have updated
-version strings (e.g., `\"version\": \"0.14.14\"`), NOT corrupted field names. Spot-check
-that Claude plugin, OpenAI agents, and standalone MCP manifests are all in sync.
-
-## Procedure F: Dependency-Ordered Tag Pushing
-
-The dependency graph:
-
-```
-unifi-core  →  unifi-mcp-shared  →  unifi-mcp-network
-                                  →  unifi-mcp-protect
-                                  →  unifi-mcp-access
-                                  →  unifi-mcp-relay
-            →  unifi-api-server
-```
-
-**Critical rule:** Push each tag INDIVIDUALLY, one at a time. Wait for GitHub Actions to
-complete and confirm the PyPI package is live before pushing the next tag. Batch-pushing
-tags in a single `git push` command causes GitHub Actions workflows to NOT trigger — releases
-are silently skipped. This is a GitHub Actions orchestration quirk: when multiple tags are
-pushed in a single push event, only the first workflow starts; subsequent tags are ignored.
-The silent failure causes PyPI to stay on the old version, artifact uploads to be skipped,
-and downstream installs to fail with unresolved dependencies.
-
-**Rule:** Upstream tags first. Wait for PyPI confirmation before downstream tags. Downstream
-packages declare a minimum version of their upstream dependencies in `pyproject.toml`; if
-the upstream version is not yet on PyPI when the downstream workflow runs, pip will fail
-to resolve the dependency.
-
-### Tag push sequence — PUSH ONE AT A TIME
-
-```bash
-# Step 1 — upstream foundation
-git tag core/v0.2.0
-git push origin core/v0.2.0
-# WAIT: confirm https://pypi.org/project/unifi-core/ shows 0.2.0 and CI is green
-
-# Step 2 — shared layer
-git tag shared/v0.4.0
-git push origin shared/v0.4.0
-# WAIT: confirm https://pypi.org/project/unifi-mcp-shared/ shows 0.4.0 and CI is green
-
-# Step 3 — app servers and API (push individually, one per command)
-git tag network/v0.14.13
-git push origin network/v0.14.13
-# WAIT: confirm https://pypi.org/project/unifi-mcp-network/ shows 0.14.13 and CI is green
-
-git tag protect/v0.3.5
-git push origin protect/v0.3.5
-# WAIT: confirm https://pypi.org/project/unifi-mcp-protect/ shows 0.3.5 and CI is green
-
-git tag access/v0.2.4
-git push origin access/v0.2.4
-# WAIT: confirm https://pypi.org/project/unifi-mcp-access/ shows 0.2.4 and CI is green
-
-git tag api/v0.2.1
-git push origin api/v0.2.1
-# WAIT: confirm https://pypi.org/project/unifi-api-server/ shows 0.2.1 and CI is green
-
-# Step 4 — relay
-git tag relay/v0.1.0
-git push origin relay/v0.1.0
-# WAIT: confirm https://pypi.org/project/unifi-mcp-relay/ shows 0.1.0 and CI is green
-
-# Step 5 — worker, if relay/worker behavior changed
-git tag worker/v1.3.1
-git push origin worker/v1.3.1
-# WAIT: confirm npm registry and CI are green
-```
-
-**Why one push per tag:** The single-push-multiple-tags pattern (`git push origin tag1 tag2`)
-fires all workflows simultaneously but GitHub only queues the first. Subsequent workflows
-start only after the first completes (or not at all, silently). The expected behavior
-(all workflows start in parallel) does not happen. Workflow skips are invisible in the job
-log — the jobs don't appear at all, so it's easy to miss that a publish never happened.
-
-**Worker app:** `apps/worker` has a separate npm release flow using OIDC via GitHub Actions.
-Apply the same ordering principle: if the worker depends on a Python package version or relay
-protocol behavior, confirm the upstream PyPI release is updated before pushing the `worker/v*` tag.
+---
 
 ## Procedure G: generate_release_notes.py Path Configuration
 
-GitHub's built-in `--generate-notes` option includes every PR merged between the
-previous tag and the current tag in the entire repo — regardless of which files
-changed. In a monorepo, a `network/v0.14.13` release would absorb protect and access
-PRs. The custom script `scripts/generate_release_notes.py` filters PRs to only those
-touching paths relevant to each package.
+Open `scripts/generate_release_notes.py` and locate `APP_CONFIGS`. Each entry is a `PackageConfig` with `path_groups` — a tuple of `PathGroup` objects that filter PRs to only those touching paths relevant to each package. Each entry should include the app directory, shared dependency directories (`packages/unifi-core/`, `packages/unifi-mcp-shared/`), and its own publish, test, and Docker build workflow paths.
 
-### Per-package path configuration
+**Known limitation:** `scripts/generate_release_notes.py` does not emit PR author information. Contributor credit must be added manually.
 
-Open `scripts/generate_release_notes.py` and locate the `APP_CONFIGS` dict. Each
-entry is a `PackageConfig` with `path_groups` — a tuple of `PathGroup` objects that
-group related paths under a label. For app servers, the structure is:
+---
 
-```python
-APP_CONFIGS = {
-    "network": PackageConfig(
-        key="network",
-        display_name="UniFi Network MCP",
-        pypi_package="unifi-network-mcp",
-        install_command="uvx unifi-network-mcp=={version}",
-        path_groups=(
-            PathGroup("Network MCP", ("apps/network/", "plugins/unifi-network/")),
-            PathGroup("Shared Libraries", ("packages/unifi-core/", "packages/unifi-mcp-shared/")),
-            PathGroup(
-                "Release Infrastructure",
-                (
-                    ".github/workflows/release-network.yml",
-                    ".github/workflows/docker-network.yml",
-                    ".github/workflows/test-network.yml",
-                    ".github/workflows/bump-plugin-versions.yml",
-                    *COMMON_PACKAGE_PATHS,  # pyproject.toml, uv.lock
-                ),
-            ),
-        ),
-    ),
-    # ... one entry per package
-}
+## Procedure G.5: Pre-Tag Full Release-Wide Smoke Matrix Gate
+
+Even when the merged diff touches only one package (e.g., a Core-only PR), do not tag from that PR's own targeted live validation alone. Run the full release-wide safe-phase smoke matrix across every live-validated surface (network, protect, access, api) before pushing any tag. A single package's isolated pass does not prove the other surfaces still function against the same rebased head — regressions in unrelated surfaces have shipped from Core-only changes that looked locally safe.
+
+```bash
+uv run python scripts/live_smoke.py --server network --phase safe
+uv run python scripts/live_smoke.py --server protect --phase safe
+uv run python scripts/live_smoke.py --server access --phase safe
 ```
 
-Note: paths are directory prefixes (e.g., `"apps/network/"`) — not `**` globs.
-
-Each app server entry should include:
-1. Its own app/package directory as the primary `PathGroup`
-2. Shared dependency directories (`packages/unifi-core/`, `packages/unifi-mcp-shared/`)
-3. Its own publish/test/docker workflows as Release Infrastructure
+All must exit 0 with zero failed/exception records before the first tag in the release is pushed — this is a gate on Procedure F, not just a post-tag check.
 
 ## Procedure H: Release Validation
 
-After pushing a tag, verify it resolved correctly before closing the work.
+After pushing a release batch:
 
-1. **Check CI:** The tag push triggers GitHub Actions. Confirm the version check job goes green.
-
-2. **Verify the version locally:**
-
+1. **Check CI concurrently:** Capture every release workflow run and confirm all complete
+   successfully. Do not serialize independent workflow watches.
+2. **Verify the final manifest sync when triggered:** If the batch contains a tag namespace listed
+   in `bump-plugin-versions.yml`, confirm its last run succeeded. For Network, Protect, or Access
+   tags, inspect the consolidated commit on `main`; for a Core-, Shared-, or Relay-only trigger,
+   accept a successful `No version changes to commit` result. API-only and Worker-only batches skip
+   this step because they do not trigger the workflow.
+3. **Verify local tag versions:** For each Python tag, change to its directory from the Package Map
+   and run `hatch version`; it must print exactly the tagged version. Worker is not a Hatch project,
+   so verify its version from the exact npm artifact in the next step.
+4. **Confirm every registry artifact:** Query PyPI for each exact Python version and run
+   `npm view unifi-mcp-worker@<version> version` for a Worker tag.
+5. **Install smoke test:** Install compatible releases together in one clean environment when
+   possible. Assert each installed distribution version, its import path under `site-packages`, and
+   any security or cross-package metadata floor that motivated the release.
+6. **Post-Release Live Smoke Verification** (must run via `uv`, not system `python3`):
    ```bash
-   cd apps/<app>
-   hatch version
-   # Should print exactly the tagged version, e.g., "0.4.0"
+   uv run python scripts/live_smoke.py --server network --phase safe
+   uv run python scripts/live_smoke.py --server protect --phase safe
+   uv run python scripts/live_smoke.py --server access --phase safe
    ```
+   All three must exit 0 with zero failed/exception records. This is the final release validation gate.
+   **Do not invoke with bare `python3 scripts/live_smoke.py`** — the system Python lacks the workspace dependencies and the harness will fail at import time.
+7. **Post-publish installed-wheel verification:** After PyPI confirms the new versions, use the
+   clean environment from step 5 to verify every released Python distribution. For released server
+   apps, run `live_smoke.py --server <server> --phase safe` separately with that environment's
+   Python executable, not `uv run` or `--server all`. Core, Shared, API, and Relay have no standalone
+   live-smoke target, so their installed version and `site-packages` import-path assertions from
+   step 5 are their packaging gate. Worker uses the exact npm-artifact check from step 4. This
+   catches packaging defects that local workspace sources can hide.
 
-   The version test in CI must use the same scoped `--match` pattern as your
-   `git_describe_command` in `pyproject.toml`. If the version test uses `--match v*`
-   (too broad), it will pick up sibling package tags on multi-tag commits. Verify
-   the CI test runs: `git describe --dirty --tags --long --match app-name/v*`.
+---
 
-3. **Confirm PyPI:** `pip index versions unifi-mcp-<app>` or check the PyPI project page.
+## Procedure I: Dependabot Dependency Update Management
 
-4. **Install smoke test:**
+Dependabot updates the lockfile one package at a time. When multiple PRs fail CI with the same class of lockfile error, merge into a single maintainer branch:
 
-   ```bash
-   pip install --upgrade unifi-mcp-<app>
-   python -c "import unifi_mcp_<app>; print(unifi_mcp_<app>.__version__)"
-   ```
+```bash
+git checkout -b deps/batch-dependabot main
+# Apply dependency changes, then re-lock from combined state:
+uv lock
+# Run per-package tests before opening the PR:
+cd apps/network && uv run pytest && cd ../..
+cd apps/protect && uv run pytest && cd ../..
+```
 
-5. **Post-Release Live Smoke Verification (Full Release Validation):**
+**Strategy A (Reactive):** Batch accumulated Dependabot PRs into a single maintainer branch, run `uv lock`, merge the combined PR.
 
-   After all tags are pushed and all PyPI packages are live, run a full post-release
-   smoke test to verify API contracts work end-to-end with the released wheel versions:
+**Strategy B (Proactive):** Don't wait for Dependabot PRs to accumulate. Periodically run `uv lock` yourself and open a single maintainer PR before the Dependabot queue grows. This prevents cascading CI failures from multiple simultaneous lockfile-touching PRs.
 
-   ```bash
-   # Set .env credentials (real hardware or staging controller)
-   # Then run the full three-domain smoke sequence:
-   python scripts/live_smoke.py --server network --phase safe
-   python scripts/live_smoke.py --server protect --phase safe
-   python scripts/live_smoke.py --server access --phase safe
-   ```
+**Major-version bumps are invisible at the PR level** — the CI failure looks identical to a minor version conflict. Always inspect the actual version change in the PR diff.
 
-   All three phases must exit with status 0 and have zero failed/exception records in
-   the artifacts. This confirms the released wheels work against real UniFi hardware
-   and that API contracts hold. This is the final release validation gate — if any phase
-   fails, the release is broken and requires either an immediate patch release or a
-   rollback announcement.
+**pyproject floor vs. lockfile drift:** After batching, verify each updated package's lower bound still permits the resolved version. Run the wheel-metadata check from Procedure D before merging.
+
+**Second-wave cascading PRs gotcha:** After a batch Dependabot PR merges, Dependabot may open a fresh wave of new PRs for versions newly unlocked by the combined resolution. This is expected — the first merge freed resolution space for the next tier. Budget time for a second round of batching review.
+
+---
+
+## Procedure J: Shared Package Architecture Constraints
+
+Before releasing `packages/unifi-mcp-shared/` or `packages/unifi-core/`, verify these three structural invariants were maintained during development.
+
+### J-1: DI-Only Rule — No Reverse Imports in `unifi-mcp-shared`
+
+Every entrypoint in `packages/unifi-mcp-shared/` must accept app-specific behavior as injected parameters. Direct imports from `unifi_network_mcp`, `unifi_protect_mcp`, or `unifi_access_mcp` inside the shared package create a circular import that breaks all three app servers simultaneously at import time — blast radius is total.
+
+Verify before releasing any shared-package change:
+```bash
+grep -r "from unifi_network_mcp\|from unifi_protect_mcp\|from unifi_access_mcp" packages/unifi-mcp-shared/
+```
+Any match is a release blocker. Replace with an injected parameter or a typed Protocol interface defined within `packages/unifi-mcp-shared/`.
+
+### J-2: Scope Gate — `unifi-core` vs. `unifi-mcp-shared`
+
+Decision tree for placing new code:
+- Talks directly to UniFi hardware or manages HTTP sessions? → `unifi-core`
+- Coordinates MCP concerns (permissions, tool registration, confirmations)? → `unifi-mcp-shared`
+- References MCP types (`FastMCP`, tool decorators)? → `unifi-mcp-shared`
+- Would be useful in a non-MCP CLI calling the UniFi API? → `unifi-core`
+
+Import direction must remain strictly left-to-right: `app servers → unifi-mcp-shared → unifi-core`. Verify:
+```bash
+grep -r "from unifi_mcp_shared\|import unifi_mcp_shared" packages/unifi-core/
+grep -r "from unifi_network_mcp\|from unifi_protect_mcp\|from unifi_access_mcp" packages/unifi-mcp-shared/ packages/unifi-core/
+```
+Both commands must return nothing.
+
+### J-3: Relay Protocol Sync (Required Before Shared-Package Release)
+
+The two relay files `packages/unifi-mcp-relay/src/unifi_mcp_relay/discovery.py` and `packages/unifi-mcp-relay/src/unifi_mcp_relay/protocol.py` implement relay protocol logic that does **not** import from `unifi-mcp-shared`. When shared-package protocol changes (new message format, endpoint path, header), these files receive no automatic update — there is no import error, failing test, or CI gate. Drift fails silently at runtime.
+
+Before any shared-package protocol release:
+1. Identify what changed (message schema, endpoint path, header, error envelope shape).
+2. Open `packages/unifi-mcp-relay/src/unifi_mcp_relay/discovery.py` and `packages/unifi-mcp-relay/src/unifi_mcp_relay/protocol.py` and manually port the change.
+3. Trace the message path end-to-end through both to confirm they agree.
+
+PR checklist trigger: any PR modifying shared-package protocol must include a "relay sync" section confirming both relay files were reviewed.
+
+---
 
 ## Cross-Cutting Gotchas
 
-**Sibling tag contamination.** If `git_describe_command` `--match` is too broad
-(e.g., `v*`), hatch-vcs picks up a sibling package's tag and reports the wrong
-version. Symptom: `pip install unifi-mcp-network==0.14.13` installs a package that
-prints `0.3.5` from `importlib.metadata`. Fix: tighten the `--match` pattern in
-`raw-options.git_describe_command` in `pyproject.toml` and rebuild.
+**Sibling tag contamination.** If `git_describe_command` `--match` is too broad (e.g., `v*`), hatch-vcs picks up a sibling package's tag and reports the wrong version. Fix: tighten the `--match` pattern and rebuild.
 
-**PR merge is NOT the release trigger — the tag push is.** `hatch-vcs` reads git tags at build time to generate `_version.py`. Merging a PR does NOT trigger a release. If the tag is never pushed, PyPI stays on the old version with no error — the build succeeds but installs the previous release. The tag push IS the release trigger. (Session 3: `core/v0.1.2` was never tagged; PyPI stayed at 0.1.1 until the tag was pushed manually.) Always run Procedure H after tagging.
+**PR merge is NOT the release trigger — the tag push is.** `hatch-vcs` reads git tags at build time. Merging a PR does NOT trigger a release. Always run Procedure H after tagging.
 
-**Silent version freeze.** If a tag is missing, `hatch-vcs` falls back to `fallback_version = \"0.0.0\"` or the last matching tag. There is no error at merge time. The failure surfaces only when a user installs and notices the wrong version. Always run Procedure H after tagging.
+**Silent version freeze.** If a tag is missing, `hatch-vcs` falls back to `fallback_version = "0.0.0"`. There is no error at merge time. Always run Procedure H after tagging.
 
-**Missing tag causes broken downstream install.** If `unifi-core` code is merged but
-`core/vX.Y.Z` is never pushed, downstream packages requesting `unifi-core>=X.Y.Z`
-will fail to install — pip resolver error, not a code error. Check PyPI before
-debugging code. The fix is to push the missing tag and wait for the publish workflow.
+**Missing tag causes broken downstream install.** If `unifi-core` code is merged but the tag is never pushed, downstream packages requesting that version fail to install. Check PyPI before debugging code.
 
-**Main-only merges are invisible to existing users.** Cache invalidation for plugin manifests requires a tagged release. A main-only merge updates the repo but does not trigger a publish workflow or invalidate any user caches. Existing users stay on their cached version indefinitely until the next tagged release. If a manifest or policy change is urgent, cut a patch release immediately (see Procedure A: Plugin-only Release).
+**Plugin updates need a version change.** Claude Code and Codex install a merged plugin change only when its manifest version changes. Keep the bump in the same PR as the shipped-file change (Procedure E).
 
-**Malformed git tag — missing 'v' prefix.** During local tag creation, you may accidentally
-create a tag like `protect/0.4.2` (no 'v') instead of `protect/v0.4.2`. This tag exists
-locally but is syntactically wrong and will be ignored by hatch-vcs and CI workflows.
-The malformed tag remains in your local tag list indefinitely, cluttering the namespace
-and potentially confusing future releases. **Prevention:** Before pushing any tags, list
-and validate them:
-```bash
-git tag -l | grep -E 'network|protect|access|relay|core|shared|api' | sort -V
-# Validate every line contains '/v' prefix (e.g., "network/v0.14.13")
-# If you see a malformed tag like "protect/0.4.2", delete it:
-git tag -d protect/0.4.2
-# Then create the correct one:
-git tag protect/v0.4.2
-```
+**Malformed git tag — missing 'v' prefix.** A tag like `protect/0.4.2` (no 'v') is syntactically wrong and ignored by hatch-vcs. Validate before pushing: `git tag -l | grep -E 'network|protect|access|relay|core|shared|api' | sort -V` — every line must contain `/v`.
 
-**PyPI pin masked by workspace source — failure mode the entire CI matrix cannot detect.**
-Workspace `[tool.uv.sources]` overrides the version range in `[project.dependencies]`
-during `uv sync`/`uv lock`, so local dev, every test job, and `uv lock --check` all
-pass with a stale pin. The pin is only enforced when pip/uv resolves the published
-wheel against PyPI — i.e., on a user's machine via `uvx <pkg>@latest`. Docker images
-also bypass the failure because the Dockerfiles use `uv sync --frozen --package <pkg>`
-against the workspace lock. Symptom: fresh `uvx`/`pip install` of the freshly published
-downstream package crashes immediately with `ModuleNotFoundError` for a module that
-only exists in the just-published upstream version. Canonical occurrence: the 2026-05-17
-coordinated release (network 0.18.0 / protect 0.4.0 / access 0.3.0 / relay 0.2.0) where
-`unifi-mcp-shared>=0.4.5,<0.5` shipped alongside `from unifi_mcp_shared.metadata import …`
-even though `metadata.py` only existed in shared 0.5.0; ~24h breakage, 4 reporters,
-silently-affected user count a multiple of that, fixed by PR #284. Prevention: run the
-wheel-metadata check in Procedure D before pushing tags. Never trust `uv lock --check`
-as the gate for this class of bug.
+**PyPI pin masked by workspace source — failure mode the entire CI matrix cannot detect.** Workspace `[tool.uv.sources]` overrides mean `uv lock --check` passes with a stale pin. The pin only fails when pip resolves against PyPI on a user's machine. Run the wheel-metadata check in Procedure D before pushing tags.
 
-**Batch tag push silently skips releases.** When `git push origin tag1 tag2 tag3` is used
-to push multiple tags in one command, GitHub Actions only starts the workflow for the first
-tag. Subsequent tags are queued but the workflows never execute, leaving PyPI on the old
-version with no error or warning. The fix: push tags one at a time. This is a GitHub
-orchestration issue, not a git or hatch-vcs bug. Always use individual `git push origin tag`
-commands per tag and wait for PyPI confirmation between pushes.
+**One multi-ref push silently skips releases.** `git push origin tag1 tag2 tag3` can start only the first workflow. Push each ref separately in a tight loop, then monitor the independent workflows concurrently.
+
+**Broken published wheels: remediation via PyPI yank (PEP 592).** Yank via the PyPI web UI — `twine` does not support the yank operation. Yanked versions are skipped during resolution but remain installable when explicitly pinned. Always follow a bulk yank with a corrected patch release.
+
+**PyPI package names differ from directory names.** `unifi-network-mcp` ≠ `unifi-mcp-network`. See Package Map.
+
+**Cross-package combined pytest run causes test configuration collision.** Running `uv run pytest packages/ apps/` causes pytest to load conflicting conftest files. Run per-package: `cd apps/network && uv run pytest`. CI workflows are already scoped this way.
+
+**Shared-package import blast radius is total.** A single `from unifi_network_mcp` import inside `packages/unifi-mcp-shared/` breaks all three app servers simultaneously at import time. The `ImportError` traceback names the shared package, masking the root cause. Run the grep from Procedure J-1 before every shared-package release.
+
+**Relay protocol drift is silent.** The relay implementation files (`packages/unifi-mcp-relay/src/unifi_mcp_relay/discovery.py` and `packages/unifi-mcp-relay/src/unifi_mcp_relay/protocol.py`) have no import from `unifi-mcp-shared` — protocol changes fail silently until a real client exercises the changed path. Manual review on every protocol-touching PR is the only protection (see Procedure J-3).
+
+**Backwards-coupling enforcement.** Import direction must stay: app servers → `unifi-mcp-shared` → `unifi-core`. Direct imports from app packages inside shared or core break at import time but no test catches it until the import is exercised. Grep before committing.
+
+**Docker builds must COPY transitive workspace dependencies, not just direct ones.** `packages/unifi-mcp-relay/Dockerfile` once copied only its direct dependency's source, and broke when `unifi-core` became a transitive dependency of `unifi-mcp-shared` and was never added to the COPY steps. Any Dockerfile for a package with workspace dependencies must COPY the full transitive dependency source tree, not just direct dependencies — verify after any change to the shared/core dependency graph.
+
+**Diagnostics direct-import pattern.** When debugging shared-package behavior from an app server, write diagnostic logic in the app server's namespace — do not import shared internals directly for inline inspection. Direct imports of shared internals count for cycle-checking.

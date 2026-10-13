@@ -3,10 +3,13 @@
 import asyncio
 import inspect
 import logging
+from typing import Annotated, Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from unifi_mcp_shared.output_schema import (
     UniFiToolResponse,
     get_unifi_tool_response_output_schema,
@@ -28,6 +31,7 @@ def mock_deps():
         input_schema=None,
         output_schema=None,
         auth_method="local_only",
+        annotations=None,
         permission_category=None,
         permission_action=None,
     ):
@@ -37,6 +41,7 @@ def mock_deps():
             "input_schema": input_schema,
             "output_schema": output_schema,
             "auth_method": auth_method,
+            "annotations": annotations,
             "permission_category": permission_category,
             "permission_action": permission_action,
         }
@@ -138,6 +143,46 @@ class TestCreatePermissionedTool:
         assert mock_deps["registered_tools"]["perm_tool"]["permission_category"] == "networks"
         assert mock_deps["registered_tools"]["perm_tool"]["permission_action"] == "update"
 
+    @pytest.mark.parametrize(
+        ("permission_category", "permission_action"),
+        [(None, None), ("clients", "read")],
+        ids=["non-permissioned", "permissioned"],
+    )
+    def test_copies_declared_annotations_to_registry(self, mock_deps, permission_category, permission_action):
+        pt = _create_pt(mock_deps)
+        annotations = ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        )
+
+        @pt(
+            name="annotated_tool",
+            description="test",
+            annotations=annotations,
+            permission_category=permission_category,
+            permission_action=permission_action,
+        )
+        async def annotated_tool():
+            return {"success": True}
+
+        assert mock_deps["registered_tools"]["annotated_tool"]["annotations"] == {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+
+    def test_absent_annotations_remain_absent_in_registry(self, mock_deps):
+        pt = _create_pt(mock_deps)
+
+        @pt(name="unannotated_tool", description="test")
+        async def unannotated_tool():
+            return {"success": True}
+
+        assert mock_deps["registered_tools"]["unannotated_tool"]["annotations"] is None
+
     def test_registers_default_output_schema_for_standard_tools(self, mock_deps):
         pt = _create_pt(mock_deps)
 
@@ -212,12 +257,12 @@ class TestCreatePermissionedTool:
         tools = await server.list_tools()
         tool = next(t for t in tools if t.name == "fastmcp_schema_tool")
         assert tool.title == "FastMCP Schema Tool"
-        assert tool.outputSchema == get_unifi_tool_response_output_schema()
+        assert tool.output_schema == get_unifi_tool_response_output_schema()
 
-        content, structured_content = await server.call_tool("fastmcp_schema_tool", {})
-        assert content[0].type == "text"
-        assert '"success": true' in content[0].text
-        assert structured_content == {"success": True, "data": {"id": "abc"}}
+        result = await server.call_tool("fastmcp_schema_tool", {})
+        assert result.content[0].type == "text"
+        assert '"success": true' in result.content[0].text
+        assert result.structured_content == {"success": True, "data": {"id": "abc"}}
 
     def test_uses_function_name_when_no_name_given(self, mock_deps):
         pt = _create_pt(mock_deps)
@@ -409,3 +454,79 @@ class TestInferInputSchema:
 
         schema = _infer_input_schema(tool, "tool", logging.getLogger("test"))
         assert "self" not in schema["properties"]
+
+    def test_infers_numeric_validation_constraints(self):
+        async def tool(
+            limit: Annotated[int, Field(ge=1, le=500)],
+            ratio: Annotated[float, Field(gt=0, lt=1, multiple_of=0.05)],
+        ):
+            pass
+
+        schema = _infer_input_schema(tool, "tool", logging.getLogger("test"))
+
+        assert schema["properties"]["limit"] == {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+        }
+        assert schema["properties"]["ratio"] == {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "exclusiveMaximum": 1,
+            "multipleOf": 0.05,
+        }
+
+    def test_infers_optional_string_validation_constraints(self):
+        async def tool(
+            name: Annotated[
+                str | None,
+                Field(min_length=2, max_length=20, pattern=r"^[a-z]+$"),
+            ] = None,
+        ):
+            pass
+
+        schema = _infer_input_schema(tool, "tool", logging.getLogger("test"))
+
+        assert schema["properties"]["name"] == {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 20,
+            "pattern": "^[a-z]+$",
+        }
+        assert "name" not in schema.get("required", [])
+
+    def test_infers_collection_validation_constraints(self):
+        async def tool(
+            items: Annotated[
+                list[str],
+                Field(min_length=1, max_length=10, json_schema_extra={"uniqueItems": True}),
+            ],
+            metadata: Annotated[dict[str, str], Field(min_length=1, max_length=5)],
+        ):
+            pass
+
+        schema = _infer_input_schema(tool, "tool", logging.getLogger("test"))
+
+        assert schema["properties"]["items"] == {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "uniqueItems": True,
+        }
+        assert schema["properties"]["metadata"] == {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 5,
+        }
+
+    def test_constraint_inference_failure_degrades_per_parameter(self):
+        async def tool(
+            callback: Callable[[int], int],
+            limit: Annotated[int, Field(ge=1)],
+        ):
+            pass
+
+        schema = _infer_input_schema(tool, "tool", logging.getLogger("test"))
+
+        assert schema["properties"]["callback"] == {"type": "string"}
+        assert schema["properties"]["limit"] == {"type": "integer", "minimum": 1}

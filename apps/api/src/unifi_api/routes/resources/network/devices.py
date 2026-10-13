@@ -28,6 +28,7 @@ def _device_key(obj) -> tuple:
 @router.get(
     "/sites/{site_id}/devices",
     response_model=Page[to_pydantic_model(Device)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/devices"],
 )
@@ -47,10 +48,8 @@ async def list_devices(
             controller.id,
             "network",
             "device_manager",
+            site=site_id,
         )
-        cm = await factory.get_connection_manager(session, controller.id, "network")
-        if cm.site != site_id:
-            await cm.set_site(site_id)
         all_devices = await mgr.get_devices()
 
     cursor_obj = None
@@ -68,7 +67,12 @@ async def list_devices(
     )
 
     type_class = request.app.state.type_registry.lookup("network", "devices")
-    items = [type_class.from_manager_output(d).to_dict() for d in page]
+    items = [
+        type_class.from_manager_output(
+            d, redact_sensitive=request.app.state.config.policy.response.redact_sensitive_fields
+        ).to_dict()
+        for d in page
+    ]
     hint = type_class.render_hint("list")
 
     return {
@@ -81,6 +85,7 @@ async def list_devices(
 @router.get(
     "/sites/{site_id}/devices/{mac}",
     response_model=Detail[to_pydantic_model(Device)],
+    response_model_exclude_unset=True,
     dependencies=[Depends(require_scope(Scope.READ))],
     tags=["network/devices"],
 )
@@ -100,10 +105,8 @@ async def get_device(
                 controller.id,
                 "network",
                 "device_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             device = await mgr.get_device_details(mac)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -111,7 +114,9 @@ async def get_device(
         raise HTTPException(status_code=404, detail="device not found")
 
     type_class = request.app.state.type_registry.lookup("network", "devices/{mac}")
-    data = type_class.from_manager_output(device).to_dict()
+    data = type_class.from_manager_output(
+        device, redact_sensitive=request.app.state.config.policy.response.redact_sensitive_fields
+    ).to_dict()
     hint = type_class.render_hint("detail")
     return {"data": data, "render_hint": hint}
 
@@ -137,10 +142,8 @@ async def get_device_radio(
                 controller.id,
                 "network",
                 "device_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             radio = await mgr.get_device_radio(mac)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -185,10 +188,8 @@ async def get_pdu_outlets(
                 controller.id,
                 "network",
                 "device_manager",
+                site=site_id,
             )
-            cm = await factory.get_connection_manager(session, controller.id, "network")
-            if cm.site != site_id:
-                await cm.set_site(site_id)
             outlets = await mgr.get_pdu_outlets(mac)
     except UniFiNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

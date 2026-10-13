@@ -1,5 +1,9 @@
 # Troubleshooting
 
+## Generate a reviewed support bundle first
+
+If the server starts, run `access_get_support_bundle(probe="summary")` and review the JSON locally before sharing it. Use `probe="connectivity"` only after agreeing to one bounded read-only controller request. See the canonical [support bundle guide](../../../docs/support-bundles.md) for the privacy boundary, direct and marketplace flows, and pre-start fallback. Ordinary `UNIFI_MCP_DIAGNOSTICS` logs are not automatically safe to post publicly.
+
 ## Connection Issues
 
 ### Cannot connect to controller
@@ -36,9 +40,9 @@
 
 **Symptoms:** Some tools work but others return "proxy session required" errors.
 
-**Explanation:** Most mutating tools (lock/unlock, credential management, policies, visitors) require the local proxy session (port 443 with username/password). If only the API key is configured, these tools will be unavailable.
+**Explanation:** Credential management, policies, and other proxy-backed mutations require the local session (port 443 with username/password). Visitor operations are different: list/get/create/delete use the Access Developer API and require `UNIFI_ACCESS_API_KEY` on port 12445.
 
-**Fix:** Ensure both `UNIFI_ACCESS_USERNAME`/`UNIFI_ACCESS_PASSWORD` and `UNIFI_ACCESS_API_KEY` are set for full functionality.
+**Fix:** Configure both `UNIFI_ACCESS_USERNAME`/`UNIFI_ACCESS_PASSWORD` and `UNIFI_ACCESS_API_KEY` for full functionality. For visitor-only failures, verify the Access API token and port 12445 first.
 
 ### "Access application not found" errors
 
@@ -67,26 +71,45 @@ This is the default, so this error typically only occurs if you explicitly set i
 
 ### Tool not appearing in client tool list
 
-**Cause:** The tool's permission is disabled. All Access mutation tools are disabled by default.
+Policy gates do not hide tools. In `lazy` mode, domain tools are discovered
+through `access_tool_index` and called through `access_execute`; they are not all
+registered directly with the client at startup. In `meta_only` mode, the index
+initially contains only meta-tools, and `access_execute` can run a domain tool
+when its name is already known. That execution lazily registers the tool's
+module, so later client lists and index results can include its domain tools.
 
 **Fix:**
-1. Check [permissions.md](permissions.md) for the relevant category
-2. Enable via environment variable:
-   ```bash
-   export UNIFI_PERMISSIONS_<CATEGORY>_<ACTION>=true
-   ```
-3. Restart the server
-
-**Example:** If `access_unlock_door` is missing:
-```bash
-export UNIFI_PERMISSIONS_DOORS_UPDATE=true
-```
+1. Use the default `lazy` mode with `access_tool_index` for discovery
+2. Use `access_execute` to call the tool, or set `UNIFI_TOOL_REGISTRATION_MODE=eager` to register all tools directly
+3. In `eager` mode, check whether `UNIFI_ENABLED_CATEGORIES` or `UNIFI_ENABLED_TOOLS` is limiting registration
 
 ### Tool returns "permission denied" via access_execute
 
-**Cause:** In lazy/meta_only mode, `access_tool_index` shows all tools (from the static manifest), but disabled tools return permission errors when called.
+**Cause:** A policy gate is denying the action at call time. Policy checks run
+before preview/confirmation, so `confirm=true` does not bypass a denied policy.
 
-**Fix:** Same as above -- enable the permission and restart.
+**Fix:** Check [permissions.md](permissions.md) for the relevant category, set the
+current policy variable named in the error, and restart the server.
+
+**Example:** To allow Access door updates:
+```bash
+export UNIFI_POLICY_ACCESS_DOORS_UPDATE=true
+```
+
+### Policy variable set but the action is still denied
+
+**Cause:** The variable name does not match a gate this server registers, so it
+is never read. Category names in `UNIFI_POLICY_ACCESS_<CATEGORY>_<ACTION>`
+are the config keys listed in [permissions.md](permissions.md), which differ from
+the `permission_category` shorthand in `tools_manifest.json`.
+
+**Fix:** At startup the server logs every unrecognized `UNIFI_POLICY_*` variable
+with the closest valid names:
+```
+[policy] Unrecognized env var UNIFI_POLICY_ACCESS_DOOR_UPDATE: no gate in the access tool manifest matches it. Did you mean UNIFI_POLICY_ACCESS_DOORS_UPDATE, ...?
+```
+Rename the variable to the suggested name and restart the server. The same applies
+in the deny direction: a misnamed variable set to `false` blocks nothing.
 
 ### No tools visible at all
 
@@ -143,7 +166,7 @@ docker run -i --rm \
   -e UNIFI_ACCESS_USERNAME=admin \
   -e UNIFI_ACCESS_PASSWORD=your-password \
   -e UNIFI_ACCESS_API_KEY=your-api-key \
-  -e UNIFI_PERMISSIONS_DOORS_UPDATE=true \
+  -e UNIFI_POLICY_ACCESS_DOORS_UPDATE=true \
   ghcr.io/sirkirby/unifi-access-mcp:latest
 ```
 

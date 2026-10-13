@@ -21,7 +21,7 @@ allowed-tools: Read, Edit, Write, Bash, Grep, Glob
 `scripts/live_smoke.py` is the manifest-driven live hardware test harness. It validates API
 contracts that mock-based CI (unit tests, golden fixtures) structurally cannot catch — auth
 token expiry, payload normalization, API version mismatches, and hardware-specific field
-assumptions. Phase 2 live smoke runs caught 3 critical bugs before merge. Run live smoke
+assumptions. Live smoke runs caught multiple critical bugs before merge. Run live smoke
 before every major merge that touches API-facing code.
 
 ## Prerequisites
@@ -58,6 +58,36 @@ Before any live run, ensure:
 4. **Branch context** — the harness lives in `scripts/live_smoke.py` on the main branch.
    When branching or bisecting, confirm you have the current harness code before running.
 
+5. **Git worktree `.env` placement** — `scripts/live_smoke.py` derives its repo root from
+   its own file location (`Path(__file__).resolve().parents[1]`) and loads `.env` from that
+   root. In a git worktree the root resolves to the worktree directory, NOT the main
+   checkout. Copy or symlink your credentials file from the main checkout into the worktree
+   root before running:
+   ```bash
+   ln -s /path/to/main-checkout/.env /path/to/worktree/.env
+   ```
+   Omitting this causes silent credential-not-found failures with no warning.
+
+6. **Use `uv run`, not system python3** — the repo's dependencies are managed by uv and are
+   not installed in the system Python environment. Always invoke the harness via:
+   ```bash
+   uv run python scripts/live_smoke.py --server network --phase safe
+   ```
+   Running with bare `python3` will fail with import errors for `aiounifi`, `dotenv`, and
+   other dependencies not available outside the uv-managed virtual environment.
+
+7. **Invoke `uv run` from the workspace root with `--all-packages` in the monorepo.** Running
+   `uv run python scripts/live_smoke.py` from a package subdirectory (or without
+   `--all-packages`) can fail with `ModuleNotFoundError: mcp` because the workspace's shared
+   dependency isn't resolved into that package's isolated env. Run from the repo root:
+   ```bash
+   uv run --all-packages python scripts/live_smoke.py --server network --phase safe
+   ```
+   **`mcp` can also silently vanish from the root `.venv` after `make pre-commit`, `uv lock`,
+   or bare `uv sync`** — any of these run without `--all-packages` and re-resolve the root env
+   without the workspace-shared dependency. If a previously-working smoke run suddenly hits
+   `ModuleNotFoundError: mcp`, re-run `uv sync --all-packages` before assuming a code regression.
+
 ## Procedure 0: PRE-MERGE BLOCKING GATE — API Response Parsing Changes
 
 **Trigger Criteria — Live Smoke is Mandatory Before Merge:**
@@ -79,15 +109,20 @@ before the PR can be merged:
 **Why this is a blocking gate:** Mock-based CI uses golden fixtures (static JSON files) that
 cannot evolve with real hardware firmware updates. Changes to response parsing are invisible
 to unit tests — they pass against the fixed fixture forever, but fail against real hardware
-running a different API version. The 2026-05-17 Access proxy incident (#283) exemplifies
-this: unit tests passed; live hardware returned auth-wrapped-in-200 errors invisible to mocks.
+running a different API version. The Access proxy incident exemplifies this: unit tests passed;
+live hardware returned auth-wrapped-in-200 errors invisible to mocks.
+
+**Ship doctrine — verify the changed code path, not an adjacent green path:** Smoke evidence
+only counts if it exercises the specific code modified by the PR. If your PR touches the
+alarm manager, a passing run that exercises only the client manager is not evidence. Identify
+the tools that invoke the changed code and name them explicitly in the PR smoke evidence block.
 
 **Execution:**
 
 ```bash
 # For the affected domain(s) (e.g., network, protect, access):
-python scripts/live_smoke.py --server <domain> --phase readonly
-python scripts/live_smoke.py --server <domain> --phase safe
+uv run python scripts/live_smoke.py --server <domain> --phase readonly
+uv run python scripts/live_smoke.py --server <domain> --phase safe
 # Both must exit status 0 with no failed/exception records in artifacts
 ```
 
@@ -128,22 +163,22 @@ phases. Always start at the safest phase and advance only after the prior phase 
 
 ```bash
 # Safest run — readonly + preview + safe lifecycles (default phase is "safe")
-python scripts/live_smoke.py --server network --phase safe
+uv run python scripts/live_smoke.py --server network --phase safe
 
 # Read-only tools only (narrowest scope)
-python scripts/live_smoke.py --server network --phase readonly
+uv run python scripts/live_smoke.py --server network --phase readonly
 
 # Preview phase — all mutating tools called with confirm=False
-python scripts/live_smoke.py --server protect --phase preview
+uv run python scripts/live_smoke.py --server protect --phase preview
 
 # Approved operations — runs all safe lifecycles plus explicitly approved mutations
-python scripts/live_smoke.py --server network --phase approved
+uv run python scripts/live_smoke.py --server network --phase approved
 
 # Run all servers at once (requires full .env with Access and Protect creds)
-python scripts/live_smoke.py --server all --phase safe
+uv run python scripts/live_smoke.py --server all --phase safe
 
 # Inventory — prints safety_tier classification for every tool; no live calls
-python scripts/live_smoke.py --server network --phase inventory
+uv run python scripts/live_smoke.py --server network --phase inventory
 ```
 
 **Phase progression guidance:**
@@ -152,8 +187,8 @@ python scripts/live_smoke.py --server network --phase inventory
 - Advance to `--phase approved` only after `safe` passes cleanly.
 - Never skip directly to `approved` on a first run against a new tool or new hardware.
 - Use `--phase inventory` to audit tier assignments without making any live calls.
-- Phase scope has expanded over the project lifecycle: Phase 1 was intentionally narrow
-  (deployment/auth only, no controller-touching); Phase 2 added full Protect physical actions
+- Phase scope has expanded over the project lifecycle: earlier phases were intentionally narrow
+  (deployment/auth only, no controller-touching); later phases added full Protect physical actions
   and Access lock/unlock patterns. Expect further expansion for each new REST endpoint domain.
 
 **Expected output:** The harness streams per-tool status to stdout. A passing run exits with
@@ -174,7 +209,7 @@ per-server artifact file in `live-smoke-results/`.
 
 ```bash
 # After reviewing Stage 1 preview output, if all looks correct:
-python scripts/live_smoke.py --server network --phase approved
+uv run python scripts/live_smoke.py --server network --phase approved
 ```
 
 The `approved` phase runs explicitly coded lifecycle methods (e.g.,
@@ -189,6 +224,27 @@ create+delete pairs with `confirm=True`.
   Investigate the tool's argument construction before proceeding to `approved`.
 - Safe-lifecycle runs should leave zero net hardware changes. After an `approved` run,
   verify the controller UI shows no orphaned test resources.
+
+**Disposable resource rule for destructive operations:** When a lifecycle method exercises
+destructive operations (archive, bulk-delete, format), always target a disposable resource
+created specifically for that run (e.g., a DNS record named `smoke-test-<timestamp>`). Never
+run destructive smoke against a production resource. If a dedicated test resource cannot be
+guaranteed (e.g., hardware-bound resources like camera channels), add the tool to
+`RISKY_OPERATION_NAMES` to exclude it from automated phases and require explicit human approval.
+
+**Pre-existing infrastructure guard (distinct from the disposable-resource rule above):** the
+`safe` phase can mutate settings on pre-existing, non-disposable infrastructure — e.g. a
+gateway's `broadcast_ping` setting — in addition to resources the run itself created. The
+disposable-resource rule only covers destructive ops on run-created resources; it does not
+cover safe-phase writes to settings on hardware that already existed before the run. Safe-phase
+lifecycle methods must reject writes to any resource ID not created by the run itself — verify
+the target ID against the run's own `created_resources` list before mutating.
+
+**VLAN reserved-range bug:** the disposable-network VLAN picker used for approved-phase
+lifecycle testing selected a controller-reserved VLAN (>=4010), causing the lifecycle create to
+fail against real hardware even though the harness logic was correct. Fix: bound the VLAN scan
+range strictly below 4000 when generating disposable test VLANs — controllers reserve the
+upper range internally and will reject or silently reassign IDs at/above 4010.
 
 ## Procedure D: Interpret Artifacts in `live-smoke-results/`
 
@@ -233,6 +289,14 @@ example, an Access proxy returning HTTP 200 with an auth-failure body: `status` 
 but `success` is `false` or `summary` contains no usable data. Always inspect `summary`
 content and `pending_approval`, not just the overall status counts.
 
+**`live-smoke-results/*.json` stores only per-tool summaries, not full response payloads —
+a `status: "ok"` run proves nothing when a PR changes which fields get populated.** The
+artifact's `summary` field is a truncated/derived view, not the raw API response, so it
+cannot confirm that a specific field was newly populated or correctly filtered. To verify
+response-shape changes, run an in-process one-shot probe script that prints the raw payload,
+and diff it against the same probe run on `git checkout origin/main` for a before/after
+comparison — the smoke artifact alone is not sufficient evidence for field-level changes.
+
 **Confirmed API contract failure patterns** (discovered through live testing; mocks did not
 catch any of these):
 
@@ -255,7 +319,7 @@ the harness as follows:
 
 1. **Run inventory to see current classification:**
    ```bash
-   python scripts/live_smoke.py --server network --phase inventory | grep unifi_new_thing
+   uv run python scripts/live_smoke.py --server network --phase inventory | grep unifi_new_thing
    ```
    Confirm `safety_tier` matches your intent. Classification is driven automatically by
    manifest annotations — check the tool's `ToolAnnotations` in the tool module.
@@ -267,17 +331,29 @@ the harness as follows:
 3. **If the tool has a `confirm` param (preview/lifecycle):** The harness auto-includes it
    in `preview` phase with `confirm=False`. For safe lifecycle testing (create+delete pair),
    add a new lifecycle method to the `LiveSmokeRunner` class in `scripts/live_smoke.py` and
-   call it from `run_lifecycles()` or `run_approved()`:
-   ```python
-   async def lifecycle_network_new_thing(self) -> None:
-       # 1. Create the resource
-       create_rec = await self.call("unifi_create_new_thing", {...}, "lifecycle")
-       if not create_rec.success:
-           return
-       resource_id = ...  # extract from create_rec.summary
-       # 2. Delete it (idempotent cleanup)
-       await self.call("unifi_delete_new_thing", {"id": resource_id, "confirm": True}, "lifecycle")
-   ```
+   call it from `run_lifecycles()` or `run_approved()`.
+
+   **Building preview args from live values:** When constructing `confirm=False` preview args
+   for a new capability tool, reuse the device-inventory cache already seeded by prior
+   read-only list tools in the same run (device/client lists fetched earlier) to source live
+   current values (device IDs, MACs) instead of hardcoding hardware identifiers. Hardcoded IDs
+   go stale as soon as lab hardware changes; cached live values stay valid across runs.
+
+   **Lifecycle completeness checklist — required for every new lifecycle method:**
+   - [ ] Follows create → update → get → delete order (NOT create → delete only)
+   - [ ] The update step asserts field preservation via a subsequent `get` call
+   - [ ] Non-default fields are tested with explicit targeted values (not just defaults)
+   - [ ] The lifecycle method lands in the harness permanently, not a throwaway script
+
+   **Throwaway vs. permanent:** One-off validation scripts (for enum-hint PRs, new optional
+   parameters, or targeted edge-case verification) belong under `scripts/` and must be deleted
+   after verification — they are NOT lifecycle methods and must NOT be committed to the
+   harness permanently. Only full create→update→get→delete lifecycle flows should be
+   added as permanent harness methods.
+
+   The DNS lifecycle (`lifecycle_network_dns`) is the canonical reference implementation:
+   create a record, update one field, get it back to assert the update landed, then delete.
+   WLAN and AP-group lifecycles were extended to follow the same pattern.
 
 4. **If the tool is risky/destructive:** Add it to `RISKY_OPERATION_NAMES` (the set at
    line ~90 in `scripts/live_smoke.py`) or set `destructiveHint=True` on `ToolAnnotations`.
@@ -285,7 +361,7 @@ the harness as follows:
 
 5. **Run read-only phase first, inspect the artifact:**
    ```bash
-   python scripts/live_smoke.py --server network --phase readonly
+   uv run python scripts/live_smoke.py --server network --phase readonly
    cat live-smoke-results/network-*.json | python -m json.tool | grep -A5 unifi_new_thing
    ```
    Confirm `status: "ok"` and `success: true` and that `summary` has the expected shape.
@@ -318,7 +394,7 @@ python scripts/probe_schemas.py
 Probe failures are non-fatal for local development but become CI gates to catch early
 regressions before a full hardware run.
 
-**Image-level Docker smoke** (Phase 3+ requirement):
+**Image-level Docker smoke** (release gate requirement):
 
 The release build pipeline runs image-level smoke tests on generated Docker images before
 they're pushed to GHCR. This tests:
@@ -348,6 +424,24 @@ in developer workflows; the fourth is automated in the release pipeline.
 
 ## Cross-Cutting Gotchas
 
+- **UniFi Network 429 login-lockout — stop on first 429, do not retry through it.** A 429
+  response from the Network controller's login endpoint means the account is rate-limited or
+  locked out. Retrying immediately produces a cascade of misleading "Not-connected" failures
+  across every subsequent tool call in the run, obscuring the real cause. On the first 429,
+  stop the run immediately, wait for the lockout window to clear (do not hot-loop retries),
+  and re-run once — do not interpret the cascading failures as tool bugs.
+
+- **Write-verification standard — mutations report `WriteVerificationResult`
+  separately from `mutation_applied`.** Lifecycle/mutation tool results classify each written
+  field as `persisted`, `dropped`, or `coerced` by comparing the request payload to a
+  follow-up `get`. `mutation_applied` (did the API accept the write) is reported as a
+  distinct field from field-level verification (did each value actually stick) — a write can
+  have `mutation_applied: true` while individual fields show `dropped` or `coerced`. Guest
+  network `purpose` changes are rejected pre-mutation (validated before the write is even
+  attempted). The harness's disabled-VLAN-only lifecycle exercises this verification path;
+  when adding new lifecycle methods for mutating tools, follow the same persisted/dropped/
+  coerced classification instead of only checking `mutation_applied`.
+
 - **Mock + golden fixtures are insufficient by design.** Live smoke is the only mechanism
   that catches auth token expiry, real payload shapes, hardware-specific fields, and API
   version skew. Treat live smoke as a required quality gate, not optional extra validation.
@@ -359,18 +453,80 @@ in developer workflows; the fourth is automated in the release pipeline.
   `api-actions`, `api-resources`, and `api-streams` phases use a different runner and do
   not require `--server`.
 
-- **Phase 2 baseline is 56 passing approved-ops.** This count was established during Phase 2
-  development. A PR that drops the count or introduces new failures requires a documented
-  explanation and fix before merge.
+- **api-actions and api-resources use curated subsets, not auto-discovery.** `API_ACTIONS_SAMPLE`
+  in `scripts/live_smoke.py` is a hardcoded list of 6 tools (network clients/devices, protect
+  cameras/lights, access doors/users). New tools are NOT automatically included in
+  `--phase api-actions` coverage. To add a new tool to the api-actions phase, explicitly
+  append it to `API_ACTIONS_SAMPLE`. Do not assume successful MCP-direct smoke implies
+  api-actions coverage.
+
+- **`--phase safe` exercises default args only — it is a regression detector, not full coverage.**
+  The harness calls every tool with its default argument values. New optional parameters added
+  to existing tools are not exercised by the safe phase. After a PR that adds optional parameters,
+  run a targeted second pass: write a short script under `scripts/` that calls the tool with
+  each new non-default value and asserts on the response shape. Delete after verification.
+
+- **HA/shadow mode transient failures are environment issues, not code bugs.** If live smoke
+  fails with "resource temporarily unavailable," "sync in progress," or similar, verify the
+  HA cluster has stabilized before investigating the tool. Retry after 30–60 seconds. Do not
+  block merge on HA transient failures — note them in the PR with a re-run confirmation.
 
 - **Credential rotation invalidates prior artifacts.** If credentials changed between runs,
   artifacts from prior runs cannot be used as PR evidence. Re-run from scratch.
 
-- **Phase scope expands with each new domain.** Phase 1 deliberately excluded
-  controller-touching endpoints; Phase 2 added them. Phase 3 will require harness expansion
-  for new REST endpoints. Every new tool category must be classified and added — do not
-  assume prior phases cover new domains.
+- **`api-resources` parity check can show a false `MISMATCH` from ID-key preference or the action endpoint's 100-row default.** `_items_id_set()` (in `scripts/live_smoke.py`) walks `("id", "_id", "mac", "uuid")` in order and uses the first key present on each item; if the resource-endpoint item and the matching action-endpoint item expose different first-matching keys, the comparison can pick non-corresponding values for what is actually the same item. Separately, most `parity_args` entries in `API_RESOURCES_SAMPLE` call the action tool with default args, and several list tools default to `limit: 100` — on a site with more than 100 items, `resource_subset_of_action` can go `false` purely from action-side truncation, not a real API contract break. Before treating `parity_mismatches > 0` as a bug, check the site's item count against 100 and confirm which id key populated on each side.
+
+- **Phase scope expands with each new domain.** Each new tool category must be classified and
+  added — do not assume prior phases cover new domains.
 
 - **`tools_manifest.json` is the source of truth for auto-discovery.** Manifest annotation
   correctness (`readOnlyHint`, `destructiveHint`) and harness registration (for lifecycle
   methods) are both required. Wrong annotations silently misclassify tools.
+
+- **`AlarmRulesFacade` fallback silently masks SuperAdmin credential failures.** If the
+  account lacks SuperAdmin on the Protect console, `AlarmManagerPermissionError` is caught by
+  `AlarmRulesFacade` and it silently falls back to the legacy automations API. The smoke
+  record shows `status: ok` — but the v2 code path was never exercised. The `complete` flag
+  in the MCP `_meta` block distinguishes v2 success (`complete: true`) from legacy fallback
+  (`complete: false`). When smoke-testing alarm rules, inspect the `summary._meta` block and
+  confirm `complete: true`; a passing run with `complete: false` means v2 was never reached.
+
+- **HTTP 404 from Access API-key endpoints confirms auth is working.** When using
+  API-key-authenticated Access endpoints, a 404 on a valid-format resource path means the
+  key was accepted but the resource doesn't exist — this is a green credential signal. A
+  401/403 means the key was rejected. Use this to validate Access API key configuration:
+  deliberately query a known-missing resource ID and expect 404, not 401.
+
+- **HTTP 401 on the uiprotect bootstrap/WebSocket path during Protect smoke is expected and benign.**
+  The uiprotect library opens a WebSocket channel for real-time events using a cookie-based
+  auth path that the MCP API key does not cover. A 401 on that WebSocket/bootstrap path does
+  not indicate a problem with the REST API key — the REST path used by all MCP tool calls
+  is healthy. When you see a 401 in Protect smoke output, check whether it's on the
+  WebSocket bootstrap path before treating it as a real auth failure.
+
+- **`access_get_activity_summary` CODE_SYSTEM_ERROR -3 on the Access activities histogram endpoint is a pre-existing controller issue, not a code bug.**
+  This error reproduces consistently across branches and controller firmware versions on
+  affected controllers. It is a known upstream Access controller issue unrelated to MCP
+  code changes. When this error appears in smoke results, treat it as an
+  environment/controller issue: note it in the PR, re-run on a different controller if
+  available, and do not block merge solely on this error.
+
+- **macOS local-network privacy gate — Homebrew Python/uv gets `[Errno 65] No route to host` on RFC1918 addresses.** macOS 15/26.x enforces a per-binary local-network entitlement. Homebrew Python, uv, and other ad-hoc-signed (non-Apple-signed) binaries are denied LAN access by the system firewall even when macOS Privacy & Security shows them as approved — the entitlement check is per binary and resets on Homebrew upgrades. Symptoms: `[Errno 65] No route to host` for any 192.168.x.x / 10.x.x.x connection while `ping` succeeds. **Workaround:** run the smoke harness inside Docker (`docker run --rm ...`) where the container inherits the LAN entitlement from Docker Desktop. Per-binary macOS approval is also possible but resets on the next `brew upgrade`.
+
+- **`UNIFI_NETWORK_HOST` vs `UNIFI_HOST` — `--server all` MCP-direct runs use `UNIFI_HOST` for the Network controller.** These are distinct variables operating at different layers. MCP-direct smoke (`--server all`) bootstraps the Network server using `UNIFI_HOST`, not `UNIFI_NETWORK_HOST`. The API bootstrap path used by REST API phases uses `UNIFI_NETWORK_HOST` when set. If `UNIFI_NETWORK_HOST` is correct but `UNIFI_HOST` is wrong or absent, `--server all` MCP-direct runs connect to the wrong controller (or fail silently) while `--phase api-actions` and `--phase api-resources` continue working. Always verify both variables when debugging unexpected `--server all` connection behavior.
+
+- **Enum-hint PRs require explicit non-default MCP tool calls — `--phase safe` alone is insufficient evidence.** The default `--phase safe` run exercises every tool with its default argument values only. A PR that modifies enum hints or filter descriptions on tool arguments is never exercised by the harness defaults — the modified annotation paths are simply not invoked. Required evidence: make an explicit targeted call (e.g., via Docker Compose MCP or a short probe script) that passes the newly-documented enum value and confirms the correct filtered response. `--phase safe` output is necessary background but not sufficient smoke evidence for enum-hint changes.
+
+- **Nonzero harness exit from a pre-existing unrelated tool failure — document and proceed.** A live smoke run may exit nonzero because a tool unrelated to the PR's changes fails (e.g., a known upstream controller issue or pre-existing API regression). This is NOT a merge blocker for the PR's code path. Required steps: (a) identify the failing tool and confirm it fails identically on `main` independent of the PR; (b) confirm all tools in the PR's exercised code path show `status: ok` in the artifact; (c) document the pre-existing failure with the tool name and error message in the PR description. Never treat every nonzero harness exit as a merge block — only failures in the PR's exercised code path are blocking.
+
+- **Mutation-widening PRs require safe-apply/revert smoke OR documented `confirm=false` preview.** When a PR widens a mutation tool's accepted parameters (e.g., adding updateable fields to `unifi_update_traffic_route`), unit tests alone are insufficient — mocks cannot catch API-side field rejection or payload normalization failures. Required: either (a) a live smoke run that applies the mutation with `confirm=True` against a disposable resource, asserts the result, and reverts idempotently (net-zero), OR (b) documented deferral: run with `confirm=False` preview and embed the returned preview payload showing the would-be request shape in the PR evidence block. Omitting both for mutation-widening PRs is a merge blocker.
+
+- **`Bootstrap.doorlocks` may be absent in newer uiprotect versions — access via `getattr` fallback only.** The `doorlocks` attribute was removed from the uiprotect `Bootstrap` dataclass in a library upgrade. Direct attribute access (`bootstrap.doorlocks`) raises `AttributeError` at runtime on affected versions with no deprecation warning. Fix: replace all `bootstrap.doorlocks` accesses with `getattr(bootstrap, "doorlocks", [])`. Live smoke against a controller running an upgraded uiprotect surfaces this as an `exception` status in Protect smoke records; mock-based unit tests and golden fixtures cannot catch it.
+
+- **Singleton config resources use an apply → verify → revert lifecycle, not create → delete.** Some device/config tools have no create or delete counterpart — they mutate one existing singleton resource. For these, model the lifecycle method as: read current state, apply the new value, verify via a follow-up `get`, then revert to the original captured value. Do not force a create/delete pair onto singleton-shaped tools.
+
+- **`access_update_device_config` has no `confirm`/preview argument — it does not get the Stage 1 preview safety net.** Because the harness's preview gate only applies to tools with a `confirm` param, this tool is not automatically protected by Procedure C. Treat it as `mutating_requires_review`: verify its classification manually and require explicit human review of arguments before any live call, since there is no preview payload to inspect first.
+
+- **Lab hardware strategy: production controllers are discovery/read-only only — mutation testing uses a dedicated Gateway Ultra.** Never run `safe`/`approved`-phase mutations against a production controller. Point mutation-phase runs at a dedicated lab Gateway Ultra (or equivalent disposable hardware) reserved for this purpose; reserve production hardware for `readonly`/`inventory` discovery passes only.
+
+- **`--server all` is unsafe as evidence that an installed wheel (not repo source) is under test.** `--server all` invokes `uv run --package` per app, which resolves the repo workspace and can silently substitute the published wheel with local source. To verify a published-package version is actually what's running, invoke `--server network` / `--server protect` / `--server access` separately using the isolated env's Python, and assert both `importlib.metadata.version(...)` and the module's `__file__` path resolve under `site-packages` (not the repo checkout). Also run `uv pip install --refresh` first — a freshly published PyPI version can be absent from cached index metadata, so a stale cache silently keeps resolving the prior version.

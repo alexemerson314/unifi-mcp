@@ -23,15 +23,23 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from unifi_core.auth import UniFiAuth
 from unifi_mcp_shared.metadata import PROJECT_WEBSITE_URL, configure_mcp_server_metadata
-from unifi_mcp_shared.strict_dispatch import StrictKwargFastMCP
-from unifi_protect_mcp.bootstrap import load_config, logger
+from unifi_mcp_shared.response_policy import resolve_mcp_content_mode, should_redact_response_sensitive_fields
+from unifi_mcp_shared.server import UniFiMCPServer, resolve_allowed_hosts
+from unifi_mcp_shared.support_bundle import (
+    SupportBundleService,
+    configured_filter,
+    configured_transports,
+    fixed_manifest_reader,
+)
+from unifi_protect_mcp.bootstrap import UNIFI_TOOL_REGISTRATION_MODE, load_config, logger
+from unifi_protect_mcp.support import ProtectSupportBundleAdapter
 
 _TOOLS_MANIFEST_PATH = Path(__file__).resolve().parent / "tools_manifest.json"
+from unifi_core.protect.managers.alarm_facade import AlarmRulesFacade
 from unifi_core.protect.managers.alarm_manager import AlarmManager
 from unifi_core.protect.managers.camera_manager import CameraManager
 from unifi_core.protect.managers.chime_manager import ChimeManager
@@ -89,12 +97,19 @@ def _create_permissioned_tool_wrapper(original_tool_decorator):
 
 
 @lru_cache
-def get_server() -> FastMCP:
+def get_server() -> UniFiMCPServer:
     """Create the FastMCP server instance exactly once."""
-    # Parse allowed hosts from environment variable for reverse proxy support
-    # Default to localhost only for backwards compatibility
-    allowed_hosts_str = os.getenv("UNIFI_MCP_ALLOWED_HOSTS", "localhost,127.0.0.1")
-    allowed_hosts = [h.strip() for h in allowed_hosts_str.split(",") if h.strip()]
+    # The operator owns the public allowlist. Deployments such as Docker Compose
+    # can add required internal service names without overriding that setting.
+    allowed_hosts = resolve_allowed_hosts(
+        os.getenv("UNIFI_MCP_ALLOWED_HOSTS"),
+        override_hosts=(
+            os.getenv("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE")
+            if os.getenv("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE_SET") == "true"
+            else None
+        ),
+        internal_hosts=os.getenv("UNIFI_MCP_INTERNAL_ALLOWED_HOSTS"),
+    )
 
     # Allow disabling DNS rebinding protection entirely (default: enabled)
     # Set to "false" for Kubernetes/proxy deployments where allowed_hosts is insufficient
@@ -110,12 +125,13 @@ def get_server() -> FastMCP:
         "Configuring FastMCP with allowed_hosts: %s, dns_rebinding_protection: %s", allowed_hosts, enable_dns_rebinding
     )
 
-    server = StrictKwargFastMCP(
+    server = UniFiMCPServer(
         name="unifi-protect-mcp",
         debug=True,
         website_url=PROJECT_WEBSITE_URL,
         transport_security=transport_security,
         tools_manifest_path=_TOOLS_MANIFEST_PATH,
+        mcp_content_mode=resolve_mcp_content_mode("protect", config=get_config()),
     )
     configure_mcp_server_metadata(server, package_name="unifi-protect-mcp", icon_family="protect")
 
@@ -217,9 +233,37 @@ def get_alarm_manager() -> AlarmManager:
 
 
 @lru_cache
+def get_alarm_facade() -> AlarmRulesFacade:
+    return AlarmRulesFacade.from_connection(get_connection_manager())
+
+
+@lru_cache
 def get_tool_registry() -> dict[str, Any]:
     """Return the global tool registry for runtime access."""
     return TOOL_REGISTRY
+
+
+@lru_cache
+def get_support_bundle_adapter() -> ProtectSupportBundleAdapter:
+    """Create the Protect adapter over existing safe runtime singletons."""
+    return ProtectSupportBundleAdapter(get_connection_manager())
+
+
+@lru_cache
+def get_support_bundle_service() -> SupportBundleService:
+    """Create the process-wide Protect support-bundle service."""
+    cfg = get_config()
+    return SupportBundleService(
+        adapter=get_support_bundle_adapter(),
+        registration_mode=UNIFI_TOOL_REGISTRATION_MODE,
+        content_mode=resolve_mcp_content_mode("protect", config=cfg),
+        transports=configured_transports(cfg.server),
+        diagnostics_enabled=str(cfg.server.diagnostics.get("enabled", False)).lower() in {"true", "1", "yes"},
+        response_redaction_enabled=should_redact_response_sensitive_fields("protect", cfg),
+        manifest_reader=fixed_manifest_reader(_TOOLS_MANIFEST_PATH),
+        enabled_categories=configured_filter(cfg.server.get("enabled_categories")),
+        enabled_tools=configured_filter(cfg.server.get("enabled_tools")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +287,20 @@ liveview_manager = get_liveview_manager()
 recognition_manager = get_recognition_manager()
 system_manager = get_system_manager()
 alarm_manager = get_alarm_manager()
+alarm_facade = get_alarm_facade()
 tool_registry = get_tool_registry()
+support_bundle_adapter = get_support_bundle_adapter()
+support_bundle_service = get_support_bundle_service()
+
+
+def should_redact_sensitive_fields() -> bool:
+    """Whether Protect MCP responses should redact sensitive fields.
+
+    Policy-resolved per call (env → config) so the surface-specific and global
+    ``UNIFI_*REDACT_SENSITIVE_FIELDS`` overrides both take effect. Binds the
+    ``"protect"`` prefix + config in one place for the tool modules.
+    """
+    return should_redact_response_sensitive_fields("protect", config)
+
 
 logger.debug("runtime.py: shared singletons initialised")

@@ -8,24 +8,217 @@ import logging
 from typing import Annotated, Any, Dict, Optional
 
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, WithJsonSchema
 
-from unifi_core.confirmation import create_preview, update_preview
+from unifi_core.confirmation import create_preview, delete_preview, update_preview
+from unifi_core.network.models.mdns import mdns_to_controller_update, validate_mdns_service_selection
 from unifi_core.network.models.system import (
     autobackup_to_controller_update,
     backup_from_controller,
+    mgmt_from_controller,
     network_health_from_controller,
     site_settings_from_controller,
     snmp_from_controller,
     snmp_to_controller_update,
     system_info_from_controller,
 )
-from unifi_network_mcp.runtime import server, system_manager
+from unifi_core.network.models.threat_management import (
+    ThreatManagementToolInput,
+    ThreatManagementValidationError,
+    threat_management_input_schema,
+    threat_management_to_controller_update,
+)
+from unifi_core.redaction import redact_sensitive_fields
+from unifi_core.write_verification import format_tool_payload
+from unifi_network_mcp.runtime import server, should_redact_sensitive_fields, system_manager
 
 logger = logging.getLogger(__name__)
 
+
 # Explicitly retrieve and log the server instance to confirm it's being used
 logger.info("System tools module loaded, server instance: %s", server)
+
+
+@server.tool(
+    name="unifi_get_mdns_settings",
+    auth="local_only",
+    description="Get site-wide mDNS service settings and read-only network scope.",
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def get_mdns_settings() -> Dict[str, Any]:
+    try:
+        settings = await system_manager.get_mdns_settings()
+        return redact_sensitive_fields(
+            {"success": True, "site": system_manager._connection.site, "mdns_settings": settings.model_dump()},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
+    except Exception as exc:
+        logger.error("Failed to get mDNS settings: %s", type(exc).__name__)
+        return {"success": False, "error": "Failed to get mDNS settings"}
+
+
+@server.tool(
+    name="unifi_update_mdns_settings",
+    auth="local_only",
+    description=(
+        "Update site-wide mDNS service mode, predefined services, or custom services. "
+        "Pass only the fields you want to change — current values are automatically preserved. "
+        "Each provided service list replaces the entire list. "
+        "Mode 'all' requires both service lists empty; mode 'custom' requires at least one service. "
+        "Network scope (enabled_for and enabled_for_network_ids) is read-only and preserved. "
+        "Changes may affect service discovery. Requires confirmation."
+    ),
+    permission_category="system",
+    permission_action="update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def update_mdns_settings(
+    update_data: Annotated[
+        Dict[str, Any],
+        Field(description="Partial mDNS service settings: mode, predefined_services, custom_services only"),
+    ],
+    confirm: Annotated[bool, Field(description="Apply update when true; preview when false")] = False,
+) -> Dict[str, Any]:
+    try:
+        updates = mdns_to_controller_update(update_data)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    if not confirm:
+        try:
+            current = (await system_manager.get_mdns_settings()).model_dump()
+            try:
+                validate_mdns_service_selection({**current, **updates})
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+            return redact_sensitive_fields(
+                update_preview(
+                    resource_type="mdns_settings",
+                    resource_id=current.get("id") or "mdns",
+                    resource_name="mDNS Settings",
+                    current_state=current,
+                    updates=updates,
+                    warnings=["Changes may affect service discovery; network scope is preserved."],
+                ),
+                redact_sensitive=should_redact_sensitive_fields(),
+            )
+        except Exception as exc:
+            logger.error("Failed to prepare mDNS preview: %s", type(exc).__name__)
+            return {"success": False, "error": "Failed to prepare mDNS settings preview"}
+    try:
+        result = await system_manager.update_mdns_settings(updates)
+        return redact_sensitive_fields(
+            format_tool_payload(
+                result,
+                site=system_manager._connection.site,
+                success_message="mDNS settings updated and verified.",
+            ),
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
+    except Exception as exc:
+        logger.error("Failed to update mDNS settings: %s", type(exc).__name__)
+        return {"success": False, "error": "Failed to update mDNS settings"}
+
+
+@server.tool(
+    name="unifi_update_threat_management_settings",
+    input_schema=threat_management_input_schema(ThreatManagementToolInput),
+    auth="local_only",
+    description=(
+        "Update site-wide IPS mode/category selection or traffic identification settings and verify persistence. "
+        "Pass only the fields you want to change — current values are automatically preserved. "
+        "Use separate calls for IPS and traffic identification fields. Category lists replace the full list and "
+        "select manual filtering; codes are validated against the gateway catalog. Disabling IPS also disables "
+        "filtering and clears categories; enabling requires protected networks and nonempty manual categories. "
+        "Network scope is read-only. ipsInline can only be preserved if already in use. Changes may reduce "
+        "inspection or disrupt traffic identification and require confirmation. MCP previews show live before/after "
+        "state; API action previews show submitted arguments only."
+    ),
+    permission_category="system",
+    permission_action="update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def update_threat_management_settings(
+    update_data: Annotated[Dict[str, Any], WithJsonSchema(threat_management_input_schema())],
+    confirm: Annotated[bool, Field(description="Apply when true; return a live preview when false")] = False,
+) -> Dict[str, Any]:
+    """Delegate validated preview/apply operations to the shared manager."""
+    try:
+        updates = threat_management_to_controller_update(update_data)
+        if not confirm:
+            prepared = await system_manager.preview_threat_management_settings(updates)
+            result = update_preview(
+                resource_type="threat_management_settings",
+                resource_id=prepared["section"],
+                resource_name="Threat Management Settings",
+                current_state=prepared["current"],
+                updates=prepared["after"],
+                warnings=[
+                    "May reduce threat inspection or traffic identification while the gateway provisions changes."
+                ],
+            )
+        else:
+            result = format_tool_payload(
+                await system_manager.update_threat_management_settings(updates),
+                site=system_manager._connection.site,
+                success_message="Threat management settings updated and verified.",
+            )
+        return redact_sensitive_fields(result, redact_sensitive=should_redact_sensitive_fields())
+    except ThreatManagementValidationError as exc:
+        return {"success": False, "error": f"Failed to update threat management settings: {exc}"}
+    except Exception as exc:
+        logger.error("Failed to update threat management settings: %s", type(exc).__name__)
+        return {
+            "success": False,
+            "error": "Failed to update threat management settings; check Network session and controller compatibility",
+        }
+
+
+@server.tool(
+    name="unifi_get_threat_management_settings",
+    auth="local_only",
+    description="Get site-wide threat management (IDS/IPS) and traffic identification settings. Requires Network session credentials.",
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def get_threat_management_settings() -> Dict[str, Any]:
+    """Get site-wide threat management (IDS/IPS) and traffic identification settings."""
+    try:
+        settings = await system_manager.get_threat_management_settings()
+        return redact_sensitive_fields(
+            {
+                "success": True,
+                "site": system_manager._connection.site,
+                "threat_management_settings": settings.model_dump(),
+            },
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
+    except Exception as exc:
+        logger.error("Failed to get threat management settings: %s", type(exc).__name__)
+        return {"success": False, "error": "Failed to get threat management settings"}
+
+
+@server.tool(
+    name="unifi_get_threat_posture",
+    auth="local_only",
+    description=(
+        "Get CyberSecure threat posture for HOUR, DAY, WEEK, or MONTH, including allowlisted gateway signature status. "
+        "Requires Network session credentials. Counts and timestamps may be unknown (null); timestamps are milliseconds. "
+        "Gateway device IDs are scoped to the legacy Network device family, not public Integration API device UUIDs."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def get_threat_posture(period: str = "DAY") -> Dict[str, Any]:
+    """Read site CyberSecure summary and gateway signature status."""
+    try:
+        posture = await system_manager.get_threat_posture(period=period)
+        return redact_sensitive_fields(
+            {"success": True, "site": system_manager._connection.site, "threat_posture": posture.model_dump()},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
+    except ValueError:
+        return {"success": False, "error": "Failed to get threat posture: period must be HOUR, DAY, WEEK, or MONTH"}
+    except Exception as exc:
+        logger.error("Failed to get threat posture: %s", type(exc).__name__)
+        return {"success": False, "error": "Failed to get threat posture"}
 
 
 @server.tool(
@@ -87,7 +280,8 @@ async def get_network_health() -> Dict[str, Any]:
 
 @server.tool(
     name="unifi_get_site_settings",
-    description="Get current site settings (e.g., country code, timezone, connectivity monitoring).",
+    description="Get current site settings: site identity, regulatory country code, timezone, "
+    "connectivity monitor (enabled, uplink type) and NTP servers.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_site_settings() -> Dict[str, Any]:
@@ -96,49 +290,88 @@ async def get_site_settings() -> Dict[str, Any]:
     try:
         settings = await system_manager.get_site_settings()
         shaped = site_settings_from_controller(settings).model_dump(exclude_none=False)
-        return {
-            "success": True,
-            "site": system_manager._connection.site,
-            "site_settings": shaped,
-        }
+        return redact_sensitive_fields(
+            {"success": True, "site": system_manager._connection.site, "site_settings": shaped},
+            redact_sensitive=should_redact_sensitive_fields(),
+        )
     except Exception as e:
         logger.error("Error getting site settings: %s", e, exc_info=True)
         return {"success": False, "error": f"Failed to get site settings: {e}"}
 
 
+def _error_detail(exc: BaseException) -> str:
+    """What to tell the caller about a failed settings call: the controller's
+    ``api.err.*`` code when it sent one, else the exception class.
+
+    Never the message: the settings document carries secrets (the SNMPv3 and
+    device-SSH passwords) and a controller validation error can quote it.
+    """
+    body = exc.args[0] if exc.args else None
+    meta = body.get("meta") if isinstance(body, dict) else None
+    msg = meta.get("msg") if isinstance(meta, dict) else None
+    if isinstance(msg, str) and msg.startswith("api.err.") and msg.replace(".", "").isalnum():
+        return msg
+    return type(exc).__name__
+
+
 @server.tool(
     name="unifi_get_snmp_settings",
-    description="Get current SNMP settings for the site (enabled state, community string).",
+    description="Get current SNMP settings for the site: v1/v2c enabled state and community string, "
+    "SNMPv3 enabled state and user name. The two services are independent flags on one record. "
+    "The community string and the v3 password are returned by the controller and always shown redacted by this tool.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def get_snmp_settings() -> Dict[str, Any]:
     """Implementation for getting SNMP settings."""
     logger.info("unifi_get_snmp_settings tool called")
+    redact_sensitive = should_redact_sensitive_fields()
     try:
         settings_list = await system_manager.get_settings("snmp")
         shaped = snmp_from_controller(settings_list).model_dump(exclude_none=False)
-        return {
-            "success": True,
-            "site": system_manager._connection.site,
-            "snmp_settings": shaped,
-        }
+        return redact_sensitive_fields(
+            {
+                "success": True,
+                "site": system_manager._connection.site,
+                "snmp_settings": shaped,
+            },
+            redact_sensitive=redact_sensitive,
+        )
     except Exception as e:
-        logger.error("Error getting SNMP settings: %s", e, exc_info=True)
-        return {"success": False, "error": f"Failed to get SNMP settings: {e}"}
+        # The record carries the v3 password; a parse error quotes the input.
+        logger.error("Error getting SNMP settings: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get SNMP settings: {_error_detail(e)}"}
 
 
 @server.tool(
     name="unifi_update_snmp_settings",
-    description="Update SNMP settings for the site (enable/disable, set community string). Requires confirm=true to apply changes.",
+    description="Update SNMP settings for the site: v1/v2c (enabled, community) and SNMPv3 (enabled_v3, username, "
+    "x_password). The two services are independent; disabling one leaves the other listening. "
+    "Pass only the fields you want to change — current values are automatically preserved. "
+    "Requires confirm=true to apply changes.",
     permission_category="snmp",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 async def update_snmp_settings(
-    enabled: Annotated[bool, Field(description="Set to true to enable SNMP on the site, false to disable it")],
+    enabled: Annotated[
+        Optional[bool],
+        Field(description="Enable (true) or disable (false) SNMP v1/v2c. Omit to keep the current value"),
+    ] = None,
     community: Annotated[
         Optional[str],
-        Field(description="SNMP community string (e.g., 'public'). Omit to keep the current value"),
+        Field(description="SNMP v1/v2c community string (e.g., 'public'). Omit to keep the current value"),
+    ] = None,
+    enabled_v3: Annotated[
+        Optional[bool],
+        Field(description="Enable (true) or disable (false) SNMPv3. Omit to keep the current value"),
+    ] = None,
+    username: Annotated[
+        Optional[str],
+        Field(description="SNMPv3 user name. Omit to keep the current value"),
+    ] = None,
+    x_password: Annotated[
+        Optional[str],
+        Field(description="SNMPv3 password. Omit to keep the current value; shown redacted in previews and results"),
     ] = None,
     confirm: Annotated[
         bool,
@@ -147,45 +380,81 @@ async def update_snmp_settings(
 ) -> Dict[str, Any]:
     """Implementation for updating SNMP settings.
 
-    Args:
-        enabled: Whether SNMP should be enabled on the site.
-        community: SNMP community string (optional, keeps current value if not provided).
-        confirm: Must be true to apply changes. When false, returns a preview of proposed changes.
+    Only the fields passed are sent; the controller keeps the rest of the
+    record. Errors are reported by controller error code or exception class,
+    never by message, because the request body carries a secret that a
+    controller validation error can quote.
     """
-    logger.info("unifi_update_snmp_settings tool called (enabled=%s, confirm=%s)", enabled, confirm)
+    logger.info("unifi_update_snmp_settings tool called (confirm=%s)", confirm)
+    redact_sensitive = should_redact_sensitive_fields()
 
-    updates: Dict[str, Any] = {"enabled": enabled}
-    if community is not None:
-        updates["community"] = community
+    # Redaction-marker write-back (e.g. community="***REDACTED***") is rejected
+    # centrally at the MCP dispatch boundary (StrictKwargFastMCP.call_tool).
+    field_values = {
+        "enabled": enabled,
+        "community": community,
+        "enabled_v3": enabled_v3,
+        "username": username,
+        "x_password": x_password,
+    }
+    updates: Dict[str, Any] = {key: value for key, value in field_values.items() if value is not None}
 
     validated_data = snmp_to_controller_update(updates)
     if not validated_data:
         return {"success": False, "error": "No valid fields to update after validation."}
 
     if not confirm:
-        return update_preview(
-            resource_type="snmp_settings",
-            resource_id="snmp",
-            resource_name="SNMP Settings",
-            current_state={},
-            updates=validated_data,
-        )
+        try:
+            settings_list = await system_manager.get_settings("snmp")
+            current = snmp_from_controller(settings_list).model_dump(exclude_none=False)
+            return redact_sensitive_fields(
+                update_preview(
+                    resource_type="snmp_settings",
+                    resource_id="snmp",
+                    resource_name="SNMP Settings",
+                    current_state=current,
+                    updates=updates,
+                ),
+                redact_sensitive=redact_sensitive,
+            )
+        except Exception as e:
+            logger.error("Error preparing SNMP settings preview: %s", type(e).__name__)
+            return {"success": False, "error": f"Failed to prepare SNMP settings preview: {_error_detail(e)}"}
 
     try:
         success = await system_manager.update_settings("snmp", validated_data)
         if success:
-            return {
-                "success": True,
-                "site": system_manager._connection.site,
-                "snmp_settings": {
-                    "enabled": validated_data.get("enabled", enabled),
-                    "community": validated_data.get("community", community or ""),
-                },
-            }
+            return redact_sensitive_fields(
+                {"success": True, "site": system_manager._connection.site, "snmp_settings": updates},
+                redact_sensitive=redact_sensitive,
+            )
         return {"success": False, "error": "Failed to update SNMP settings."}
     except Exception as e:
-        logger.error("Error updating SNMP settings: %s", e, exc_info=True)
-        return {"success": False, "error": f"Failed to update SNMP settings: {e}"}
+        logger.error("Error updating SNMP settings: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to update SNMP settings: {_error_detail(e)}"}
+
+
+@server.tool(
+    name="unifi_get_mgmt_settings",
+    description="Get the site's device management (mgmt) settings, read-only: device SSH state and user name, "
+    "password-auth flag, authorised-key count, whether an SSH password, password hash, management key and API "
+    "token are stored (presence only; values never returned), debug tools, auto-upgrade and its hour.",
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def get_mgmt_settings() -> Dict[str, Any]:
+    """Implementation for getting device management settings.
+
+    ``mgmt_from_controller`` is the allowlist: the shaped record holds no
+    credential, hash or key material, so there is nothing left to redact.
+    """
+    logger.info("unifi_get_mgmt_settings tool called")
+    try:
+        settings_list = await system_manager.get_settings("mgmt")
+        shaped = mgmt_from_controller(settings_list).model_dump(exclude_none=False)
+        return {"success": True, "site": system_manager._connection.site, "mgmt_settings": shaped}
+    except Exception as e:
+        logger.error("Error getting management settings: %s", e, exc_info=True)
+        return {"success": False, "error": f"Failed to get management settings: {e}"}
 
 
 # ---- Backup Management ----
@@ -268,8 +537,9 @@ async def delete_backup(
     """Delete a backup file."""
     logger.info("unifi_delete_backup tool called (filename=%s, confirm=%s)", filename, confirm)
     if not confirm:
-        return create_preview(
+        return delete_preview(
             resource_type="backup",
+            resource_id=filename,
             resource_data={"filename": filename},
             resource_name=filename,
             warnings=["This will permanently delete the backup file."],
@@ -301,8 +571,8 @@ async def get_autobackup_settings() -> Dict[str, Any]:
             "autobackup_settings": settings,
         }
     except Exception as e:
-        logger.error("Error getting auto-backup settings: %s", e, exc_info=True)
-        return {"success": False, "error": f"Failed to get auto-backup settings: {e}"}
+        logger.error("Error getting auto-backup settings: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to get auto-backup settings: {type(e).__name__}"}
 
 
 @server.tool(
@@ -337,11 +607,16 @@ async def update_autobackup_settings(
         return {"success": False, "error": "No valid fields to update after validation."}
 
     if not confirm:
+        try:
+            current = await system_manager.get_autobackup_settings()
+        except Exception as e:
+            logger.error("Error preparing auto-backup settings preview: %s", type(e).__name__)
+            return {"success": False, "error": f"Failed to prepare auto-backup settings preview: {type(e).__name__}"}
         return update_preview(
             resource_type="autobackup_settings",
             resource_id="super_mgmt",
             resource_name="Auto-Backup Settings",
-            current_state={},
+            current_state=current,
             updates=validated_data,
         )
 
@@ -355,5 +630,5 @@ async def update_autobackup_settings(
             }
         return {"success": False, "error": "Failed to update auto-backup settings."}
     except Exception as e:
-        logger.error("Error updating auto-backup settings: %s", e, exc_info=True)
-        return {"success": False, "error": f"Failed to update auto-backup settings: {e}"}
+        logger.error("Error updating auto-backup settings: %s", type(e).__name__)
+        return {"success": False, "error": f"Failed to update auto-backup settings: {type(e).__name__}"}

@@ -30,7 +30,7 @@ class TestAllowedHostsParsing:
 
         # Set up environment with required config vars + test vars
         test_env = {
-            "UNIFI_HOST": "192.168.1.1",
+            "UNIFI_HOST": "192.0.2.1",
             "UNIFI_USERNAME": "admin",
             "UNIFI_PASSWORD": "password",
             **env_vars,
@@ -39,11 +39,16 @@ class TestAllowedHostsParsing:
         # Remove UNIFI_MCP_ALLOWED_HOSTS if set in shell environment
         # (load_dotenv is mocked, so .env won't reload it during import)
         os.environ.pop("UNIFI_MCP_ALLOWED_HOSTS", None)
+        os.environ.pop("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE", None)
+        os.environ.pop("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE_SET", None)
+        os.environ.pop("UNIFI_MCP_INTERNAL_ALLOWED_HOSTS", None)
+        os.environ.pop("UNIFI_MCP_CONTENT_MODE", None)
+        os.environ.pop("UNIFI_NETWORK_MCP_CONTENT_MODE", None)
 
         with (
             patch.dict(os.environ, test_env),
             patch("dotenv.load_dotenv"),  # Prevent .env from being reloaded during import
-            patch("unifi_mcp_shared.strict_dispatch.StrictKwargFastMCP") as mock_fastmcp,
+            patch("unifi_mcp_shared.server.UniFiMCPServer") as mock_fastmcp,
         ):
             try:
                 # Import triggers module-level get_server() call
@@ -58,6 +63,7 @@ class TestAllowedHostsParsing:
                 settings = kwargs.get("transport_security")
 
                 assert settings is not None, "transport_security should be passed to FastMCP"
+                assert kwargs.get("mcp_content_mode") == "adaptive"
                 assert settings.allowed_hosts == expected_hosts, (
                     f"Expected {expected_hosts}, got {settings.allowed_hosts}"
                 )
@@ -104,6 +110,37 @@ class TestAllowedHostsParsing:
         """Test that empty string results in empty allowed hosts list."""
         self._test_get_server_with_env({"UNIFI_MCP_ALLOWED_HOSTS": ""}, [])
 
+    def test_internal_hosts_are_appended_without_duplicates(self):
+        self._test_get_server_with_env(
+            {
+                "UNIFI_MCP_ALLOWED_HOSTS": "localhost,example.com",
+                "UNIFI_MCP_INTERNAL_ALLOWED_HOSTS": "unifi-network-mcp,localhost",
+            },
+            ["localhost", "example.com", "unifi-network-mcp"],
+        )
+
+    def test_compose_override_replaces_env_file_hosts(self):
+        self._test_get_server_with_env(
+            {
+                "UNIFI_MCP_ALLOWED_HOSTS": "env-file.example.com",
+                "UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE": "shell.example.com",
+                "UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE_SET": "true",
+                "UNIFI_MCP_INTERNAL_ALLOWED_HOSTS": "unifi-network-mcp",
+            },
+            ["shell.example.com", "unifi-network-mcp"],
+        )
+
+    def test_explicit_empty_compose_override_clears_env_file_hosts(self):
+        self._test_get_server_with_env(
+            {
+                "UNIFI_MCP_ALLOWED_HOSTS": "env-file.example.com",
+                "UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE": "",
+                "UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE_SET": "true",
+                "UNIFI_MCP_INTERNAL_ALLOWED_HOSTS": "unifi-network-mcp",
+            },
+            ["unifi-network-mcp"],
+        )
+
 
 class TestDnsRebindingProtection:
     """Test UNIFI_MCP_ENABLE_DNS_REBINDING_PROTECTION environment variable."""
@@ -123,7 +160,7 @@ class TestDnsRebindingProtection:
 
         # Set up environment with required config vars + test vars
         test_env = {
-            "UNIFI_HOST": "192.168.1.1",
+            "UNIFI_HOST": "192.0.2.1",
             "UNIFI_USERNAME": "admin",
             "UNIFI_PASSWORD": "password",
             **env_vars,
@@ -131,12 +168,17 @@ class TestDnsRebindingProtection:
 
         # Remove env vars if set in shell environment
         os.environ.pop("UNIFI_MCP_ALLOWED_HOSTS", None)
+        os.environ.pop("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE", None)
+        os.environ.pop("UNIFI_MCP_COMPOSE_ALLOWED_HOSTS_OVERRIDE_SET", None)
+        os.environ.pop("UNIFI_MCP_INTERNAL_ALLOWED_HOSTS", None)
         os.environ.pop("UNIFI_MCP_ENABLE_DNS_REBINDING_PROTECTION", None)
+        os.environ.pop("UNIFI_MCP_CONTENT_MODE", None)
+        os.environ.pop("UNIFI_NETWORK_MCP_CONTENT_MODE", None)
 
         with (
             patch.dict(os.environ, test_env),
             patch("dotenv.load_dotenv"),
-            patch("unifi_mcp_shared.strict_dispatch.StrictKwargFastMCP") as mock_fastmcp,
+            patch("unifi_mcp_shared.server.UniFiMCPServer") as mock_fastmcp,
         ):
             try:
                 from unifi_network_mcp.runtime import get_server  # noqa: F401

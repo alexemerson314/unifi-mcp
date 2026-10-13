@@ -19,8 +19,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from unifi_core.manifest_helpers import get_tool_annotations
-
+from unifi_mcp_shared.manifest_helpers import get_tool_annotations
 from unifi_mcp_shared.meta_tools import register_load_tools, register_meta_tools
 from unifi_mcp_shared.tool_loader import auto_load_tools
 
@@ -28,6 +27,12 @@ from unifi_mcp_shared.tool_loader import auto_load_tools
 class _ManifestLazyLoader:
     async def load_tool(self, tool_name: str) -> bool:
         return False
+
+
+async def _manifest_support_bundle_handler(*, probe: str = "summary", resource: str | None = None) -> dict[str, Any]:
+    """Non-executing build-time handler used only to expose the tool schema."""
+    del probe, resource
+    return {"success": False, "error": "Support bundle collection is unavailable during manifest generation."}
 
 
 def _build_module_map(
@@ -96,6 +101,7 @@ def _generate_manifest(
         start_async_tool=jobs_mod.start_async_tool,
         get_job_status=jobs_mod.get_job_status,
         register_tool=tool_index_mod.register_tool,
+        support_bundle_handler=_manifest_support_bundle_handler,
         prefix=meta_prefix,
         server_label=server_label,
     )
@@ -147,6 +153,7 @@ def _generate_manifest(
         tool_data: dict[str, Any] = {
             "name": meta.name,
             "description": meta.description,
+            "auth_method": meta.auth_method,
             "schema": {"input": meta.input_schema},
         }
         if meta.title:

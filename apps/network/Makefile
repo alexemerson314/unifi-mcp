@@ -30,7 +30,7 @@ help:
 	@echo "  make lint           Run linters"
 	@echo "  make format         Format code"
 	@echo "  make format-fix     Auto-fix lint issues"
-	@echo "  make pre-commit     Format + lint + test"
+	@echo "  make pre-commit     Format + manifests + lint + test"
 	@echo ""
 	@echo "Build & Release:"
 	@echo "  make version        Show current version (from git tags)"
@@ -118,7 +118,7 @@ version:
 build: manifest server-manifest
 	cd ../.. && uv build --package unifi-network-mcp
 
-build-check: clean manifest
+build-check: clean manifest server-manifest
 	@echo "Building and verifying version..."
 	cd ../.. && uv build --package unifi-network-mcp
 	@WHEEL=$$(ls ../../dist/unifi_network_mcp-*.whl | head -1); \
@@ -175,9 +175,9 @@ console-direct:
 	cd ../.. && UNIFI_CONTROLLER_TYPE=direct UNIFI_MCP_LOG_LEVEL=DEBUG UNIFI_TOOL_REGISTRATION_MODE=eager uv run --package unifi-network-mcp python apps/network/devtools/dev_console.py
 
 # Pre-commit / Pre-release
-pre-commit: format lint test
+pre-commit: format manifest server-manifest lint test
 
-pre-release: clean manifest format lint test build-check
+pre-release: clean manifest server-manifest format lint test build-check
 	@echo ""
 	@echo "Release preparation complete!"
 	@echo ""
@@ -216,25 +216,18 @@ info:
 # Permission testing helpers
 run-with-all-permissions:
 	cd ../.. && \
-	UNIFI_PERMISSIONS_NETWORKS_CREATE=true \
-	UNIFI_PERMISSIONS_NETWORKS_UPDATE=true \
-	UNIFI_PERMISSIONS_WLANS_CREATE=true \
-	UNIFI_PERMISSIONS_WLANS_UPDATE=true \
-	UNIFI_PERMISSIONS_DEVICES_CREATE=true \
-	UNIFI_PERMISSIONS_DEVICES_UPDATE=true \
-	UNIFI_PERMISSIONS_CLIENTS_UPDATE=true \
+	UNIFI_POLICY_NETWORK_NETWORKS_CREATE=true \
+	UNIFI_POLICY_NETWORK_NETWORKS_UPDATE=true \
+	UNIFI_POLICY_NETWORK_WLANS_CREATE=true \
+	UNIFI_POLICY_NETWORK_WLANS_UPDATE=true \
+	UNIFI_POLICY_NETWORK_DEVICES_CREATE=true \
+	UNIFI_POLICY_NETWORK_DEVICES_UPDATE=true \
+	UNIFI_POLICY_NETWORK_CLIENTS_UPDATE=true \
 	uv run --package unifi-network-mcp unifi-network-mcp
 
 run-read-only:
 	cd ../.. && \
-	UNIFI_PERMISSIONS_FIREWALL_POLICIES_CREATE=false \
-	UNIFI_PERMISSIONS_FIREWALL_POLICIES_UPDATE=false \
-	UNIFI_PERMISSIONS_TRAFFIC_ROUTES_CREATE=false \
-	UNIFI_PERMISSIONS_TRAFFIC_ROUTES_UPDATE=false \
-	UNIFI_PERMISSIONS_PORT_FORWARDS_CREATE=false \
-	UNIFI_PERMISSIONS_PORT_FORWARDS_UPDATE=false \
-	UNIFI_PERMISSIONS_QOS_RULES_CREATE=false \
-	UNIFI_PERMISSIONS_QOS_RULES_UPDATE=false \
-	UNIFI_PERMISSIONS_VPN_CLIENTS_UPDATE=false \
-	UNIFI_PERMISSIONS_VPN_SERVERS_UPDATE=false \
+	UNIFI_POLICY_NETWORK_CREATE=false \
+	UNIFI_POLICY_NETWORK_UPDATE=false \
+	UNIFI_POLICY_NETWORK_DELETE=false \
 	uv run --package unifi-network-mcp unifi-network-mcp
