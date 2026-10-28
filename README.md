@@ -307,6 +307,8 @@ Each server supports its own prefixed environment variables that take priority o
 
 **Single controller?** Just set the shared `UNIFI_*` variables -- all servers will use them. Server-specific variables are only needed when the servers talk to different controllers or use different credentials.
 
+**Tracing:** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export the MCP SDK's spans over OTLP, one per MCP message, continuing a trace context passed in the request's `_meta`. The Docker images include the exporter; pip and uvx installs need the `otel` extra (for example `unifi-network-mcp[otel]`). Off by default.
+
 For the full configuration reference including permissions, transports, and advanced options, see the [Network server docs](apps/network/docs/configuration.md), [Protect server docs](apps/protect/docs/configuration.md), or [Access server docs](apps/access/docs/configuration.md).
 
 ## Secret redaction

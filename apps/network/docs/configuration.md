@@ -131,6 +131,20 @@ HTTP is disabled by default. The stdio transport is recommended for most use cas
 
 Diagnostics include the tool name or HTTP method, duration, boolean outcome when available, and exception class. They omit arguments, results, controller request/response bodies, paths, and exception messages, even when the legacy payload flags are enabled.
 
+## Tracing
+
+The MCP SDK records a span for every MCP message (`tools/call <tool>` carries `gen_ai.tool.name`) and continues a W3C trace context passed in the request's `_meta`, so a gateway or client that sends one sees the server's spans in its own trace. Setting an OTLP endpoint exports these spans. The Docker image includes the exporter; pip and uvx installs need the `otel` extra (`unifi-network-mcp[otel]`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP collector endpoint; spans are exported only when this or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `http/protobuf`, or `grpc` once `opentelemetry-exporter-otlp-proto-grpc` is installed |
+| `OTEL_SERVICE_NAME` | `unifi-network-mcp` | Service name on exported spans |
+
+The other standard `OTEL_*` variables apply as usual, for example `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_EXPORTER_OTLP_HEADERS`. A span records the MCP method, the tool name, the JSON-RPC request ID and the timing, not tool arguments or results. A call through `unifi_execute` or `unifi_batch`, which the `lazy` and `meta_only` registration modes rely on, carries the meta tool's name, not the name of the tool it runs.
+
+A failed request records its error message in the span status. For `resources/read`, the SDK's message contains the requested resource URI. Tools return their errors as results; if an exception escapes a request handler anyway, the SDK also records its type, message and stack trace on the span.
+
 ## Permissions
 
 Authorization is enforced at call time. All tools remain visible regardless of permission configuration. See [permissions.md](permissions.md) for full details.

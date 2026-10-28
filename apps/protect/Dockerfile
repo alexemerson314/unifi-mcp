@@ -22,7 +22,7 @@ COPY packages/unifi-core/src packages/unifi-core/src
 COPY packages/unifi-mcp-shared/src packages/unifi-mcp-shared/src
 
 # Install all packages using uv sync (respects lockfile for reproducible builds)
-RUN uv sync --frozen --no-dev --package unifi-protect-mcp
+RUN uv sync --frozen --no-dev --package unifi-protect-mcp --extra otel
 
 # Use the venv Python directly
 ENV PATH="/app/.venv/bin:$PATH"

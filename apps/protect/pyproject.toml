@@ -43,6 +43,10 @@ dependencies = [
     "typing-extensions>=4.16.0",
 ]
 
+[project.optional-dependencies]
+# OTLP trace export, enabled by OTEL_EXPORTER_OTLP_ENDPOINT; the container image installs it.
+otel = ["unifi-mcp-shared[otel]"]
+
 [tool.uv.sources]
 unifi-mcp-shared = { workspace = true }
 unifi-core = { workspace = true }

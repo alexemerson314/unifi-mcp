@@ -96,10 +96,12 @@ async def main_async():
     from unifi_mcp_shared.server_lifecycle import apply_log_level, install_asyncio_exception_handler
     from unifi_mcp_shared.setup_required import controller_host_configured, serve_setup_required
     from unifi_mcp_shared.tool_registration import register_tools_for_mode
+    from unifi_mcp_shared.tracing import configure_tracing
     from unifi_mcp_shared.transport import resolve_http_auth_token, resolve_http_config, run_transports
 
     install_asyncio_exception_handler(logger)
     apply_log_level(config, "unifi-access-mcp")
+    configure_tracing("unifi-access-mcp", logger=logger)
     check_deprecated_env_vars("access", logger)
     check_unknown_policy_env_vars("access", logger, policy_gates(), ACCESS_CATEGORY_MAP)
     if not controller_host_configured(config):

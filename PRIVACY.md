@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** 2026-06-12
+**Last updated:** 2026-10-28
 
 ## Summary
 
@@ -50,12 +50,22 @@ If you choose to enable the [cloud relay](packages/unifi-mcp-relay/), your tool 
 - No inbound ports are exposed on your network
 - You can revoke relay access at any time by rotating or deleting your token
 
+### Trace Export (optional)
+
+If you set an OTLP endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`), the MCP servers send trace spans to the collector you configured. Without an endpoint, no spans leave the server process. Retention follows your collector's settings.
+
+- A span records the MCP method, the tool name, the JSON-RPC request ID and the timing, not tool arguments or results.
+- A call through the meta tools (`unifi_execute`, `unifi_batch` and their Protect and Access counterparts), which the `lazy` and `meta_only` registration modes rely on, carries the meta tool's name, not the name of the tool it runs.
+- A failed request records its error message in the span status. For `resources/read`, the SDK's message contains the requested resource URI, so a failed Protect camera snapshot read records the camera ID (`Error creating resource from template protect://cameras/<camera_id>/snapshot`).
+- Tools return their errors as results. If an exception escapes a request handler anyway, the SDK also records its type, message and stack trace on the span.
+
 ## Third-Party Services
 
 | Service | When Used | What It Sees |
 |---------|-----------|-------------|
 | **Your UniFi Controller** | Always | Tool requests (queries, mutations) over your local network |
 | **Cloudflare Workers** | Only if you enable relay mode | Tool calls in transit (encrypted, not stored) |
+| **Your OTLP collector** | Only if you set an OTLP endpoint | Trace spans: MCP method, tool name, request ID, timing, error messages of failed requests |
 | **PyPI** | Only during installation | Standard package download (pip/uv install) |
 | **GitHub** | Only during plugin installation | Plugin source code download |
 
