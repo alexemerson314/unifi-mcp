@@ -66,12 +66,37 @@ def _normalize_transport_security(
     if settings is None:
         return None
 
+    if settings.enable_dns_rebinding_protection:
+        for host in settings.allowed_hosts:
+            if _matches_no_host(host):
+                raise ValueError(
+                    f"UNIFI_MCP_ALLOWED_HOSTS entry {host!r} matches no host: the MCP SDK "
+                    f"has no wildcard, so the check would refuse every request. Name the "
+                    f"hosts your proxy sends, or set "
+                    f"UNIFI_MCP_ENABLE_DNS_REBINDING_PROTECTION=false to turn the Host "
+                    f"check off deliberately."
+                )
+
     allowed_hosts: list[str] = []
     for host in settings.allowed_hosts:
         for value in _normalize_allowed_host(host):
             if value not in allowed_hosts:
                 allowed_hosts.append(value)
     return settings.model_copy(update={"allowed_hosts": allowed_hosts})
+
+
+def _matches_no_host(host: str) -> bool:
+    """Report whether an entry can never match a real Host header.
+
+    The SDK matches an entry either exactly or, for "name:*", as a "name:"
+    prefix; it has no other wildcard. A Host header never contains "*", so any
+    "*" left after dropping a ":*" port suffix ("*", "*.example.com", "mcp.*",
+    "*:8443") makes the entry match only that literal string, as does an empty
+    name.
+    """
+    value = host.strip()
+    base = value[:-2] if value.endswith(":*") else value
+    return "*" in base or not base.strip(":")
 
 
 def _normalize_allowed_host(host: str) -> list[str]:
