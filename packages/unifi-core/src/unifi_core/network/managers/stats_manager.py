@@ -1441,6 +1441,7 @@ class StatsManager:
                 "radio",
                 "essid",
                 "bssid",
+                "ap_mac",
                 "nss",
                 "is_11r",
             ]
