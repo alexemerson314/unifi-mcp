@@ -2,8 +2,8 @@
 
 `unifi_core.incident_evidence` is the one versioned, closed model every incident
 surface uses to say what it observed, where each observation came from, and what
-it could not check. MCP tools, API routes, the relay and the worker consume it;
-none of them define their own evidence semantics.
+it could not check. MCP tools, API routes and the cloud worker consume it, and
+the relay forwards it; none of them define their own evidence semantics.
 
 | Piece | Location |
 |-------|----------|
@@ -321,7 +321,7 @@ valid document, not only for what valid requests collect:
   characters (`{}` when nothing was cut). An ASCII label the request rules
   accept is never cut; one with multi-byte characters is cut past 128 bytes
   (a label of 128 emoji to its first 32), and a document from elsewhere, such
-  as an older relay's, can carry a longer one.
+  as an older server's, can carry a longer one.
 - Request validation bounds the rest (at most 5 cameras, 20 assertions, and
   the label and identifier rules under [Inputs](#inputs)), so only
   records are fitted to what remains.
@@ -453,10 +453,15 @@ The default lazy registration mode lists only meta-tools, and its route to a
 domain tool, `*_execute`, is not read-only, so a client that permits only
 `readOnlyHint: true` tools could reach no controller read. Each app's
 `LAZY_DIRECT_TOOLS` (in `categories.py`) names read-only tools that lazy mode
-registers directly at startup, so they are listed with their own annotations.
-Loading a module registers every tool in it, so startup fails unless every
-tool the module registers is named and read-only. `meta_only` mode still lists
-only meta-tools, and eager mode lists every tool.
+registers directly at startup, so they are listed with their own annotations:
+each product's evidence tool, plus the lookups that tie a camera to a Network
+device by exact identifier, `protect_get_camera` (the camera's MAC) and
+`unifi_get_client_details` (that MAC's uplink, `ap_mac` or `sw_mac` and
+`sw_port`). Only the named tools register: the other tools in their modules are held and
+register when first loaded, so `*_execute` and `*_tool_index` reach them as
+before. Startup fails if a named tool is not read-only or anything else
+registers. `meta_only` mode still lists only meta-tools, and eager mode lists
+every tool.
 
 ## Current product contracts
 
@@ -621,24 +626,94 @@ INCIDENT_EVIDENCE_UPDATE_GOLDEN=1 uv run --package unifi-core pytest \
 Corpus fixtures use only synthetic identifiers: locally administered MACs,
 RFC 5737 documentation IPs and `fixture-` names. A test enforces this.
 
-## Relay and worker migration
+## Relay and worker consumers
 
-The corpus lives in the top-level `tests/fixtures/` directory because both
-Python package tests and the worker's Vitest suite already read shared fixtures
-from there. Each case holds per-source inputs (tool envelopes, raw records, or
-`"adapter": "page"` manager pages) with call arguments, and the normalized
-evidence (`expected`). TypeScript consumers validate `expected` against the
-schema artifact and the checks above, must reproduce it from `input` without
-importing Python, and must reject every case under `invalid/`.
+The cloud worker provides `unifi_location_timeline` when a relay is connected.
+The relay does not register or handle it: it forwards the product evidence
+tools like any other read-only tool, and local product servers serve those
+tools but not the timeline. The timeline returns the same standard success
+envelope as the product tools: `{"success": true, "data": <view or
+IncidentEvidence>}`. It calls each product tool with `detail: "full"`, combines the full documents,
+and returns the combined set's [client view](#client-view) unless its own
+`detail` is `full`; `max_records_returned` and `resume_after` apply to that
+view, which fits the same output budget. A product document from outside
+request validation, such as an older server's with a longer site, has its
+labels cut and marked in the view like any other; a combined set too broad
+for its view is refused with Core's message, and `detail: "full"` still
+returns it. A successful
+transport envelope does not establish complete collection: inspect `overall`,
+`coverage_complete`, each source outcome and `budgets.exhausted`. Total source
+failure returns `overall: "failed"`, never an empty all-clear.
 
-`unifi_core.event_timeline` keeps `NormalizedEvent`, `merge_timelines` and
-`filter_by_area` unchanged for existing callers. `normalized_event_from_record`
-projects timed evidence onto that legacy shape and returns `None` for untimed
-records. A projected list drops coverage and failure state, so callers that
-return it must also return the evidence set's source outcomes. The relay
-location timeline and the worker timeline still use the legacy path. Moving
-them onto this contract means calling `unifi_get_incident_evidence` and
-`protect_get_incident_evidence` for one window, combining the documents with
-`combine_incident_evidence` (or, in TypeScript, the rules under
-[Combining evidence sets](#combining-evidence-sets)), and reporting per-source
-outcomes instead of skipping failed sources.
+The worker forwards `start` and `end` with explicit UTC offsets to
+`unifi_get_incident_evidence` and `protect_get_incident_evidence`. It accepts
+`device_macs`, `camera_ids`, `mappings`, `location_id`, the four `max_*`
+budgets described above, `detail`, `max_records_returned` and `resume_after`,
+under the same bounds as the product tools: a count over its limit is refused
+as such ("at most 5", "at most 20"), apart from a malformed identifier.
+`products` defaults to Network and Protect; requested
+Access collection produces an explicit `unsupported` source. The legacy
+`start_time`/`end_time`, `area_hint` and `event_types` arguments are rejected.
+Use exact identifiers and explicit assertions to select evidence and mappings.
+
+Every source is returned in full, so a call reads at most 7 sources: as many as
+one location produces (Network, a Protect source per camera, at most 5, and
+Access). The worker counts selected locations × requested products, with Protect counted
+once per camera ID, and refuses a call over the limit before any read, naming
+the counts; select one `location_id`, or fewer products or cameras. A failed
+location still contributes its sources, so the limit keeps the view of every
+allowed call within budget.
+
+The worker sends one evidence-tool call to each selected location through its
+relay and validates the
+committed JSON Schema plus all 13 semantic rules before combining. Missing tools,
+disconnected locations, transport failures, error envelopes and malformed
+responses become failed sources within the combined document. Error envelopes
+carry no typed failure, so they are `unavailable`; raw error text is never
+inspected or copied. Failed calls make no queried-window or pagination claim.
+A product document with mismatched window, limits, mappings, product or requested
+location scope becomes `parse_failed`.
+
+Budgets are per product collection at each selected location. Combining sums
+limits and usage, takes the smallest window limit and keeps every exhausted
+kind. An unanswered transport call cannot report controller usage; its synthetic
+source document reports zero observed usage. Those zeros do not imply complete
+coverage. Transport failure sources have distinct deterministic IDs per location.
+Product source IDs remain product-owned: contradictory sets with the same
+source ID fail combination, including across locations. Select `location_id`
+when different controllers return conflicting source IDs; the consumer never
+silently rewrites provenance or merges them.
+
+The TypeScript consumer uses pinned Ajv as a development dependency to generate
+a committed standalone validator for the schema's closed shapes and conditional
+rules. Hand-written checks supply the cross-field semantics JSON Schema cannot
+express. Wrangler bundles the standalone artifact from `worker/src`; the deployed
+Worker needs neither Python nor runtime code generation. Schema-artifact drift
+is checked by `npm --prefix apps/worker/worker run check:evidence-schema`.
+The shared `cases/` expected documents must validate and every `invalid/` case
+must fail at its declared schema or semantic layer.
+
+`tests/fixtures/incident_evidence/combine/` contains Python-generated input/output
+pairs for order independence, deduplication, mapping union, conflicting source
+IDs, exhausted budgets and mixed failures.
+`tests/test_incident_combine_fixtures.py` checks generator drift against Core
+and TypeScript compares canonical JSON with those outputs. TypeScript
+also projects every golden case into the client view and compares canonical
+JSON with the golden views in `views/`:
+
+```bash
+uv run --package unifi-core python tests/fixtures/incident_evidence/generate_combine.py --check
+npm --prefix apps/worker/worker test
+```
+
+Regenerate after an intentional change by omitting `--check`; Python remains the
+reference. Evidence digests serialize numbers using RFC 8785's ECMAScript
+binary64 form: `1.0` and `1` hash identically, and negative zero becomes `0`.
+Core's existing ASCII string escapes, key order and identity type tags are
+preserved. JavaScript uses `JSON.stringify` for these numbers. The numeric
+golden case and combine fixtures cover integral floats, exponent thresholds,
+signed zero and large integers; integers needing exact precision beyond
+binary64 should be represented as strings.
+
+`unifi_core.event_timeline` still provides the legacy projection for other callers. The worker's timeline no longer returns that projection,
+which cannot carry coverage or failure state.

@@ -9,6 +9,10 @@ Three-level hierarchy (most specific wins):
 Permission mode controls mutation handling:
     UNIFI_TOOL_PERMISSION_MODE=confirm|bypass           - global
     UNIFI_<SERVER>_TOOL_PERMISSION_MODE=confirm|bypass  - per-server
+
+Read-only mode denies every non-read action, whatever the policy gates say:
+    UNIFI_READ_ONLY=true|false                          - global
+    UNIFI_<SERVER>_READ_ONLY=true|false                 - per-server
 """
 
 import difflib
@@ -62,11 +66,15 @@ class PolicyGateChecker:
         """Check if an action is allowed by policy gates.
 
         Returns True if allowed, False if denied.
+        Read-only mode denies every non-read action, before any gate is read.
         If no gate is set, the action is allowed.
         Read actions always return True (not gateable).
         """
         if action.lower() == "read":
             return True
+
+        if resolve_read_only(self.server_prefix):
+            return False
 
         for var in self.env_var_names(category, action):
             value = os.environ.get(var)
@@ -91,8 +99,64 @@ class PolicyGateChecker:
 
     def denial_message(self, category: str, action: str) -> str:
         """Build a user-friendly denial message with enable hint."""
+        # check() runs first on every call and has already warned about an
+        # unrecognized read-only value, so this lookup stays silent.
+        if action.lower() != "read" and _read_only_setting(self.server_prefix)[0]:
+            return (
+                f"{action.capitalize()} is disabled for {category}: the {self.server_prefix.lower()} server "
+                "is in read-only mode, which no policy gate overrides."
+            )
         enable_var = self.env_var_names(category, action)[0]
         return f"{action.capitalize()} is disabled by policy for {category}. Set {enable_var}=true to enable."
+
+
+def read_only_env_var_names(server_prefix: str) -> list[str]:
+    """Env vars that turn on read-only mode for a server, most specific first."""
+    return [f"UNIFI_{server_prefix.upper()}_READ_ONLY", "UNIFI_READ_ONLY"]
+
+
+def _read_only_setting(server_prefix: str) -> tuple[bool, str | None]:
+    """Resolve read-only mode without logging.
+
+    Returns the mode and, when an unrecognized value decided it, that
+    variable's name.
+    """
+    for var in read_only_env_var_names(server_prefix):
+        value = os.environ.get(var)
+        if value is None or not value.strip():
+            continue
+        normalized = value.strip().lower()
+        if normalized in _TRUTHY:
+            return True, None
+        if normalized in _FALSY:
+            return False, None
+        return True, var
+    return False, None
+
+
+def resolve_read_only(server_prefix: str) -> bool:
+    """Return True when the server runs in read-only mode.
+
+    Priority: server-specific > global > default (off). An unrecognized value
+    turns read-only mode on: a misspelt attempt to enable it must not leave
+    mutations allowed.
+    """
+    read_only, unrecognized_var = _read_only_setting(server_prefix)
+    if unrecognized_var is not None:
+        logger.warning("[policy] Unrecognized value for %s, treating as read-only", unrecognized_var)
+    return read_only
+
+
+def log_read_only_mode(server_prefix: str, logger) -> bool:
+    """Log at startup that read-only mode is on. Returns whether it is."""
+    if not resolve_read_only(server_prefix):
+        return False
+    logger.info(
+        "[policy] Read-only mode is on for %s: every tool stays listed, but calls to non-read actions are "
+        "denied whatever the UNIFI_POLICY_* gates say.",
+        server_prefix.lower(),
+    )
+    return True
 
 
 def resolve_permission_mode(server_prefix: str) -> str:

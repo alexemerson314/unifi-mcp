@@ -7,11 +7,16 @@ still listening.
 
 Also catches ``SystemExit`` from uvicorn bind failures (e.g. port conflict)
 so that a failed HTTP transport does not kill the stdio connection.
+
+HTTP can optionally require a static bearer token
+(``UNIFI_MCP_HTTP_AUTH_TOKEN``); see :func:`resolve_http_auth_token`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -20,9 +25,16 @@ from unifi_core.config_helpers import parse_config_bool
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 VALID_HTTP_TRANSPORTS = {"streamable-http", "sse"}
 _TRANSPORT_LABELS = {"streamable-http": "Streamable HTTP", "sse": "HTTP SSE"}
+
+# Resolved by bootstrap.resolve_env as UNIFI_<PREFIX>_MCP_HTTP_AUTH_TOKEN, then
+# UNIFI_MCP_HTTP_AUTH_TOKEN, each also accepting the _FILE and _COMMAND spellings.
+HTTP_AUTH_TOKEN_KEY = "mcp_http_auth_token"
+MIN_HTTP_AUTH_TOKEN_LENGTH = 32
+_AUTH_REALM = "unifi-mcp"
 
 
 def resolve_http_config(
@@ -70,6 +82,148 @@ def resolve_http_config(
     return http_enabled, http_transport, host, port
 
 
+def resolve_http_auth_token(*, env_prefix: str, logger: logging.Logger, configured: Any = None) -> str | None:
+    """Resolve the optional bearer token that HTTP callers must present.
+
+    Checks ``UNIFI_<PREFIX>_MCP_HTTP_AUTH_TOKEN`` and then the shared
+    ``UNIFI_MCP_HTTP_AUTH_TOKEN``; both accept the ``_FILE`` and ``_COMMAND``
+    spellings that the controller credentials do. ``configured`` is
+    ``server.http.auth_token`` from ``config.yaml``, used only when no
+    environment spelling is set. Returns ``None`` when no token is configured,
+    which leaves HTTP unauthenticated as before.
+
+    A spelling that is present but empty refuses startup instead of counting as
+    unset: this is an access control, and a secret store that materialises a
+    missing secret as ``""`` must not silently turn authentication off.
+
+    A token shorter than :data:`MIN_HTTP_AUTH_TOKEN_LENGTH` characters, or one
+    holding whitespace or non-printable/non-ASCII characters (which a client
+    cannot send in an ``Authorization`` header), refuses startup rather than
+    serving a token nobody can present or anybody can guess.
+    """
+    from unifi_mcp_shared.bootstrap import EXIT_SECRET_UNRESOLVED, resolve_env
+
+    token = resolve_env(HTTP_AUTH_TOKEN_KEY, env_prefix=env_prefix, logger=logger)
+    if token is None:
+        upper = HTTP_AUTH_TOKEN_KEY.upper()
+        empty = [
+            f"{base}{suffix}"
+            for base in (f"UNIFI_{env_prefix}_{upper}", f"UNIFI_{upper}")
+            for suffix in ("", "_FILE", "_COMMAND")
+            if os.environ.get(f"{base}{suffix}") == ""
+        ]
+        if empty:
+            logger.error(
+                "[credentials] %s is set but empty. Set a token or unset the variable. "
+                "Refusing to start until it is fixed.",
+                " and ".join(empty),
+            )
+            raise SystemExit(EXIT_SECRET_UNRESOLVED)
+        token = str(configured) if configured else None
+    if token is None:
+        return None
+    if not (token.isascii() and token.isprintable()) or any(ch.isspace() for ch in token):
+        logger.error(
+            "[credentials] The HTTP auth token must be printable ASCII with no whitespace. "
+            "Refusing to start until it is fixed."
+        )
+        raise SystemExit(EXIT_SECRET_UNRESOLVED)
+    if len(token) < MIN_HTTP_AUTH_TOKEN_LENGTH:
+        logger.error(
+            "[credentials] The HTTP auth token is %d characters; use at least %d (for example `openssl rand -hex 32`). "
+            "Refusing to start until it is fixed.",
+            len(token),
+            MIN_HTTP_AUTH_TOKEN_LENGTH,
+        )
+        raise SystemExit(EXIT_SECRET_UNRESOLVED)
+    return token
+
+
+class BearerTokenMiddleware:
+    """Reject every HTTP request that does not carry ``Authorization: Bearer <token>``.
+
+    Wraps the whole Starlette app, so it covers every method and path of both
+    transports (``/mcp``, ``/sse``, ``/messages/``). Lifespan events pass through
+    untouched: the Streamable HTTP session manager starts there.
+    """
+
+    def __init__(self, app: ASGIApp, token: str, *, logger: logging.Logger) -> None:
+        self._app = app
+        self._token = token.encode("ascii")
+        self._logger = logger
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self._app(scope, receive, send)
+            return
+        values = [value for name, value in scope.get("headers", []) if name == b"authorization"]
+        if not values:
+            await self._reject(scope, send, error=None)
+            return
+        scheme, _, credentials = values[0].partition(b" ")
+        valid = (
+            len(values) == 1
+            and scheme.lower() == b"bearer"
+            and hmac.compare_digest(credentials.strip(b" "), self._token)
+        )
+        if not valid:
+            await self._reject(scope, send, error="invalid_token")
+            return
+        await self._app(scope, receive, send)
+
+    async def _reject(self, scope: Scope, send: Send, *, error: str | None) -> None:
+        # Fixed text only: never log the presented credential or the peer address.
+        self._logger.warning("Rejected an HTTP request with a missing or invalid bearer token.")
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        challenge = f'Bearer realm="{_AUTH_REALM}"' + (f', error="{error}"' if error else "")
+        body = json.dumps({"error": error or "unauthorized"}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", challenge.encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+async def _serve_authenticated_http(
+    *,
+    server: MCPServer,
+    host: str,
+    port: int,
+    http_transport: str,
+    auth_token: str,
+    logger: logging.Logger,
+) -> None:
+    """Build the SDK's Starlette app, wrap it in bearer auth, and serve it.
+
+    Mirrors ``run_streamable_http_async`` / ``run_sse_async`` with the default
+    paths; the SDK has no hook for an outer middleware short of its OAuth
+    resource-server profile.
+    """
+    import uvicorn
+
+    transport_security = getattr(server, "transport_security", None)
+    if http_transport == "streamable-http":
+        app = server.streamable_http_app(transport_security=transport_security, host=host)
+    else:
+        app = server.sse_app(transport_security=transport_security, host=host)
+    config = uvicorn.Config(
+        BearerTokenMiddleware(app, auth_token, logger=logger),
+        host=host,
+        port=port,
+        log_level=server.settings.log_level.lower(),
+    )
+    await uvicorn.Server(config).serve()
+
+
 async def run_transports(
     *,
     server: MCPServer,
@@ -78,6 +232,7 @@ async def run_transports(
     port: int,
     http_transport: str,
     logger: logging.Logger,
+    auth_token: str | None = None,
 ) -> None:
     """Run stdio (always) and optionally HTTP, with stdio as the primary.
 
@@ -89,6 +244,10 @@ async def run_transports(
 
     ``SystemExit`` raised by uvicorn on port-bind failures is caught inside
     ``run_http`` so it does not propagate.
+
+    When ``auth_token`` is set (see :func:`resolve_http_auth_token`), every HTTP
+    request must carry it as ``Authorization: Bearer <token>``; stdio is
+    unaffected.
     """
 
     async def run_stdio() -> None:
@@ -115,7 +274,17 @@ async def run_transports(
 
             uvicorn.config.LOGGING_CONFIG["handlers"]["access"]["stream"] = "ext://sys.stderr"
 
-            if http_transport == "streamable-http":
+            if auth_token:
+                logger.info("%s requires a bearer token.", transport_label)
+                await _serve_authenticated_http(
+                    server=server,
+                    host=host,
+                    port=port,
+                    http_transport=http_transport,
+                    auth_token=auth_token,
+                    logger=logger,
+                )
+            elif http_transport == "streamable-http":
                 await server.run_streamable_http_async(
                     host=host,
                     port=port,

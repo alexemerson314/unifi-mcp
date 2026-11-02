@@ -104,9 +104,9 @@ alone can reactivate shared credentials. Inherited environment providers must
 also be corrected in the launcher. Never delete a working provider in a separate
 preparatory write.
 
-Claude Code is the exception for a raw password or API key it holds in the
-system keychain: it cannot clear one through `claude plugin configure` or the
-options dialog. Setup therefore refuses, with nothing changed, any change that
+Claude Code 2.1.296 and earlier are the exception for a raw password or API
+key held in the system keychain: they cannot clear one through `claude plugin
+configure` or the options dialog. Setup therefore refuses, with nothing changed, any change that
 would clear it, such as selecting a `_FILE` or `_COMMAND` provider for that
 credential or a null deletion. The message names the variable and the choices:
 keep the saved secret, or run `claude plugin uninstall` and `claude plugin
@@ -114,6 +114,18 @@ install` with the plugin id it names (usually `unifi-access@unifi-plugins`),
 then rerun setup with the provider and the options the message lists.
 Uninstalling clears every option of the plugin, so offer it to the user and
 never run it without their consent.
+
+On a newer or unrecognized Claude Code release, setup clears a keychain
+secret only in a run that changes that one credential: send its patch alone,
+then other settings in a second run. Setup refuses a combined patch with
+nothing changed. It saves and verifies the new options first, then clears the
+secret. If Claude Code keeps the secret, setup removes the credential's
+providers so only the secret remains, and refuses with the same choices. If a
+step of a provider switch fails or is interrupted, the credential still has a
+saved value: rerun setup with the same settings to finish the switch. Until
+then the server refuses to start if two spellings of the credential are set.
+A deletion has no replacement: if its step fails, setup reports that whether
+the secret was cleared is unknown.
 
 Before changing or skipping API-key setup, remove obsolete
 `UNIFI_ACCESS_API_KEY`, `UNIFI_ACCESS_API_KEY_FILE`, and

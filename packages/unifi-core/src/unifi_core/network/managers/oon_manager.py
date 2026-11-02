@@ -27,6 +27,7 @@ from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.mac import normalize_mac
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -216,7 +217,7 @@ class OonManager:
         if not await self._connection.ensure_connected():
             raise ConnectionError("Not connected to controller")
 
-        api_request = ApiRequestV2(method="get", path=f"{OON_PATH_SINGLE}/{policy_id}")
+        api_request = ApiRequestV2(method="get", path=f"{OON_PATH_SINGLE}/{object_id(policy_id, 'OON policy')}")
         try:
             response = await self._connection.request(api_request)
         except Exception:
@@ -317,7 +318,9 @@ class OonManager:
         update_data = normalize_oon_update_payload(update_data, existing)
 
         merged_data = deep_merge(existing, update_data)
-        api_request = ApiRequestV2(method="put", path=f"{OON_PATH_SINGLE}/{policy_id}", data=merged_data)
+        api_request = ApiRequestV2(
+            method="put", path=f"{OON_PATH_SINGLE}/{object_id(policy_id, 'OON policy')}", data=merged_data
+        )
         await self._connection.request(api_request)
         self._invalidate_cache()
         return merged_data
@@ -341,7 +344,9 @@ class OonManager:
         new_state = not policy.get("enabled", False)
         policy["enabled"] = new_state
 
-        api_request = ApiRequestV2(method="put", path=f"{OON_PATH_SINGLE}/{policy_id}", data=policy)
+        api_request = ApiRequestV2(
+            method="put", path=f"{OON_PATH_SINGLE}/{object_id(policy_id, 'OON policy')}", data=policy
+        )
         await self._connection.request(api_request)
         self._invalidate_cache()
         return new_state
@@ -360,7 +365,7 @@ class OonManager:
 
         try:
             # DELETE may return 204 No Content
-            api_request = ApiRequestV2(method="delete", path=f"{OON_PATH_SINGLE}/{policy_id}")
+            api_request = ApiRequestV2(method="delete", path=f"{OON_PATH_SINGLE}/{object_id(policy_id, 'OON policy')}")
             await self._connection.request(api_request)
 
             self._invalidate_cache()

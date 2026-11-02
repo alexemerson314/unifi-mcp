@@ -12,6 +12,7 @@ from aiounifi.models.api import ApiRequest
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -105,7 +106,9 @@ class DynamicDnsManager:
         current = await self.get_dynamic_dns(entry_id)  # raises UniFiNotFoundError on miss
         merged = {**current, **entry_data}
 
-        api_request = ApiRequest(method="put", path=f"/rest/dynamicdns/{entry_id}", data=merged)
+        api_request = ApiRequest(
+            method="put", path=f"/rest/dynamicdns/{object_id(entry_id, 'dynamic DNS entry')}", data=merged
+        )
         await self._connection.request(api_request)
         self._connection._invalidate_cache(f"{CACHE_PREFIX_DDNS}_{self._connection.site}")
         return merged
@@ -119,7 +122,7 @@ class DynamicDnsManager:
         if not await self._connection.ensure_connected():
             raise ConnectionError("Not connected to controller")
 
-        api_request = ApiRequest(method="delete", path=f"/rest/dynamicdns/{entry_id}")
+        api_request = ApiRequest(method="delete", path=f"/rest/dynamicdns/{object_id(entry_id, 'dynamic DNS entry')}")
         await self._connection.request(api_request)
         self._connection._invalidate_cache(f"{CACHE_PREFIX_DDNS}_{self._connection.site}")
         return True

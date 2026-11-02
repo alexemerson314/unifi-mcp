@@ -115,6 +115,7 @@ HTTP is disabled by default. The stdio transport is recommended for most MCP cli
 | `UNIFI_MCP_HOST` | `127.0.0.1` | HTTP bind address; remote access requires an authenticated proxy or relay |
 | `UNIFI_MCP_PORT` | `3002` | HTTP bind port |
 | `UNIFI_MCP_HTTP_FORCE` | `false` | Force HTTP in non-container environments |
+| `UNIFI_MCP_HTTP_AUTH_TOKEN` | unset | Require `Authorization: Bearer <token>` on every HTTP request; at least 32 printable ASCII characters. `UNIFI_ACCESS_MCP_HTTP_AUTH_TOKEN` overrides it for this server, and both accept the `_FILE` and `_COMMAND` spellings. See [HTTP bearer token](../../network/docs/transports.md#http-bearer-token) |
 
 **Note:** The Access server defaults to port 3002 (vs. 3000 for Network, 3001 for Protect) to allow running all servers simultaneously.
 
@@ -128,6 +129,20 @@ HTTP is disabled by default. The stdio transport is recommended for most MCP cli
 | `UNIFI_MCP_DIAG_MAX_PAYLOAD` | `2000` | Max characters for diagnostic payloads |
 
 Diagnostics log operation metadata only. Controller payloads, paths, and exception messages are omitted regardless of the legacy payload flags.
+
+## Tracing
+
+The MCP SDK records a span for every MCP message (`tools/call <tool>` carries `gen_ai.tool.name`) and continues a W3C trace context passed in the request's `_meta`, so a gateway or client that sends one sees the server's spans in its own trace. Setting an OTLP endpoint exports these spans. The Docker image includes the exporter; pip and uvx installs need the `otel` extra (`unifi-access-mcp[otel]`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP collector endpoint; spans are exported only when this or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `http/protobuf`, or `grpc` once `opentelemetry-exporter-otlp-proto-grpc` is installed |
+| `OTEL_SERVICE_NAME` | `unifi-access-mcp` | Service name on exported spans |
+
+The other standard `OTEL_*` variables apply as usual, for example `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_EXPORTER_OTLP_HEADERS`. A span records the MCP method, the tool name, the JSON-RPC request ID and the timing, not tool arguments or results. A call through `access_execute` or `access_batch`, which the `lazy` and `meta_only` registration modes rely on, carries the meta tool's name, not the name of the tool it runs.
+
+A failed request records its error message in the span status. For `resources/read`, the SDK's message contains the requested resource URI. Tools return their errors as results; if an exception escapes a request handler anyway, the SDK also records its type, message and stack trace on the span.
 
 ## Permissions
 

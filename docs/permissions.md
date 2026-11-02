@@ -54,6 +54,33 @@ Resolution order: most specific wins.
 | `UNIFI_TOOL_PERMISSION_MODE` | Global (all servers) | `confirm` or `bypass` |
 | `UNIFI_<SERVER>_TOOL_PERMISSION_MODE` | Per-server | `UNIFI_NETWORK_TOOL_PERMISSION_MODE=bypass` |
 
+### Preview Tokens (opt-in)
+
+In `confirm` mode the server does not check that a preview came first: a client can send `confirm=true` on its first call. Preview tokens close that gap. When they are enabled, every preview response carries a `preview_token`, and a call with `confirm=true` is refused unless it sends back a token issued for the same tool and the same arguments.
+
+```json
+{
+  "success": true,
+  "requires_confirmation": true,
+  "preview": {"current": {"name": "IoT VLAN"}, "proposed": {"name": "IoT Devices"}},
+  "preview_token": "kQ4m...",
+  "preview_token_expires_in": 300,
+  "message": "Will update name on network 'IoT VLAN'. Set confirm=true to execute. Send the preview_token from this response with confirm=true."
+}
+```
+
+A token is single use and expires after `UNIFI_PREVIEW_TOKEN_TTL_SECONDS`. Any presented token is spent, including one refused for changed arguments, so a changed request needs a new preview. Tokens are held in process memory and do not survive a restart. A token is a server-side, single-use secret that is not bound to a client or session: on a shared HTTP server, any client that holds it can redeem it within its lifetime. Every mutating tool gains an optional `preview_token` argument while the mode is on; the committed tool manifests are generated with it off.
+
+| Variable | Scope | Example |
+|----------|-------|---------|
+| `UNIFI_REQUIRE_PREVIEW_TOKEN` | Global (all servers) | `true` |
+| `UNIFI_<SERVER>_REQUIRE_PREVIEW_TOKEN` | Per-server, wins over global | `UNIFI_NETWORK_REQUIRE_PREVIEW_TOKEN=true` |
+| `UNIFI_PREVIEW_TOKEN_TTL_SECONDS` | All servers | `300` (default), clamped to 10 to 3600 |
+
+The mode applies to tool calls on the Network, Protect and Access MCP servers, including calls made through `unifi_execute` and `unifi_batch`. The API server's action endpoint has its own confirm flow and does not check tokens. The setting is read at startup. An unrecognized value counts as `true`. `bypass` mode executes mutations without a preview, so it requires no token; the server logs a warning at startup when both are set.
+
+What a token proves is narrow: the server produced a preview for exactly this request. It does not prove a human read it, because an agent can call the preview and then execute with its token. It guarantees that a preview always exists for a client to show, and that the executed request is the one that was previewed. Human approval still belongs to the MCP client.
+
 ---
 
 ## Policy Gates
@@ -105,6 +132,28 @@ level.
 
 ---
 
+## Read-Only Mode
+
+Read-only mode denies every action that is not a read, whatever the policy gates say. No `UNIFI_POLICY_*` variable re-enables an action while it is on. It is off by default.
+
+It covers the Network, Protect and Access MCP servers and the API server (`POST /v1/actions/{tool}`). Every tool stays listed; calls to non-read tools return an error naming read-only mode. The API server refuses mutation previews (`confirm=false`) as well as confirmed calls with HTTP 403 and writes a `denied` audit row; read actions are unaffected.
+
+**Error example:**
+```
+Update is disabled for networks: the network server is in read-only mode, which no policy gate overrides.
+```
+
+| Variable | Scope | Values |
+|----------|-------|--------|
+| `UNIFI_READ_ONLY` | Global (all servers) | `true`/`false` |
+| `UNIFI_<SERVER>_READ_ONLY` | Per-server (`NETWORK`, `PROTECT`, `ACCESS`); overrides global | `true`/`false` |
+
+The API server resolves the per-server variable from the action's product, so `UNIFI_PROTECT_READ_ONLY=true` also blocks `protect_*` mutations on the API.
+
+**Accepted values:** `true`, `1`, `yes`, `on` (case-insensitive) turn it on; `false`, `0`, `no`, `off` turn it off; unset or empty defers to the next level. Any other value turns read-only mode on and logs a warning, so a misspelt attempt to enable it never leaves mutations allowed.
+
+---
+
 ## Practical Scenarios
 
 ### Zero config (default)
@@ -121,10 +170,9 @@ UNIFI_TOOL_PERMISSION_MODE=bypass
 
 ### Enterprise read-only: block all mutations
 ```bash
-UNIFI_POLICY_CREATE=false
-UNIFI_POLICY_UPDATE=false
-UNIFI_POLICY_DELETE=false
+UNIFI_READ_ONLY=true
 ```
+Unlike setting `UNIFI_POLICY_CREATE/UPDATE/DELETE=false`, no more specific policy gate can re-enable an action, and the API server is covered too.
 
 ### Lock down deletes only
 ```bash

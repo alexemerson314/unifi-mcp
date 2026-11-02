@@ -144,6 +144,51 @@ class ClientWifiDetails(BaseModel):
         description="WiFi channel number",
         json_schema_extra={"mutable": False},
     )
+    noise: Optional[int] = Field(
+        default=None,
+        description="Noise floor in dBm",
+        json_schema_extra={"mutable": False},
+    )
+    satisfaction: Optional[int] = Field(
+        default=None,
+        description="Controller-computed satisfaction score (0-100)",
+        json_schema_extra={"mutable": False},
+    )
+    tx_retries: Optional[int] = Field(
+        default=None,
+        description="Transmit retry count",
+        json_schema_extra={"mutable": False},
+    )
+    wifi_tx_attempts: Optional[int] = Field(
+        default=None,
+        description="Transmit attempt count",
+        json_schema_extra={"mutable": False},
+    )
+    roam_count: Optional[int] = Field(
+        default=None,
+        description="Number of roams since association",
+        json_schema_extra={"mutable": False},
+    )
+    radio: Optional[str] = Field(
+        default=None,
+        description="Radio band identifier (e.g. na, ng)",
+        json_schema_extra={"mutable": False},
+    )
+    bssid: Optional[str] = Field(
+        default=None,
+        description="BSSID of the AP radio the client is associated to",
+        json_schema_extra={"mutable": False},
+    )
+    nss: Optional[int] = Field(
+        default=None,
+        description="Number of spatial streams",
+        json_schema_extra={"mutable": False},
+    )
+    is_11r: Optional[bool] = Field(
+        default=None,
+        description="Whether the client uses 802.11r fast roaming",
+        json_schema_extra={"mutable": False},
+    )
 
 
 CLIENTWIFIDETAILS_MUTABLE_FIELDS: frozenset[str] = frozenset()
@@ -168,4 +213,13 @@ def client_wifi_details_from_controller(obj: Any) -> ClientWifiDetails:
         tx_rate=_get(obj, "tx_rate"),
         rx_rate=_get(obj, "rx_rate"),
         channel=_get(obj, "channel"),
+        noise=_get(obj, "noise"),
+        satisfaction=_get(obj, "satisfaction"),
+        tx_retries=_get(obj, "tx_retries"),
+        wifi_tx_attempts=_get(obj, "wifi_tx_attempts"),
+        roam_count=_get(obj, "roam_count"),
+        radio=_get(obj, "radio"),
+        bssid=_get(obj, "bssid"),
+        nss=_get(obj, "nss"),
+        is_11r=_get(obj, "is_11r"),
     )

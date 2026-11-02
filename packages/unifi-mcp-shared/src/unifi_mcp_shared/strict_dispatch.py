@@ -27,6 +27,9 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from unifi_core.redaction import redaction_marker_paths
 
+from unifi_mcp_shared.permissioned_tool import preview_token_tools
+from unifi_mcp_shared.preview_token import PREVIEW_TOKEN_ARGUMENT
+
 logger = logging.getLogger(__name__)
 
 # Network tools take the subject MAC as ``mac_address``. Older callers may still
@@ -105,6 +108,10 @@ class StrictKwargFastMCP(MCPServer):
         """
         if name in self._allowed_kwargs:
             allowed = self._allowed_kwargs[name]
+            # Preview-token mode adds this argument at registration time; the
+            # committed manifest is generated without it.
+            if name in preview_token_tools():
+                allowed = allowed | {PREVIEW_TOKEN_ARGUMENT}
             unknown = set(arguments.keys()) - allowed
             if unknown:
                 unknown_str = ", ".join(sorted(unknown))

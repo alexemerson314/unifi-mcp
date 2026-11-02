@@ -45,6 +45,9 @@ server:
     enabled: ${oc.env:UNIFI_MCP_HTTP_ENABLED,false}
     force: ${oc.env:UNIFI_MCP_HTTP_FORCE,false}
     transport: ${oc.env:UNIFI_MCP_HTTP_TRANSPORT,streamable-http}
+    # Bearer token every HTTP request must carry; empty leaves HTTP unauthenticated.
+    # UNIFI_<SERVER>_MCP_HTTP_AUTH_TOKEN and the _FILE/_COMMAND spellings take precedence.
+    auth_token: ${oc.env:UNIFI_MCP_HTTP_AUTH_TOKEN,""}
   diagnostics:
     enabled: ${oc.env:UNIFI_MCP_DIAGNOSTICS,false}
     log_tool_args: ${oc.env:UNIFI_MCP_DIAG_LOG_TOOL_ARGS,true}
@@ -65,6 +68,7 @@ access:
 
 # Permissions are controlled via environment variables:
 #   UNIFI_TOOL_PERMISSION_MODE=confirm|bypass (default: confirm)
+#   UNIFI_REQUIRE_PREVIEW_TOKEN=true|false (default: false; confirm=true needs the preview's token)
 #   UNIFI_POLICY_<ACTION>=true|false (global policy gates)
 #   UNIFI_POLICY_<SERVER>_<ACTION>=true|false (per-server)
 #   UNIFI_POLICY_<SERVER>_<CATEGORY>_<ACTION>=true|false (per-category)

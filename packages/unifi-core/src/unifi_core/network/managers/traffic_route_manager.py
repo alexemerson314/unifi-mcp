@@ -20,6 +20,7 @@ from unifi_core.network.models.traffic_routes import (
     validate_create_payload,
     validate_update_fields,
 )
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -273,7 +274,7 @@ class TrafficRouteManager:
 
             api_request = ApiRequestV2(
                 method="put",
-                path=f"/trafficroutes/{route_id}",
+                path=f"/trafficroutes/{object_id(route_id, 'traffic route')}",
                 data=payload,
             )
             # A PUT may commit before its response is lost; never retain a pre-update cache.
@@ -326,7 +327,7 @@ class TrafficRouteManager:
 
             api_request = ApiRequestV2(
                 method="put",
-                path=f"/trafficroutes/{route_id}",
+                path=f"/trafficroutes/{object_id(route_id, 'traffic route')}",
                 data=payload,
             )
             # A PUT may commit before its response is lost; never retain a pre-update cache.

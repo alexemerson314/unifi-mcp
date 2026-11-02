@@ -7,15 +7,17 @@ from unifi_mcp_shared.setup_required import controller_host_configured, setup_re
 
 
 @pytest.mark.parametrize(
-    ("unifi", "configured"),
-    [({"host": "192.0.2.10"}, True), ({"host": ""}, False), ({"host": "  "}, False), ({}, False)],
+    ("cfg_dict", "configured"),
+    [
+        ({"unifi": {"host": "192.0.2.10"}}, True),
+        ({"unifi": {"host": ""}}, False),
+        ({"unifi": {"host": "  "}}, False),
+        ({"unifi": {}}, False),
+        ({}, False),
+    ],
 )
-def test_controller_host_configured(unifi, configured):
-    assert controller_host_configured(OmegaConf.create({"unifi": unifi})) is configured
-
-
-def test_missing_unifi_section_counts_as_unconfigured():
-    assert controller_host_configured(OmegaConf.create({})) is False
+def test_controller_host_configured(cfg_dict, configured):
+    assert controller_host_configured(OmegaConf.create(cfg_dict)) is configured
 
 
 def message(state: str | None) -> str:
@@ -32,20 +34,12 @@ def test_names_every_setup_path():
     assert "~/.config/unifi-mcp/protect.env" in text
     assert "UNIFI_PROTECT_HOST" in text and "UNIFI_SETTINGS_FILE" in text
     assert "does not exist yet" not in text and "ignored" not in text
-
-
-def test_names_the_recovery_that_works_in_each_client():
-    text = message(None)
     assert "Claude Code: run /reload-plugins or start a new session" in text
     assert "/mcp reconnect does not load new plugin options" in text
     assert "Codex: restart Codex or start a new session" in text
     assert "OpenClaw: start a new session or run openclaw gateway restart" in text
     assert "Standalone: restart the server" in text
     assert "reconnect it in the client" not in text
-
-
-def test_points_at_the_other_unifi_plugins_without_naming_installed_ones():
-    text = message(None)
     assert "Any other UniFi plugins you have installed (Network, Protect, Access) need the same setup" in text
 
 
@@ -63,3 +57,35 @@ def test_settings_file_state_is_named_without_its_path(state, phrase):
 def test_loaded_file_without_host_adds_no_file_hint():
     text = message("loaded")
     assert "does not exist yet" not in text and "was ignored" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("http_enabled", "expected"), [(True, "y" * 40), (False, None)])
+async def test_setup_mode_keeps_config_auth_token(monkeypatch, http_enabled, expected):
+    """A token set only in config.yaml still guards the setup-mode HTTP endpoint."""
+    import logging
+    from unittest.mock import AsyncMock
+
+    from mcp.server.mcpserver import MCPServer as FastMCP
+    from unifi_mcp_shared.setup_required import serve_setup_required
+
+    for name in ("UNIFI_PROTECT_MCP_HTTP_AUTH_TOKEN", "UNIFI_MCP_HTTP_AUTH_TOKEN"):
+        for suffix in ("", "_FILE", "_COMMAND"):
+            monkeypatch.delenv(f"{name}{suffix}", raising=False)
+    transport = AsyncMock()
+    monkeypatch.setattr("unifi_mcp_shared.transport.run_transports", transport)
+    monkeypatch.setattr(
+        "unifi_mcp_shared.transport.resolve_http_config",
+        lambda *a, **kw: (http_enabled, "streamable-http", "127.0.0.1", 3001),
+    )
+    config = OmegaConf.create({"unifi": {}, "server": {"http": {"enabled": http_enabled, "auth_token": "y" * 40}}})
+    await serve_setup_required(
+        server=FastMCP("test"),
+        config=config,
+        plugin_name="unifi-protect",
+        env_prefix="PROTECT",
+        tool_prefix="protect",
+        default_port=3001,
+        logger=logging.getLogger("test"),
+    )
+    assert transport.await_args.kwargs["auth_token"] == expected

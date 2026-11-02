@@ -20,6 +20,7 @@ from unifi_core.network.models.networks import (
 )
 from unifi_core.network.models.vpn import is_vpn_network
 from unifi_core.network.models.wlans import apply_update_dependencies as apply_wlan_update_dependencies
+from unifi_core.request_paths import object_id
 from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
@@ -338,7 +339,7 @@ class NetworkManager:
             # 4. Send the full merged data
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/networkconf/{network_id}",
+                path=f"/rest/networkconf/{object_id(network_id, 'network')}",
                 data=merged_data,  # Send full object
             )
             await self._connection.request(api_request)
@@ -382,7 +383,7 @@ class NetworkManager:
                     f"Refusing to delete network {network_id}: purpose '{purpose}' is not a LAN/VLAN network. "
                     "Deleting WAN or VPN networkconf entries can sever gateway connectivity." + hint
                 )
-            api_request = ApiRequest(method="delete", path=f"/rest/networkconf/{network_id}")
+            api_request = ApiRequest(method="delete", path=f"/rest/networkconf/{object_id(network_id, 'network')}")
             await self._connection.request(api_request)
             logger.info("Delete command sent for network %s", network_id)
             self._connection._invalidate_cache(f"{CACHE_PREFIX_NETWORKS}_{self._connection.site}")
@@ -528,7 +529,7 @@ class NetworkManager:
             # 4. Send the full merged data
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/wlanconf/{wlan_id}",
+                path=f"/rest/wlanconf/{object_id(wlan_id, 'WLAN')}",
                 data=merged_data,  # Send full object
             )
             await self._connection.request(api_request)
@@ -572,7 +573,7 @@ class NetworkManager:
         """
         try:
             await self.get_wlan_details(wlan_id)
-            api_request = ApiRequest(method="delete", path=f"/rest/wlanconf/{wlan_id}")
+            api_request = ApiRequest(method="delete", path=f"/rest/wlanconf/{object_id(wlan_id, 'WLAN')}")
             await self._connection.request(api_request)
             logger.info("Delete command sent for WLAN %s", wlan_id)
             self._connection._invalidate_cache(f"{CACHE_PREFIX_WLANS}_{self._connection.site}")
@@ -600,7 +601,9 @@ class NetworkManager:
             new_state = not wlan.get("enabled", False)
             update_payload = {"enabled": new_state}
 
-            api_request = ApiRequest(method="put", path=f"/rest/wlanconf/{wlan_id}", data=update_payload)
+            api_request = ApiRequest(
+                method="put", path=f"/rest/wlanconf/{object_id(wlan_id, 'WLAN')}", data=update_payload
+            )
             await self._connection.request(api_request)
             logger.info(
                 "Toggle command sent for WLAN %s (new state: %s)", wlan_id, "enabled" if new_state else "disabled"
@@ -719,7 +722,9 @@ class NetworkManager:
 
             merged_data = deep_merge(existing, update_data)
 
-            api_request = ApiRequestV2(method="put", path=f"/apgroups/{group_id}", data=merged_data)
+            api_request = ApiRequestV2(
+                method="put", path=f"/apgroups/{object_id(group_id, 'AP group')}", data=merged_data
+            )
             await self._connection.request(api_request)
 
             self._connection._invalidate_cache(CACHE_PREFIX_AP_GROUPS)
@@ -750,7 +755,7 @@ class NetworkManager:
             True on success, False on failure.
         """
         try:
-            api_request = ApiRequestV2(method="delete", path=f"/apgroups/{group_id}")
+            api_request = ApiRequestV2(method="delete", path=f"/apgroups/{object_id(group_id, 'AP group')}")
             await self._connection.request(api_request)
 
             self._connection._invalidate_cache(CACHE_PREFIX_AP_GROUPS)

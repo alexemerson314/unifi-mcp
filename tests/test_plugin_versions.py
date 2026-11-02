@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,12 @@ def edit(root: Path, path: str, **fields) -> None:
     write(root, path, data)
 
 
+def log(root: Path, *plugins: str) -> None:
+    """Add a changelog entry heading naming each "plugin version"."""
+    path = root / versions.CHANGELOG
+    path.write_text(path.read_text() + f"\n## 2026-01-01 — {', '.join(plugins)}\n\n- Change.\n")
+
+
 def manifests(root: Path, version: str) -> None:
     for manifest in versions.MANIFESTS:
         edit(root, f"plugins/unifi-network/{manifest}", version=version)
@@ -45,26 +52,43 @@ def pins(root: Path, version: str) -> None:
         )
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the base fixture repo (git init + commit + tag) once per module.
+
+    `repo` below copies this per test instead of repeating the full git init/
+    config/add/commit/tag subprocess sequence (~7 git invocations) for every
+    one of the ~40 tests that use it — a copy of this tiny repo is far
+    cheaper than rebuilding it, and each test still gets its own isolated
+    working tree to mutate and commit into.
+    """
+    template = tmp_path_factory.mktemp("repo-template")
+    subprocess.run(["git", "init", "-q", str(template)], check=True)
     for manifest in versions.MANIFESTS:
-        write(tmp_path, f"plugins/unifi-network/{manifest}", {"name": "unifi-network", "version": "1.0.0"})
+        write(template, f"plugins/unifi-network/{manifest}", {"name": "unifi-network", "version": "1.0.0"})
     # As shipped: the Codex manifest names its server file by path.
-    edit(tmp_path, "plugins/unifi-network/.codex-plugin/plugin.json", mcpServers="./.mcp.codex.json")
-    pins(tmp_path, "0.37.0")
+    edit(template, "plugins/unifi-network/.codex-plugin/plugin.json", mcpServers="./.mcp.codex.json")
+    pins(template, "0.37.0")
     for marketplace in versions.MARKETPLACES:
-        write(tmp_path, marketplace, {"plugins": [{"name": "unifi-network"}]})
+        write(template, marketplace, {"plugins": [{"name": "unifi-network"}]})
+    (template / versions.CHANGELOG).write_text(f"# Changelog\n\n{versions.CHANGELOG_MARKER}\n")
     # Fixture identity and hooks are scoped to this disposable repository.
-    versions.git(tmp_path, "config", "--local", "user.name", "Fixture")
-    versions.git(tmp_path, "config", "--local", "user.email", "fixture@example.invalid")
-    versions.git(tmp_path, "config", "--local", "commit.gpgsign", "false")
-    versions.git(tmp_path, "config", "--local", "core.hooksPath", str(tmp_path / "no-hooks"))
-    versions.git(tmp_path, "add", ".")
-    versions.git(tmp_path, "commit", "-qm", "fixture")
-    versions.git(tmp_path, "tag", "network/v0.37.0")
-    versions.git(tmp_path, "branch", "base")
-    return tmp_path
+    versions.git(template, "config", "--local", "user.name", "Fixture")
+    versions.git(template, "config", "--local", "user.email", "fixture@example.invalid")
+    versions.git(template, "config", "--local", "commit.gpgsign", "false")
+    versions.git(template, "config", "--local", "core.hooksPath", str(template / "no-hooks"))
+    versions.git(template, "add", ".")
+    versions.git(template, "commit", "-qm", "fixture")
+    versions.git(template, "tag", "network/v0.37.0")
+    versions.git(template, "branch", "base")
+    return template
+
+
+@pytest.fixture
+def repo(tmp_path: Path, _repo_template: Path) -> Path:
+    target = tmp_path / "repo"
+    shutil.copytree(_repo_template, target)
+    return target
 
 
 def change_skill(root: Path) -> None:
@@ -144,6 +168,7 @@ def test_missing_base_fails_even_without_plugin_changes(repo: Path) -> None:
 def test_unreleased_pin_fails_and_exact_workflow_tag_is_allowed(repo: Path) -> None:
     pins(repo, "0.38.0")
     manifests(repo, "1.1.0")
+    log(repo, "unifi-network 1.1.0")
     with pytest.raises(ValueError, match="has no release tag"):
         versions.check(repo, "base", "protect/v0.38.0")
     versions.check(repo, "base", "network/v0.38.0")
@@ -153,12 +178,14 @@ def test_unreleased_pin_fails_and_exact_workflow_tag_is_allowed(repo: Path) -> N
 
 def test_version_only_bump_is_allowed(repo: Path) -> None:
     manifests(repo, "1.0.1")
+    log(repo, "unifi-network 1.0.1")
     versions.check(repo, "base")
 
 
 def test_changed_skill_with_bump_passes(repo: Path) -> None:
     change_skill(repo)
     manifests(repo, "1.0.1")
+    log(repo, "unifi-network 1.0.1")
     versions.check(repo, "base")
 
 
@@ -170,22 +197,48 @@ def test_uses_merge_base_instead_of_tip(repo: Path) -> None:
     versions.git(repo, "commit", "-qm", "ahead")
     versions.git(repo, "checkout", "-")
     manifests(repo, "1.0.1")
+    log(repo, "unifi-network 1.0.1")
     versions.check(repo, "ahead")
 
 
 @pytest.mark.parametrize("client", versions.MANIFESTS)
-def test_unlisted_skills_only_plugin_checks_existing_manifests(repo: Path, client: str) -> None:
-    write(repo, f"plugins/cross-product/{client}", {"name": "cross-product", "version": "1.0.0"})
+def test_skills_only_plugin_checks_existing_manifests(repo: Path, client: str) -> None:
+    write(repo, f"plugins/unifi-intelligence/{client}", {"name": "unifi-intelligence", "version": "1.0.0"})
+    log(repo, "unifi-intelligence 1.0.0")
     versions.check(repo, "base")
     versions.git(repo, "add", ".")
-    versions.git(repo, "commit", "-qm", "cross product")
-    write(repo, f"plugins/cross-product/{client}", {"name": "cross-product", "version": "0.9.0"})
-    with pytest.raises(ValueError, match="cross-product: changed plugin"):
+    versions.git(repo, "commit", "-qm", "skills only")
+    write(repo, f"plugins/unifi-intelligence/{client}", {"name": "unifi-intelligence", "version": "0.9.0"})
+    with pytest.raises(ValueError, match="unifi-intelligence: changed plugin"):
         versions.check(repo, "HEAD")
 
 
+def test_product_plugin_without_mcp_configs_fails(repo: Path) -> None:
+    for filename in (".mcp.codex.json", ".claude-plugin/plugin.json"):
+        data = json.loads((repo / "plugins/unifi-network" / filename).read_text())
+        data.pop("mcpServers", None)
+        write(repo, f"plugins/unifi-network/{filename}", data)
+    (repo / "plugins/unifi-network/.mcp.codex.json").unlink()
+    manifests(repo, "1.0.1")
+    with pytest.raises(ValueError, match="unifi-network: missing MCP configs"):
+        versions.check(repo, "base")
+
+
+def test_renamed_plugin_is_checked_as_new(repo: Path) -> None:
+    write(repo, "plugins/old-name/.claude-plugin/plugin.json", {"name": "old-name", "version": "1.1.0"})
+    log(repo, "old-name 1.1.0", "new-name 1.0.0")
+    versions.git(repo, "add", ".")
+    versions.git(repo, "commit", "-qm", "old name")
+    versions.git(repo, "branch", "-f", "base")
+    versions.git(repo, "mv", "plugins/old-name", "plugins/new-name")
+    edit(repo, "plugins/new-name/.claude-plugin/plugin.json", name="new-name", version="1.0.0")
+    versions.check(repo, "base")
+    versions.git(repo, "rm", "-rqf", "plugins/new-name")
+    versions.check(repo, "base")
+
+
 def test_plugin_needs_at_least_one_manifest(repo: Path) -> None:
-    (repo / "plugins/cross-product").mkdir()
+    (repo / "plugins/unifi-intelligence").mkdir()
     with pytest.raises(ValueError, match="at least one plugin manifest"):
         versions.check(repo, "base")
 
@@ -222,9 +275,51 @@ def test_release_writeback_passes_guard_and_is_idempotent(repo: Path, pin: str, 
     assert versions.plugin_state(repo / "plugins/unifi-network") == (expected, {"unifi-network-mcp": pin})
     assert json.loads((repo / "apps/network/server.json").read_text())["version"] == pin
     versions.check(repo, "base")
+    changelog = (repo / versions.CHANGELOG).read_text()
+    assert f"— unifi-network {expected}\n\n- Pins `unifi-network-mcp` [{pin}]" in changelog
+    assert f"/releases/tag/network/v{pin})." in changelog
     before = versions.git(repo, "diff")
     versions.sync(repo)
     assert versions.git(repo, "diff") == before
+
+
+def test_bump_without_changelog_entry_fails(repo: Path) -> None:
+    change_skill(repo)
+    manifests(repo, "1.0.1")
+    log(repo, "unifi-network 1.0.10", "unifi-network-extra 1.0.1")
+    with pytest.raises(ValueError, match="no entry heading naming unifi-network 1.0.1"):
+        versions.check(repo, "base")
+    (repo / versions.CHANGELOG).write_text((repo / versions.CHANGELOG).read_text() + "unifi-network 1.0.1\n")
+    with pytest.raises(ValueError, match="no entry heading"):
+        versions.check(repo, "base")
+
+
+def test_one_writeback_records_every_plugin_it_bumped_newest_first(tmp_path: Path) -> None:
+    (tmp_path / versions.CHANGELOG).write_text(f"# Changelog\n\n{versions.CHANGELOG_MARKER}\n\n## Older\n")
+    versions.record_pin_moves(
+        tmp_path,
+        [
+            ("unifi-network", "1.2.0", "unifi-network-mcp", "0.39.0"),
+            ("unifi-protect", "1.1.4", "unifi-protect-mcp", "0.9.2"),
+        ],
+    )
+    text = (tmp_path / versions.CHANGELOG).read_text()
+    assert text.index("unifi-network 1.2.0, unifi-protect 1.1.4") < text.index("## Older")
+    assert "[0.39.0](https://github.com/sirkirby/unifi-mcp/releases/tag/network/v0.39.0) and" in text
+    assert versions.changelog_has(tmp_path, "unifi-protect", "1.1.4")
+
+
+def test_writeback_refuses_a_changelog_without_its_marker(tmp_path: Path) -> None:
+    (tmp_path / versions.CHANGELOG).write_text("# Changelog\n")
+    with pytest.raises(ValueError, match="missing the entry marker"):
+        versions.record_pin_moves(tmp_path, [("unifi-network", "1.2.0", "unifi-network-mcp", "0.39.0")])
+
+
+def test_shipped_changelog_names_every_current_plugin_version() -> None:
+    for bundle in sorted((ROOT / "plugins").iterdir()):
+        if bundle.is_dir():
+            version, _ = versions.plugin_state(bundle)
+            assert versions.changelog_has(ROOT, bundle.name, version), f"{bundle.name} {version}"
 
 
 def test_tag_discovery_does_not_depend_on_lexical_order() -> None:

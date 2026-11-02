@@ -167,19 +167,14 @@ async def test_client_handles_tool_call_handler_exception(config):
     assert "Unexpected failure" in sent_data["error"]
 
 
-async def test_client_handles_error_message(config):
+@pytest.mark.parametrize(
+    "msg",
+    [ErrorMessage(message="Rate limited", code="rate_limit"), None],
+)
+async def test_client_handles_error_or_none_message(config, msg):
     client = RelayClient(config)
     mock_ws = AsyncMock()
-    msg = ErrorMessage(message="Rate limited", code="rate_limit")
-    # Should not raise, just log
     await client._handle_message(msg, mock_ws)
-    mock_ws.send.assert_not_called()
-
-
-async def test_client_ignores_none_message(config):
-    client = RelayClient(config)
-    mock_ws = AsyncMock()
-    await client._handle_message(None, mock_ws)
     mock_ws.send.assert_not_called()
 
 
@@ -196,19 +191,15 @@ async def test_client_send_catalog_update_when_connected(config, tools):
     assert len(sent_data["tools"]) == 1
 
 
-async def test_client_send_catalog_update_when_disconnected(config, tools):
+@pytest.mark.parametrize("ws_state", [None, WsState.CLOSED])
+async def test_client_send_catalog_update_when_disconnected(config, tools, ws_state):
     client = RelayClient(config)
-    client._ws = None
-
-    result = await client.send_catalog_update(tools)
-    assert result is False
-
-
-async def test_client_send_catalog_update_when_ws_closed(config, tools):
-    client = RelayClient(config)
-    mock_ws = AsyncMock()
-    mock_ws.state = WsState.CLOSED
-    client._ws = mock_ws
+    if ws_state is None:
+        client._ws = None
+    else:
+        mock_ws = AsyncMock()
+        mock_ws.state = ws_state
+        client._ws = mock_ws
 
     result = await client.send_catalog_update(tools)
     assert result is False
@@ -357,14 +348,10 @@ def test_is_auth_failure_no_rcvd():
 # --- URL validation tests ---
 
 
-def test_build_ws_url_rejects_invalid_scheme():
+@pytest.mark.parametrize("url", ["ftp://example.com", "example.com"])
+def test_build_ws_url_rejects_invalid_scheme_or_missing_scheme(url):
     with pytest.raises(ValueError, match="must start with http"):
-        RelayClient._build_ws_url("ftp://example.com")
-
-
-def test_build_ws_url_rejects_missing_scheme():
-    with pytest.raises(ValueError, match="must start with http"):
-        RelayClient._build_ws_url("example.com")
+        RelayClient._build_ws_url(url)
 
 
 # --- Timeout enforcement test ---

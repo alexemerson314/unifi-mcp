@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { handleMcpRequest, type RelayStub } from "../src/mcp-handler";
 import type { JsonRpcRequest, ToolInfo } from "../src/types";
+import { FULL_AGENT_SCOPE } from "../src/types";
 
 function mockStub(overrides: Partial<RelayStub> = {}): RelayStub {
   return {
@@ -76,7 +77,7 @@ describe("tools/list", () => {
     const response = await handleMcpRequest(req("tools/list"), stub, "eager");
 
     expect(stub.isMultiLocation).toHaveBeenCalled();
-    expect(stub.getToolList).toHaveBeenCalledWith("eager");
+    expect(stub.getToolList).toHaveBeenCalledWith("eager", FULL_AGENT_SCOPE);
 
     const result = response.result as Record<string, unknown>;
     expect(result.tools).toEqual(tools);
@@ -91,7 +92,7 @@ describe("tools/list", () => {
 
     await handleMcpRequest(req("tools/list"), stub, "eager");
 
-    expect(stub.getToolList).toHaveBeenCalledWith("lazy");
+    expect(stub.getToolList).toHaveBeenCalledWith("lazy", FULL_AGENT_SCOPE);
   });
 
   it("uses lazy mode when mode param is already lazy (single-location)", async () => {
@@ -101,7 +102,7 @@ describe("tools/list", () => {
 
     await handleMcpRequest(req("tools/list"), stub, "lazy");
 
-    expect(stub.getToolList).toHaveBeenCalledWith("lazy");
+    expect(stub.getToolList).toHaveBeenCalledWith("lazy", FULL_AGENT_SCOPE);
   });
 });
 
@@ -121,7 +122,7 @@ describe("tools/call", () => {
       "lazy",
     );
 
-    expect(stub.handleToolCall).toHaveBeenCalledWith("list_clients", { site: "default" });
+    expect(stub.handleToolCall).toHaveBeenCalledWith("list_clients", { site: "default" }, FULL_AGENT_SCOPE);
     expect(response.error).toBeUndefined();
 
     const result = response.result as Record<string, unknown>;
@@ -140,7 +141,19 @@ describe("tools/call", () => {
       "lazy",
     );
 
-    expect(stub.handleToolCall).toHaveBeenCalledWith("list_clients", {});
+    expect(stub.handleToolCall).toHaveBeenCalledWith("list_clients", {}, FULL_AGENT_SCOPE);
+  });
+
+  it("passes the caller's scope to the stub", async () => {
+    const stub = mockStub();
+    const scope = { readOnly: true, locations: ["loc-1"] };
+
+    await handleMcpRequest(req("tools/list"), stub, "eager", scope);
+    await handleMcpRequest(req("tools/call", { name: "list_clients" }), stub, "lazy", scope);
+
+    expect(stub.isMultiLocation).toHaveBeenCalledWith(scope);
+    expect(stub.getToolList).toHaveBeenCalledWith("eager", scope);
+    expect(stub.handleToolCall).toHaveBeenCalledWith("list_clients", {}, scope);
   });
 
   it("returns -32000 error when stub throws", async () => {

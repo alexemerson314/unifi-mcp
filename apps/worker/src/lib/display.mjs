@@ -1,6 +1,6 @@
 // src/lib/display.mjs
 import chalk from "chalk";
-import { maskToken } from "./config.mjs";
+import { getConfigFile, maskToken } from "./config.mjs";
 
 export function showInstallSuccess({ workerUrl, agentToken, adminToken, relayToken, locationName }) {
   console.log("");
@@ -81,6 +81,15 @@ export function showAddLocationSuccess({ locationName, relayToken, workerUrl }) 
   console.log(`    ${chalk.dim("UNIFI_RELAY_TOKEN")}=${relayToken}`);
   console.log(`    ${chalk.dim("UNIFI_RELAY_LOCATION_NAME")}=${locationName}`);
   console.log("");
+}
+
+/**
+ * Report a rotated secret without printing it: terminal scrollback, CI logs and
+ * shell recordings keep stdout. The value is in the 0600 config file.
+ */
+export function showRotatedToken(name, configKey, token, nextStep) {
+  console.log(chalk.green(`  New ${name}: ${maskToken(token)}`));
+  console.log(chalk.dim(`  → Saved to ${getConfigFile()} (${configKey}). ${nextStep}\n`));
 }
 
 export function showError(message) {

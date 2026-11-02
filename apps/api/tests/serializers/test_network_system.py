@@ -103,8 +103,10 @@ def test_network_health_list_serializer_shape() -> None:
     assert rows[0]["subsystem"] == "wan"
     assert rows[0]["status"] == "ok"
     assert rows[0]["num_user"] == 5
-    assert rows[0]["rx_bytes"] == 100
-    assert rows[0]["tx_bytes"] == 200
+    assert rows[0]["rx_bytes"] is None
+    assert rows[0]["tx_bytes"] is None
+    assert rows[0]["rx_bytes_per_sec"] == 100
+    assert rows[0]["tx_bytes_per_sec"] == 200
     assert rows[1]["subsystem"] == "wlan"
 
 
@@ -204,6 +206,26 @@ def test_top_clients_list_serializer_shape() -> None:
     assert item["total_bytes"] == 300
 
 
+def test_top_clients_serializer_keeps_window_direction_and_source() -> None:
+    # Shape returned by StatsManager.get_top_clients for a windowed report.
+    sample = {
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "rx_bytes": 900,
+        "tx_bytes": 100,
+        "upload_bytes": 900,
+        "download_bytes": 100,
+        "total_bytes": 1000,
+        "source": "report",
+        "granularity": "5minutes",
+    }
+    item = TopClient.from_manager_output(sample).to_dict()
+    assert item["upload_bytes"] == 900
+    assert item["download_bytes"] == 100
+    assert item["upload_bytes"] == item["rx_bytes"]
+    assert item["download_bytes"] == item["tx_bytes"]
+    assert item["source"] == "report"
+
+
 # ---- Speedtest ----
 
 
@@ -215,6 +237,13 @@ def test_speedtest_list_serializer_shape() -> None:
     assert item["download_mbps"] == 500.5
     assert item["upload_mbps"] == 50.1
     assert item["latency_ms"] == 12
+    assert item["wan_networkgroup"] is None
+
+
+def test_speedtest_serializer_names_the_wan() -> None:
+    sample = {"time": 1, "xput_download": 314.0, "wan_networkgroup": "WAN2", "interface_name": "eth7"}
+    item = SpeedtestResult.from_manager_output(sample).to_dict()
+    assert (item["wan_networkgroup"], item["interface_name"]) == ("WAN2", "eth7")
 
 
 # ---- System mutation acks (still serializer-backed) ----

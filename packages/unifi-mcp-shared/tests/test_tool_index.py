@@ -25,12 +25,6 @@ def clean_registry():
 class TestToolMetadata:
     """Tests for ToolMetadata dataclass."""
 
-    def test_to_dict_excludes_none(self):
-        meta = ToolMetadata(name="test", description="A test tool")
-        d = meta.to_dict()
-        assert "output_schema" not in d
-        assert d["name"] == "test"
-
     def test_to_dict_includes_all_set_fields(self):
         meta = ToolMetadata(
             name="test",
@@ -63,6 +57,8 @@ class TestToolMetadata:
     def test_to_dict_excludes_none_permission_fields(self):
         meta = ToolMetadata(name="test", description="A test tool")
         d = meta.to_dict()
+        assert d["name"] == "test"
+        assert "output_schema" not in d
         assert "permission_category" not in d
         assert "permission_action" not in d
 
@@ -290,6 +286,7 @@ class TestGetToolIndex:
 
         index = get_tool_index(registration_mode="lazy", manifest_path=manifest_path, category="Clients")
         assert index["count"] == 1
+        assert index["filtered"] is True
 
     # --- Search filtering ---
 
@@ -308,10 +305,18 @@ class TestGetToolIndex:
         assert index["count"] == 1
         assert index["tools"][0]["name"] == "unifi_get_stats"
 
-    def test_search_case_insensitive(self):
-        register_tool(name="unifi_list_clients", description="List clients")
-        index = get_tool_index(registration_mode="eager", search="LIST")
+    @pytest.mark.parametrize(
+        ("name", "description", "search"),
+        [
+            ("unifi_list_clients", "List clients", "LIST"),
+            ("tool_a", "A", "tool"),
+        ],
+    )
+    def test_search_case_insensitive(self, name, description, search):
+        register_tool(name=name, description=description)
+        index = get_tool_index(registration_mode="eager", search=search)
         assert index["count"] == 1
+        assert index["filtered"] is True
 
     @pytest.mark.parametrize(
         ("search", "expected"),
@@ -326,32 +331,40 @@ class TestGetToolIndex:
 
         assert [tool["name"] for tool in index["tools"]] == expected
 
-    def test_search_prioritizes_exact_phrase(self):
-        register_tool(name="unifi_firewall_policy_update", description="Modify policy configuration")
-        register_tool(name="unifi_exact_wall_policy", description="Apply the wall policy update workflow")
-
-        index = get_tool_index(registration_mode="eager", search="wall policy update")
-
-        assert [tool["name"] for tool in index["tools"]] == [
-            "unifi_exact_wall_policy",
-            "unifi_firewall_policy_update",
-        ]
-
-    def test_search_does_not_create_exact_phrase_across_fields(self):
-        register_tool(name="unifi_wall_alpha", description="Configure policy update")
-        register_tool(name="unifi_wall", description="Policy update settings")
-
-        index = get_tool_index(registration_mode="eager", search="wall policy update")
-
-        assert [tool["name"] for tool in index["tools"]] == ["unifi_wall_alpha", "unifi_wall"]
-
-    def test_search_preserves_source_order_for_ties(self):
-        register_tool(name="unifi_alpha", description="Inspect client details")
-        register_tool(name="unifi_beta", description="Inspect client details")
-
-        index = get_tool_index(registration_mode="eager", search="inspect client")
-
-        assert [tool["name"] for tool in index["tools"]] == ["unifi_alpha", "unifi_beta"]
+    @pytest.mark.parametrize(
+        ("tools", "search", "expected"),
+        [
+            (
+                [
+                    ("unifi_firewall_policy_update", "Modify policy configuration"),
+                    ("unifi_exact_wall_policy", "Apply the wall policy update workflow"),
+                ],
+                "wall policy update",
+                ["unifi_exact_wall_policy", "unifi_firewall_policy_update"],
+            ),
+            (
+                [
+                    ("unifi_wall_alpha", "Configure policy update"),
+                    ("unifi_wall", "Policy update settings"),
+                ],
+                "wall policy update",
+                ["unifi_wall_alpha", "unifi_wall"],
+            ),
+            (
+                [
+                    ("unifi_alpha", "Inspect client details"),
+                    ("unifi_beta", "Inspect client details"),
+                ],
+                "inspect client",
+                ["unifi_alpha", "unifi_beta"],
+            ),
+        ],
+    )
+    def test_search_phrase_and_tie_ranking(self, tools, search, expected):
+        for name, description in tools:
+            register_tool(name=name, description=description)
+        index = get_tool_index(registration_mode="eager", search=search)
+        assert [tool["name"] for tool in index["tools"]] == expected
 
     def test_search_caps_results(self):
         for index in range(25):
@@ -435,11 +448,6 @@ class TestGetToolIndex:
         register_tool(name="tool_a", description="A")
         index = get_tool_index(registration_mode="eager")
         assert "filtered" not in index
-
-    def test_filtered_flag_with_search(self):
-        register_tool(name="tool_a", description="A")
-        index = get_tool_index(registration_mode="eager", search="tool")
-        assert index["filtered"] is True
 
     # --- Combined filters ---
 

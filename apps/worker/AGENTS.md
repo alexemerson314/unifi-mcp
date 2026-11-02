@@ -41,6 +41,7 @@ Two workspaces live in one repo:
 - `worker/src/relay-object.ts` — Durable Object (`RelayObject`). All persistent state and WebSocket management lives here.
 - `worker/src/mcp-handler.ts` — MCP JSON-RPC dispatch. Pure function, no side effects beyond calling the `RelayStub` interface.
 - `worker/src/auth.ts` — Token generation, hashing, and validation. All auth primitives live here.
+- `worker/src/cors.ts` — The `CORS_ALLOWED_ORIGINS` allowlist. Responses MUST take CORS headers from `corsHeaders`; never echo an `Origin` outside it. An unset or empty allowlist echoes any Origin; a set one narrows to its entries.
 - `worker/src/types.ts` — All TypeScript interfaces and protocol constants. Shared types MUST be defined here, not inline.
 
 New Worker source files SHOULD be added to `worker/src/` only when they represent a clearly distinct concern. Do not fragment into deep directory trees.
@@ -54,8 +55,9 @@ New Worker source files SHOULD be added to `worker/src/` only when they represen
 ### 3.4 Authentication
 
 - All endpoints except `/health` MUST require Bearer token authentication.
+- `/mcp` accepts the static `AGENT_TOKEN` (full scope) or a scoped agent token from the `agent_tokens` table. The Durable Object resolves the bearer to an `AgentScope` before parsing the body, and every tool listing and routing path MUST take that scope. A new route to a relay client that skips it is a scope bypass.
 - Token comparison MUST use the constant-time `timingSafeEqual` function from `worker/src/auth.ts`.
-- Relay tokens MUST be stored as SHA-256 hashes (via `hashToken`), never plaintext.
+- Relay tokens and scoped agent tokens MUST be stored as SHA-256 hashes (via `hashToken`), never plaintext.
 - The CLI config file (`~/.unifi-mcp-worker/config.json`) MUST be written with mode `0o600` and its directory with `0o700`.
 
 ### 3.5 Protocol
@@ -68,7 +70,7 @@ New Worker source files SHOULD be added to `worker/src/` only when they represen
 
 - The relay uses a singleton Durable Object (`env.RELAY.idFromName("singleton")`).
 - The Durable Object uses SQLite for persistent location/token storage (configured in `wrangler.toml` via `new_sqlite_classes`).
-- Meta-tools (`unifi_tool_index`, `unifi_execute`, `unifi_batch`, `unifi_location_timeline`) are defined in `relay-object.ts` and handled by the relay itself — they MUST NOT be forwarded to relay clients.
+- Meta-tools (`unifi_tool_index`, `unifi_execute`, `unifi_batch`, `unifi_location_timeline`) are defined in `relay-object.ts` (`unifi_location_timeline` in `location-timeline-tool.json`, which repository checks read) and handled by the relay itself — they MUST NOT be forwarded to relay clients.
 
 ### 3.7 Dependencies
 
@@ -92,7 +94,7 @@ New Worker source files SHOULD be added to `worker/src/` only when they represen
 ### 4.2 Add a New Worker Endpoint
 
 1. Add the route handler in `worker/src/index.ts` following the existing `if (url.pathname === ...)` pattern.
-2. All authenticated routes MUST call `validateBearerToken` before proceeding.
+2. All authenticated routes MUST call `validateBearerToken` before proceeding, except `/mcp` and `/ws`, whose tokens live in Durable Object storage and are validated there.
 3. Add tests at `worker/test/<module>.test.ts` using Vitest.
 4. Run `make check` to verify.
 
@@ -166,7 +168,7 @@ Releases are tag-triggered. Do NOT manually edit `package.json` version on `main
 
 ## 7. Security Considerations
 
-- Secrets (`AGENT_TOKEN`, `ADMIN_TOKEN`, relay tokens) MUST NEVER appear in logs, error messages, or test output.
+- Secrets (`AGENT_TOKEN`, `ADMIN_TOKEN`, relay tokens, scoped agent tokens) MUST NEVER appear in logs, error messages, or test output. CLI commands that rotate a secret MUST NOT print it; save it to the config file and show `maskToken`.
 - The `.dev.vars` and `.env` files are gitignored and MUST remain so.
 - Config files written to disk MUST use restrictive permissions (`0o600` for files, `0o700` for directories).
 - Token generation MUST use `crypto.getRandomValues` (32 bytes, URL-safe base64).

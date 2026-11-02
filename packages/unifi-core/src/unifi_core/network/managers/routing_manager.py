@@ -10,6 +10,7 @@ from aiounifi.models.api import ApiRequest
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -206,7 +207,7 @@ class RoutingManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/routing/{route_id}",
+                path=f"/rest/routing/{object_id(route_id, 'static route')}",
                 data=payload,
             )
             await self._connection.request(api_request)

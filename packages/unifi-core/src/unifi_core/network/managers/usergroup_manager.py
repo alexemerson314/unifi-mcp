@@ -10,6 +10,7 @@ from aiounifi.models.api import ApiRequest
 
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -160,7 +161,7 @@ class UsergroupManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/usergroup/{group_id}",
+                path=f"/rest/usergroup/{object_id(group_id, 'user group')}",
                 data=payload,
             )
             await self._connection.request(api_request)

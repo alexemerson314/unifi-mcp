@@ -30,6 +30,8 @@ import strawberry
 from unifi_core.network.models.system import mgmt_from_controller, snmp_from_controller
 from unifi_core.redaction import redact_value
 
+from unifi_api.graphql.scalars import BigInt
+
 
 def _get(obj: Any, *keys: str, default: Any = None) -> Any:
     if not isinstance(obj, dict):
@@ -180,8 +182,18 @@ class NetworkHealth:
     num_user: int | None
     num_guest: int | None
     num_iot: int | None
-    rx_bytes: int | None
-    tx_bytes: int | None
+    rx_bytes: BigInt | None = strawberry.field(
+        description="Cumulative bytes received on this subsystem, when the controller sends a counter."
+    )
+    tx_bytes: BigInt | None = strawberry.field(
+        description="Cumulative bytes transmitted on this subsystem, when the controller sends a counter."
+    )
+    rx_bytes_per_sec: float | None = strawberry.field(
+        description="Current receive rate on this subsystem in bytes per second (not a total)."
+    )
+    tx_bytes_per_sec: float | None = strawberry.field(
+        description="Current transmit rate on this subsystem in bytes per second (not a total)."
+    )
     _was_dict: strawberry.Private[bool] = True
 
     @classmethod
@@ -193,8 +205,8 @@ class NetworkHealth:
                 "subsystem",
                 "status",
                 "num_user",
-                "rx_bytes",
-                "tx_bytes",
+                "rx_bytes_per_sec",
+                "tx_bytes_per_sec",
             ],
         }
 
@@ -209,6 +221,8 @@ class NetworkHealth:
                 num_iot=None,
                 rx_bytes=None,
                 tx_bytes=None,
+                rx_bytes_per_sec=None,
+                tx_bytes_per_sec=None,
                 _was_dict=False,
             )
         return cls(
@@ -217,8 +231,10 @@ class NetworkHealth:
             num_user=_get(record, "num_user"),
             num_guest=_get(record, "num_guest"),
             num_iot=_get(record, "num_iot"),
-            rx_bytes=_get(record, "rx_bytes-r", "rx_bytes"),
-            tx_bytes=_get(record, "tx_bytes-r", "tx_bytes"),
+            rx_bytes=_get(record, "rx_bytes"),
+            tx_bytes=_get(record, "tx_bytes"),
+            rx_bytes_per_sec=_get(record, "rx_bytes-r"),
+            tx_bytes_per_sec=_get(record, "tx_bytes-r"),
             _was_dict=True,
         )
 
@@ -473,9 +489,25 @@ class AutoBackupSettings:
 class TopClient:
     mac: str | None
     hostname: str | None
-    tx_bytes: int | None
-    rx_bytes: int | None
-    total_bytes: int | None
+    tx_bytes: BigInt | None = strawberry.field(
+        description="Bytes the network transmitted to this client (the client's download)."
+    )
+    rx_bytes: BigInt | None = strawberry.field(
+        description="Bytes the network received from this client (the client's upload)."
+    )
+    upload_bytes: BigInt | None = strawberry.field(
+        description="Bytes uploaded by this client (same value as rx_bytes)."
+    )
+    download_bytes: BigInt | None = strawberry.field(
+        description="Bytes downloaded by this client (same value as tx_bytes)."
+    )
+    total_bytes: BigInt | None
+    source: str | None = strawberry.field(
+        description=(
+            "'report' when summed over the requested window; 'live_counters' when cumulative "
+            "since association and not scoped to the window."
+        )
+    )
     _was_dict: strawberry.Private[bool] = True
 
     @classmethod
@@ -495,7 +527,10 @@ class TopClient:
                 hostname=None,
                 tx_bytes=None,
                 rx_bytes=None,
+                upload_bytes=None,
+                download_bytes=None,
                 total_bytes=None,
+                source=None,
                 _was_dict=False,
             )
         return cls(
@@ -503,7 +538,10 @@ class TopClient:
             hostname=_get(record, "name", "hostname"),
             tx_bytes=_get(record, "tx_bytes"),
             rx_bytes=_get(record, "rx_bytes"),
+            upload_bytes=_get(record, "upload_bytes"),
+            download_bytes=_get(record, "download_bytes"),
             total_bytes=_get(record, "total_bytes", "bytes"),
+            source=_get(record, "source"),
             _was_dict=True,
         )
 
@@ -517,10 +555,14 @@ class TopClient:
 
 @strawberry.type(description="A speedtest result entry.")
 class SpeedtestResult:
-    timestamp: int | None
+    timestamp: BigInt | None = strawberry.field(description="When the test ran, in epoch milliseconds.")
     download_mbps: float | None
     upload_mbps: float | None
     latency_ms: float | None
+    wan_networkgroup: str | None = strawberry.field(
+        description="WAN the test ran on (e.g. WAN, WAN2); null when the controller does not say."
+    )
+    interface_name: str | None = strawberry.field(description="Gateway interface the test ran on (e.g. eth8).")
     _was_dict: strawberry.Private[bool] = True
 
     @classmethod
@@ -529,6 +571,7 @@ class SpeedtestResult:
             "kind": kind,
             "display_columns": [
                 "timestamp",
+                "wan_networkgroup",
                 "download_mbps",
                 "upload_mbps",
                 "latency_ms",
@@ -544,6 +587,8 @@ class SpeedtestResult:
                 download_mbps=None,
                 upload_mbps=None,
                 latency_ms=None,
+                wan_networkgroup=None,
+                interface_name=None,
                 _was_dict=False,
             )
         return cls(
@@ -551,6 +596,8 @@ class SpeedtestResult:
             download_mbps=_get(record, "xput_download", "download_mbps"),
             upload_mbps=_get(record, "xput_upload", "upload_mbps"),
             latency_ms=_get(record, "latency", "latency_ms"),
+            wan_networkgroup=_get(record, "wan_networkgroup"),
+            interface_name=_get(record, "interface_name"),
             _was_dict=True,
         )
 

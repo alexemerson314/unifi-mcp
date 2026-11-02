@@ -24,6 +24,7 @@ from unifi_core.network.models.threat_management import (
 )
 from unifi_core.network.models.threat_posture import ThreatPosture, threat_posture_from_controller
 from unifi_core.redaction import collect_secret_values, sanitize_exception
+from unifi_core.request_paths import object_id
 from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
@@ -585,7 +586,9 @@ class SystemManager:
             return cached_data
 
         try:
-            api_request = ApiRequest(method="get", path=f"/get/setting/{section}")
+            # An empty section reads every section.
+            path = f"/get/setting/{object_id(section, 'settings section')}" if section else "/get/setting/"
+            api_request = ApiRequest(method="get", path=path)
             response = await self._connection.request(api_request)
             settings_list = response if isinstance(response, list) else []
             self._connection._update_cache(cache_key, settings_list)
@@ -625,7 +628,7 @@ class SystemManager:
             if "key" not in settings_data:
                 settings_data["key"] = section
 
-            endpoint = f"/set/setting/{section}"
+            endpoint = f"/set/setting/{object_id(section, 'settings section')}"
 
             api_request = ApiRequest(method="put", path=endpoint, data=settings_data)
             response = await self._connection.request(api_request)
@@ -1122,7 +1125,7 @@ class SystemManager:
                 logger.error("Cannot delete the currently configured admin user for this connection.")
                 return False
 
-            api_request = ApiRequest(method="delete", path=f"/api/stat/admin/{user_id}")
+            api_request = ApiRequest(method="delete", path=f"/api/stat/admin/{object_id(user_id, 'admin user')}")
             response = await self._connection.request(api_request)
 
             success = isinstance(response, dict) and response.get("meta", {}).get("rc") == "ok"

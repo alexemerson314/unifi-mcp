@@ -311,8 +311,8 @@ Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
   tagged and the pin moves; usually in or after the writeback.
 - **Enforcement.** `make check-plugin-versions` admits version bumps and pins;
   `make check-plugin-tool-refs` fails when a shipped plugin file names a tool absent
-  from the release tag its product's plugin pins (cross-product: the product pins plus
-  the latest released relay). Both run in `make pre-commit` and in the generated-artifacts
+  from the release tag its product's plugin pins (unifi-intelligence: the product pins plus
+  the latest released cloud worker). Both run in `make pre-commit` and in the generated-artifacts
   CI job. Never weaken either check to pass a PR; fix the plugin text or move the pin.
 - **Counts and references follow the pin.** Plugin skill tool counts and the generated
   `references/*-tools.md` come from the manifest of the release tag each plugin pins
@@ -325,8 +325,13 @@ Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
 
 - Each plugin has an independent SemVer describing everything it ships, separate from
   the server pin. Set the same `version` in every existing Claude and Codex manifest
-  (at least one). The unlisted `cross-product` bundle uses its Claude manifest only.
+  (at least one). The skills-only `unifi-intelligence` bundle has both manifests, no MCP
+  config and no pin, and names the MCP plugins it needs in the Claude manifest's
+  `dependencies`; Codex and OpenClaw install no dependencies, so its descriptions say so.
   Keep `version` out of marketplace entries.
+- A renamed plugin is a new identity to every client, so it starts at `1.0.0`. The guard
+  checks a plugin with no files at the merge base as new and skips a removed one; say in
+  the upgrade guide what users of the old name do.
 - Bump every affected plugin in the same PR whenever any file under `plugins/<name>/`
   changes, including skills, references, setup scripts, MCP configs and docs. Version-only
   bumps are allowed.
@@ -340,19 +345,23 @@ Hermes Agent `plugins.md` and `plugin-catalog.md` (NousResearch/hermes-agent).
 - Writeback: `bump-plugin-versions.yml` runs
   `python3 scripts/plugin_versions.py sync --releasing <package-tag>`. It moves the inline
   Claude pin and the `.mcp.codex.json` pin, bumps the plugin by the size of the server move,
-  and regenerates `apps/<product>/server.json` with the **server** version. Retrying an
-  already-synced pin does not bump again. Core, Shared and Relay triggers only coalesce
+  regenerates `apps/<product>/server.json` with the **server** version, and inserts one
+  `CHANGELOG.md` entry naming every plugin it bumped and linking each server release.
+  Retrying an already-synced pin does not bump again. Core, Shared and Relay triggers only coalesce
   outstanding product tags, otherwise they write nothing.
 - `make check-plugin-versions` runs `scripts/plugin_versions.py check --base origin/main`;
   PR CI uses the PR base SHA. Fetch base history and tags first; a missing base fails.
   Changed plugin versions must be valid SemVer, agree across manifests and exceed the
-  merge-base version. Pins must agree and name release tags; only the workflow's exact
+  merge-base version, and `CHANGELOG.md` needs an entry heading naming `<plugin> <version>`
+  for each changed or new plugin. Pins must agree and name release tags; only the workflow's exact
   `--releasing` tag may stand in for a tag not yet discovered locally.
 
 ### Release checklist
 
-1. Bump the version by the rules above and write the user-visible changes in the PR
-   description; the squash commit carries them as the release notes.
+1. Bump the version by the rules above and add a `CHANGELOG.md` entry below its marker:
+   `## <YYYY-MM-DD UTC> — <plugin> <version>[, <plugin> <version>…]`, then the user-visible
+   changes in plain language (what users notice, not how it was built). Repeat them in the
+   PR description. The README describes what each plugin is; never put release notes there.
 2. Run `make pre-commit` (both plugin checks included).
 3. Merge as one squash merge.
 4. Tell users how to update, per the client table: Claude Code users update the

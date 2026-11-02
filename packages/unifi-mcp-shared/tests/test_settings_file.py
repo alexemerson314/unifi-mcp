@@ -420,14 +420,11 @@ def test_no_value_from_the_file_is_logged(tmp_path, bundled_config, caplog):
 
 
 def test_report_is_flushed_once(tmp_path, caplog):
+    assert flushed(caplog) == ""
     path = settings(tmp_path, "UNIFI_NETWORK_HOST=192.0.2.10\n")
     os.environ["UNIFI_SETTINGS_FILE"] = str(path)
     bootstrap.load_process_env()
     first = flushed(caplog)
     caplog.clear()
     assert "Loaded 1 setting" in first
-    assert flushed(caplog) == ""
-
-
-def test_report_without_load_is_a_no_op(caplog):
     assert flushed(caplog) == ""

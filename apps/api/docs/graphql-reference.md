@@ -506,6 +506,33 @@ type ClientWifiDetails {
   txRate: Int
   rxRate: Int
   channel: Int
+
+  """Noise floor in dBm."""
+  noise: Int
+
+  """Controller-computed satisfaction score (0-100)."""
+  satisfaction: Int
+
+  """Transmit retry count since association."""
+  txRetries: BigInt
+
+  """Transmit attempt count since association."""
+  wifiTxAttempts: BigInt
+
+  """Number of roams since association."""
+  roamCount: Int
+
+  """Radio band identifier (e.g. na, ng)."""
+  radio: String
+
+  """BSSID of the AP radio the client is associated to."""
+  bssid: String
+
+  """Number of spatial streams."""
+  nss: Int
+
+  """Whether the client uses 802.11r fast roaming."""
+  is11r: Boolean
 }
 
 """A content-filtering profile (V2 /content-filtering entry)."""
@@ -1288,8 +1315,26 @@ type NetworkHealth {
   numUser: Int
   numGuest: Int
   numIot: Int
-  rxBytes: Int
-  txBytes: Int
+
+  """
+  Cumulative bytes received on this subsystem, when the controller sends a counter.
+  """
+  rxBytes: BigInt
+
+  """
+  Cumulative bytes transmitted on this subsystem, when the controller sends a counter.
+  """
+  txBytes: BigInt
+
+  """
+  Current receive rate on this subsystem in bytes per second (not a total).
+  """
+  rxBytesPerSec: Float
+
+  """
+  Current transmit rate on this subsystem in bytes per second (not a total).
+  """
+  txBytesPerSec: Float
 }
 
 """Paginated page of network configurations."""
@@ -1825,7 +1870,7 @@ type ProtectQuery {
   alarmStatus(controller: ID!): AlarmStatus
 
   """
-  List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.
+  List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Use arm_compatible to determine whether a profile id can be passed to the arm and disarm actions.
   """
   alarmProfiles(controller: ID!): AlarmProfileList
 
@@ -2102,10 +2147,19 @@ type SnmpSettings {
 
 """A speedtest result entry."""
 type SpeedtestResult {
-  timestamp: Int
+  """When the test ran, in epoch milliseconds."""
+  timestamp: BigInt
   downloadMbps: Float
   uploadMbps: Float
   latencyMs: Float
+
+  """
+  WAN the test ran on (e.g. WAN, WAN2); null when the controller does not say.
+  """
+  wanNetworkgroup: String
+
+  """Gateway interface the test ran on (e.g. eth8)."""
+  interfaceName: String
 }
 
 """Paginated page of speedtest result entries."""
@@ -2232,9 +2286,24 @@ type ThreatPosture {
 type TopClient {
   mac: String
   hostname: String
-  txBytes: Int
-  rxBytes: Int
-  totalBytes: Int
+
+  """Bytes the network transmitted to this client (the client's download)."""
+  txBytes: BigInt
+
+  """Bytes the network received from this client (the client's upload)."""
+  rxBytes: BigInt
+
+  """Bytes uploaded by this client (same value as rx_bytes)."""
+  uploadBytes: BigInt
+
+  """Bytes downloaded by this client (same value as tx_bytes)."""
+  downloadBytes: BigInt
+  totalBytes: BigInt
+
+  """
+  'report' when summed over the requested window; 'live_counters' when cumulative since association and not scoped to the window.
+  """
+  source: String
 }
 
 """A single UniFi traffic-flow record."""
@@ -2262,6 +2331,7 @@ type TrafficFlowEndpoint {
   name: String
   mac: String
   ip: String
+  port: Int
   networkName: String
   zoneName: String
   domains: [String!]!
@@ -2693,7 +2763,7 @@ Read-only access to UniFi Protect resources.
 
 **Fields:**
 
-- `alarmProfiles: AlarmProfileList`  — List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Alarm Manager v2 profile IDs are scoped to this read family; use arm_compatible to determine whether a profile can be passed to legacy arm actions.
+- `alarmProfiles: AlarmProfileList`  — List configured alarm profiles ({profiles, count, complete, coverageNotice}), including each profile's state and state_set_at timestamp. Use arm_compatible to determine whether a profile id can be passed to the arm and disarm actions.
 - `alarmRule: AlarmRule`  — Fetch a single alarm rule (automation) by id.
 - `alarmRules: AlarmRuleList`  — List configured alarm rules / Alarm Manager automations ({rules, count}).
 - `alarmStatus: AlarmStatus`  — Get the alarm system arm-state snapshot.

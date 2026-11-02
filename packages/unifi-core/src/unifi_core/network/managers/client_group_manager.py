@@ -16,6 +16,7 @@ from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.mac import normalize_mac_list
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -68,7 +69,7 @@ class ClientGroupManager:
         if not await self._connection.ensure_connected():
             raise ConnectionError("Not connected to controller")
 
-        api_request = ApiRequestV2(method="get", path=f"/network-members-group/{group_id}")
+        api_request = ApiRequestV2(method="get", path=f"/network-members-group/{object_id(group_id, 'client group')}")
         try:
             response = await self._connection.request(api_request)
         except Exception:
@@ -164,7 +165,9 @@ class ClientGroupManager:
             return existing
 
         merged_data = deep_merge(existing, update_data)
-        api_request = ApiRequestV2(method="put", path=f"/network-members-group/{group_id}", data=merged_data)
+        api_request = ApiRequestV2(
+            method="put", path=f"/network-members-group/{object_id(group_id, 'client group')}", data=merged_data
+        )
         await self._connection.request(api_request)
         self._invalidate_cache()
         return merged_data
@@ -182,7 +185,9 @@ class ClientGroupManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            api_request = ApiRequestV2(method="delete", path=f"/network-members-group/{group_id}")
+            api_request = ApiRequestV2(
+                method="delete", path=f"/network-members-group/{object_id(group_id, 'client group')}"
+            )
             await self._connection.request(api_request)
 
             self._invalidate_cache()

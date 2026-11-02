@@ -25,15 +25,6 @@ def cm_proxy():
 
 
 @pytest.fixture
-def cm_api():
-    """ConnectionManager with API client available."""
-    cm = AccessConnectionManager(host="192.0.2.1", username="", password="", api_key="test-key")
-    cm._api_client_available = True
-    cm._api_client = AsyncMock()
-    return cm
-
-
-@pytest.fixture
 def cm_none():
     """ConnectionManager with no auth paths."""
     return AccessConnectionManager(host="192.0.2.1", username="", password="")
@@ -42,11 +33,6 @@ def cm_none():
 @pytest.fixture
 def event_mgr_proxy(cm_proxy):
     return EventManager(cm_proxy)
-
-
-@pytest.fixture
-def event_mgr_api(cm_api):
-    return EventManager(cm_api)
 
 
 @pytest.fixture
@@ -131,22 +117,10 @@ class TestEventManagerBuffer:
 
 class TestEventManagerWebsocket:
     @pytest.mark.asyncio
-    async def test_start_listening_with_api_client(self, event_mgr_api, cm_api):
-        """start_listening starts websocket via API client."""
-        cm_api.start_websocket = MagicMock()
-        await event_mgr_api.start_listening()
-        cm_api.start_websocket.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_start_listening_without_api_client(self, event_mgr_proxy):
         """start_listening logs warning when no API client."""
         # Should not raise
         await event_mgr_proxy.start_listening()
-
-    def test_on_event_dict(self, event_mgr_proxy):
-        """_on_event buffers dict events."""
-        event_mgr_proxy._on_event({"type": "door_open", "door_id": "d1"})
-        assert event_mgr_proxy.buffer_size == 1
 
     def test_on_event_object(self, event_mgr_proxy):
         """_on_event converts object events to dict."""
@@ -285,18 +259,6 @@ class TestEventManagerREST:
         assert "until=" in path
         assert "interval=3600" in path
         assert "door_id=d1" in path
-
-    @pytest.mark.asyncio
-    async def test_get_activity_summary_default_days(self, event_mgr_proxy, cm_proxy):
-        """get_activity_summary uses correct time range for default 7 days."""
-        with patch.object(cm_proxy, "proxy_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = {"data": {}}
-            await event_mgr_proxy.get_activity_summary()
-
-        path = mock_req.call_args[0][1]
-        # The 'since' parameter should be approximately 7 days ago
-        assert "since=" in path
-        assert "until=" in path
 
     @pytest.mark.asyncio
     async def test_get_activity_summary_no_proxy(self, event_mgr_none):

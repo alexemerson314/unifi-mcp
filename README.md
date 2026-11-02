@@ -23,6 +23,19 @@ Leverage agents and agentic AI workflows to manage your UniFi deployment.
 | [Protect](apps/protect/) | Stable | 63 | [`unifi-protect-mcp`](https://pypi.org/project/unifi-protect-mcp/) |
 | [Access](apps/access/) | Stable | 37 | [`unifi-access-mcp`](https://pypi.org/project/unifi-access-mcp/) |
 
+## Plugins
+
+Install these from the Claude Code, Codex or OpenClaw marketplace; [Quick Start](#quick-start) shows how.
+
+| Plugin | What you get |
+|--------|--------------|
+| `unifi-network` | The Network MCP server, its agent skills and guided setup |
+| `unifi-protect` | The Protect MCP server, its agent skills and guided setup |
+| `unifi-access` | The Access MCP server, its agent skills and guided setup |
+| `unifi-intelligence` | Cross-product investigations that use Network and Protect together, with every claim cited. Incident Investigation runs locally; Security Patrol and Visitor Audit need the [cloud worker](#cloud-relay). It requires the Network and Protect plugins |
+
+The [Agent Skills](#agent-skills) table lists every skill each plugin ships.
+
 ## Choose an integration
 
 | What you are building | Use | Why |
@@ -64,15 +77,16 @@ UniFi MCP is a collection of [Model Context Protocol](https://modelcontextprotoc
 
 ## MCP HTTP Access
 
-MCP HTTP is unauthenticated and intended for trusted local clients. HTTP is disabled by default; when enabled, packages bind to loopback. Docker Compose enables it on the container network and publishes ports 3000–3002 on host `127.0.0.1`. Use an authenticated TLS proxy or Cloud Relay for remote access, and prevent direct access to the backend. See the [transport security model](SECURITY.md#mcp-transport-trust-boundary) and [HTTP setup and migration](apps/network/docs/transports.md#http-deployment-security).
+MCP HTTP is unauthenticated by default and intended for trusted local clients. Set `UNIFI_MCP_HTTP_AUTH_TOKEN` to require a static bearer token on every HTTP request ([details](apps/network/docs/transports.md#http-bearer-token)). HTTP is disabled by default; when enabled, packages bind to loopback. Docker Compose enables it on the container network and publishes ports 3000–3002 on host `127.0.0.1`. Use an authenticated TLS proxy or Cloud Relay for remote access, and prevent direct access to the backend. See the [transport security model](SECURITY.md#mcp-transport-trust-boundary) and [HTTP setup and migration](apps/network/docs/transports.md#http-deployment-security).
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `UNIFI_MCP_HTTP_ENABLED` | `false` | Opt into HTTP transport |
 | `UNIFI_MCP_HOST` | `127.0.0.1` | Bind address; Compose explicitly uses `0.0.0.0` inside containers |
 | `UNIFI_MCP_HTTP_FORCE` | `false` | Allow HTTP outside container PID 1 |
-| `UNIFI_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Complete accepted Host-header list; Compose separately adds required internal hosts |
+| `UNIFI_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Complete accepted Host-header list; Compose separately adds required internal hosts. List each host: the MCP SDK has no wildcard beyond a `:*` port suffix, so an entry with any other `*` (`*`, `*.example.com`) stops the server at startup instead of accepting every host |
 | `UNIFI_MCP_ENABLE_DNS_REBINDING_PROTECTION` | `true` | Validate Host headers to prevent DNS-rebinding requests |
+| `UNIFI_MCP_HTTP_AUTH_TOKEN` | unset | Require `Authorization: Bearer <token>` on every HTTP request; at least 32 printable ASCII characters. `UNIFI_<NETWORK\|PROTECT\|ACCESS>_MCP_HTTP_AUTH_TOKEN` overrides it per server, and `_FILE`/`_COMMAND` spellings work. Set but empty refuses startup |
 
 ## MCP Discovery
 
@@ -114,45 +128,8 @@ OpenCode's built-in MCP support, and the current manual paths for Antigravity,
 Cursor, and Devin Desktop. A skills install adds agent guidance; it does not by
 itself register the MCP server.
 
-### What's new in the 1.0.1 plugins
-
-- **A down controller no longer fails the plugin.** The servers answer the
-  client before the controller connects. While it is unreachable, tools say the
-  server is still connecting or cannot reach the controller, and recover on
-  their own once it is back.
-- **Connection errors name the real cause.** A network failure says the
-  controller is unreachable instead of asking you to check your credentials.
-- **Claude Code setup protects a keychain-held secret.** Claude Code cannot
-  clear a password or API key it holds in the system keychain, so setup refuses,
-  before writing, a change that would clear one. It says how to switch:
-  uninstall and reinstall the plugin, then run setup with the provider and the
-  options it lists.
-- The plugins pin `unifi-network-mcp` 0.37.2, `unifi-protect-mcp` 0.8.19 and
-  `unifi-access-mcp` 0.6.14.
-
-### What's new in the 1.0.0 plugins
-
-- **Claude Code keeps settings as plugin options.** The plugins no longer read
-  the project's `.claude/settings.local.json`; passwords and API keys entered
-  as options go to the system keychain. Existing users run the setup migration
-  once per plugin (`set-env.sh --target claude --migrate`). Options apply in
-  every project, so a project's own settings stop being used once another
-  project is migrated; the upgrade guide covers several projects.
-- **No secrets in chat or command arguments.** Setup uses a password or API-key
-  file or command provider, and every configuration write is validated and
-  atomic.
-- **Plugin versions are independent of server versions.** All plugins are now
-  1.0.0 and pin the current server releases.
-- **Server improvements.** The pinned servers (`unifi-network-mcp` 0.37.1,
-  `unifi-protect-mcp` 0.8.18, `unifi-access-mcp` 0.6.13) reconnect Access and
-  Protect after a failed start, read Codex's settings file, and start in setup
-  mode with a read-only `*_setup_status` tool instead of exiting when
-  unconfigured.
-- **Skills report their coverage** and give no all-clear from missing, partial
-  or capped data.
-
-Read the [plugin upgrade guide](docs/plugin-upgrade.md) before updating an
-existing install.
+See the [changelog](CHANGELOG.md) for what each plugin release changed, and the
+[plugin upgrade guide](docs/plugin-upgrade.md) before updating an existing install.
 
 ### Claude Code (recommended)
 
@@ -170,7 +147,13 @@ Repeat for Protect or Access if needed:
 /plugin install unifi-access@unifi-plugins
 ```
 
-`/plugin install` opens the plugin's options dialog straight away; fill it in there, or close it and run the setup command. Each plugin's setup command walks you through connecting to your controller and configuring permissions, and saves the result as the plugin's Claude Code options. Auto-update is off by default for this marketplace; see the [plugin upgrade guide](docs/plugin-upgrade.md) for update steps.
+For the cross-product skills, `/plugin install unifi-intelligence@unifi-plugins`
+also installs the Network and Protect plugins it needs. Claude Code opens no
+options dialog for plugins it installs as dependencies, so run each product's
+setup command (`/unifi-network:unifi-network-setup`,
+`/unifi-protect:unifi-protect-setup`) for any not yet configured.
+
+`/plugin install` of a product plugin opens its options dialog straight away; fill it in there, or close it and run the setup command. Each plugin's setup command walks you through connecting to your controller and configuring permissions, and saves the result as the plugin's Claude Code options. Auto-update is off by default for this marketplace; see the [plugin upgrade guide](docs/plugin-upgrade.md) for update steps.
 
 Prerequisites, version boundaries and verification status for each client are in the [plugin support matrix](docs/plugin-support.md).
 
@@ -182,7 +165,7 @@ Register the UniFi MCP marketplace, then install the plugins from Codex's `/plug
 codex plugin marketplace add sirkirby/unifi-mcp
 ```
 
-Launch `codex`, run `/plugins`, open the UniFi MCP marketplace, and install `unifi-network`, `unifi-protect`, or `unifi-access`. After installing, ask Codex to run the plugin's setup skill, for example:
+Launch `codex`, run `/plugins`, open the UniFi MCP marketplace, and install `unifi-network`, `unifi-protect`, or `unifi-access`. `unifi-intelligence` adds the cross-product skills; Codex does not install plugin dependencies, so install and set up `unifi-network` and `unifi-protect` before it. After installing, ask Codex to run the plugin's setup skill, for example:
 
 > Use the `unifi-network-setup` skill to configure this for Codex.
 
@@ -212,7 +195,7 @@ bash ~/.openclaw/extensions/unifi-network/scripts/set-env.sh --target openclaw \
   'UNIFI_NETWORK_PASSWORD_FILE=/absolute/path/to/password-file'
 ```
 
-Setup saves these settings in `~/.config/unifi-mcp/network.env`, readable by you only, and the plugin's own server reads that file. It adds no entry to `openclaw.json`, so `openclaw plugins update` brings each new server version with nothing to rerun. An `mcp.servers.unifi-network` entry in `openclaw.json` replaces the plugin's server and pins its version; setup before plugin 1.0.0 wrote one, and `set-env.sh --target openclaw --refresh` converts it once (see the [upgrade guide](docs/plugin-upgrade.md#openclaw)). Repeat with `unifi-protect` or `unifi-access` as needed.
+Setup saves these settings in `~/.config/unifi-mcp/network.env`, readable by you only, and the plugin's own server reads that file. It adds no entry to `openclaw.json`, so `openclaw plugins update` brings each new server version with nothing to rerun. An `mcp.servers.unifi-network` entry in `openclaw.json` replaces the plugin's server and pins its version; setup before plugin 1.0.0 wrote one, and `set-env.sh --target openclaw --refresh` converts it once (see the [upgrade guide](docs/plugin-upgrade.md#openclaw)). Repeat with `unifi-protect` or `unifi-access` as needed. Install `unifi-intelligence` for the cross-product skills only after setting up `unifi-network` and `unifi-protect`; OpenClaw does not install plugin dependencies.
 
 ### Other MCP clients
 
@@ -282,9 +265,9 @@ Once connected, just ask your AI agent in natural language:
 > "Who badged into the office today? Show me a timeline of all door access events"
 > "Create a visitor pass for John Smith with access to the main entrance tomorrow 9-5"
 
-**Cross-Product** (requires [relay](packages/unifi-mcp-relay/) for full experience)
-> "Show me everything that happened at the front entrance in the last hour" — correlates Network clients, Protect camera events, and Access badge scans in a single timeline
-> "A switch went offline at 2 AM — was there physical activity nearby?"
+**UniFi Intelligence** (the `unifi-intelligence` plugin)
+> "Switch `aa:bb:cc:00:10:02` dropped off at 8:45 this morning, New York time. What happened between 8:00 and 9:00?" — cites Network events and mapped Protect camera events with their coverage
+> "Show me everything that happened at the front entrance in the last hour" — needs the [cloud worker](apps/worker/) and [relay](packages/unifi-mcp-relay/)
 
 All mutations use a **preview-then-confirm** flow — you see exactly what will change before anything is applied.
 
@@ -324,6 +307,8 @@ Each server supports its own prefixed environment variables that take priority o
 
 **Single controller?** Just set the shared `UNIFI_*` variables -- all servers will use them. Server-specific variables are only needed when the servers talk to different controllers or use different credentials.
 
+**Tracing:** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export the MCP SDK's spans over OTLP, one per MCP message, continuing a trace context passed in the request's `_meta`. The Docker images include the exporter; pip and uvx installs need the `otel` extra (for example `unifi-network-mcp[otel]`). Off by default.
+
 For the full configuration reference including permissions, transports, and advanced options, see the [Network server docs](apps/network/docs/configuration.md), [Protect server docs](apps/protect/docs/configuration.md), or [Access server docs](apps/access/docs/configuration.md).
 
 ## Secret redaction
@@ -343,10 +328,13 @@ Each plugin ships with agent skills that go beyond raw tool access — they teac
 | **Firewall Auditor** | unifi-network | Security audit with 16 benchmarks, 100-point scoring, topology analysis, and trend tracking |
 | **Security Digest** | unifi-protect | Protect event summary with explicit coverage limits; optional Access and Network reads add correlation hypotheses |
 | **UniFi Access** | unifi-access | Door control, credentials, visitors, access policies — with real-time event streaming and activity summaries |
+| **Incident Investigation** | unifi-intelligence | One Network device incident with Protect camera context, from the read-only incident evidence tools, with cited coverage |
+| **Security Patrol** | unifi-intelligence | Area activity from the cloud worker's merged location timeline |
+| **Visitor Audit** | unifi-intelligence | Access events beside Network evidence from the cloud worker's timeline, with identity limits |
 
 Skills include reference documentation for device states, alarm types, firewall schemas, and event fields. The agent gathers and interprets evidence; the firewall score CLI computes scores from supported findings. Firewall snapshots, diffs, and template application follow the skill instructions.
 
-Each non-setup skill declares required and optional servers and requires a Coverage and Limitations section in reports. Missing required dependencies stop the workflow; optional missing sources, failed reads, and result caps are disclosed. Cross-product repository workflows require a separately available relay for merged timelines; see [Cross-Product Capabilities](docs/cross-product.md).
+Each non-setup skill declares required and optional servers and requires a Coverage and Limitations section in reports. Missing required dependencies stop the workflow; optional missing sources, failed reads, and result caps are disclosed. Security Patrol and Visitor Audit need the cloud worker's merged timeline through a connected relay; see [Cross-Product Capabilities](docs/cross-product.md).
 
 ## Architecture
 
@@ -367,7 +355,7 @@ plugins/
   unifi-network/    # Claude Code/Codex/OpenClaw plugin: MCP server + agent skills + setup
   unifi-protect/    # Claude Code/Codex/OpenClaw plugin: MCP server + agent skills + setup
   unifi-access/     # Claude Code/Codex/OpenClaw plugin: MCP server + agent skills + setup
-  cross-product/    # Unlisted skills-only bundle; merged timelines need the relay
+  unifi-intelligence/ # Skills-only plugin; needs unifi-network and unifi-protect
 skills/
   _shared/          # Shared utilities for skill scripts (MCP client, config)
 docs/               # Ecosystem-level documentation

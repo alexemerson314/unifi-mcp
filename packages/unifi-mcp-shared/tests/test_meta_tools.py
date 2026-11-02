@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -18,7 +19,9 @@ from mcp.types import (
 )
 from pydantic import BaseModel
 from unifi_core.jobs import JobStore
+from unifi_core.policy_gate import PolicyGateChecker
 from unifi_mcp_shared.meta_tools import is_meta_tool, register_load_tools, register_meta_tools
+from unifi_mcp_shared.permissioned_tool import create_permissioned_tool
 from unifi_mcp_shared.tool_index import TOOL_REGISTRY, get_tool_index, register_tool
 
 
@@ -61,7 +64,7 @@ def _register_test_meta_tools(*, server, prefix, start_async_tool=None, get_job_
     return registered
 
 
-def test_tool_index_schema_describes_ranked_token_search():
+def test_meta_tool_registered_schemas_and_descriptions():
     register_tool = Mock()
     register_meta_tools(
         server=SimpleNamespace(),
@@ -74,53 +77,19 @@ def test_tool_index_schema_describes_ranked_token_search():
         prefix="unifi",
     )
 
-    index_call = next(call for call in register_tool.call_args_list if call.kwargs["name"] == "unifi_tool_index")
-    description = index_call.kwargs["input_schema"]["properties"]["search"]["description"]
+    calls = {call.kwargs["name"]: call.kwargs for call in register_tool.call_args_list}
+    description = calls["unifi_tool_index"]["input_schema"]["properties"]["search"]["description"]
     assert "token search" in description
     assert "at most 20" in description
     assert "no usable terms returns no tools" in description
+    assert "manifest-backed in lazy mode" in calls["unifi_tool_index"]["description"]
+    assert "in meta-only mode it starts with registered meta-tools" in calls["unifi_tool_index"]["description"]
 
-    tool_description = index_call.kwargs["description"]
-    assert "manifest-backed in lazy mode" in tool_description
-    assert "in meta-only mode it starts with registered meta-tools" in tool_description
+    assert calls["unifi_execute"]["input_schema"]["properties"]["arguments"]["type"] == ["object", "null"]
 
-
-def test_execute_tool_index_schema_accepts_null_arguments():
-    register_tool = Mock()
-    register_meta_tools(
-        server=SimpleNamespace(),
-        tool_decorator=_capture_tools()[1],
-        tool_index_handler=AsyncMock(return_value={}),
-        start_async_tool=AsyncMock(),
-        get_job_status=AsyncMock(),
-        register_tool=register_tool,
-        support_bundle_handler=AsyncMock(return_value={"success": True, "data": {}}),
-        prefix="unifi",
-    )
-
-    execute_call = next(call for call in register_tool.call_args_list if call.kwargs["name"] == "unifi_execute")
-    arguments_schema = execute_call.kwargs["input_schema"]["properties"]["arguments"]
-    assert arguments_schema["type"] == ["object", "null"]
-
-
-def test_batch_schema_explains_tool_discovery_by_registration_mode():
-    register_tool = Mock()
-    register_meta_tools(
-        server=SimpleNamespace(),
-        tool_decorator=_capture_tools()[1],
-        tool_index_handler=AsyncMock(return_value={}),
-        start_async_tool=AsyncMock(),
-        get_job_status=AsyncMock(),
-        register_tool=register_tool,
-        support_bundle_handler=AsyncMock(return_value={"success": True, "data": {}}),
-        prefix="unifi",
-    )
-
-    batch_call = next(call for call in register_tool.call_args_list if call.kwargs["name"] == "unifi_batch")
-    operations_schema = batch_call.kwargs["input_schema"]["properties"]["operations"]
+    operations_schema = calls["unifi_batch"]["input_schema"]["properties"]["operations"]
     tool_description = operations_schema["items"]["properties"]["tool"]["description"]
     arguments_description = operations_schema["items"]["properties"]["arguments"]["description"]
-
     assert "unifi_tool_index in lazy mode" in tool_description
     assert "known domain tool name in meta-only mode" in tool_description
     assert arguments_description == "Tool parameters matching the domain tool's input schema"
@@ -360,8 +329,9 @@ async def test_batch_preserves_content_only_result(prefix, content):
     assert stored["result"] is content
 
 
+@pytest.mark.parametrize("execute_args", [{}, None])
 @pytest.mark.parametrize("prefix", ["unifi", "protect", "access"])
-async def test_fastmcp_execute_and_batch_expose_domain_payload(prefix):
+async def test_fastmcp_execute_and_batch_expose_domain_payload(prefix, execute_args):
     payload = {"success": True, "data": {"id": "abc"}}
     server = FastMCP(f"{prefix}-test")
     store = JobStore()
@@ -387,7 +357,7 @@ async def test_fastmcp_execute_and_batch_expose_domain_payload(prefix):
 
     execute = await server.call_tool(
         f"{prefix}_execute",
-        {"tool": f"{prefix}_inner", "arguments": {}},
+        {"tool": f"{prefix}_inner", "arguments": execute_args},
     )
     assert json.loads(execute.content[0].text) == payload
 
@@ -408,107 +378,28 @@ async def test_fastmcp_execute_and_batch_expose_domain_payload(prefix):
     assert status_payload["result"] == payload
 
 
-@pytest.mark.parametrize("prefix", ["unifi", "protect", "access"])
-async def test_fastmcp_execute_accepts_null_arguments(prefix):
-    payload = {"success": True, "data": {"id": "abc"}}
-    server = FastMCP(f"{prefix}-test")
-
-    @server.tool(name=f"{prefix}_inner", structured_output=True)
-    async def structured_inner() -> StructuredInnerResult:
-        return StructuredInnerResult(**payload)
-
-    register_meta_tools(
-        server=server,
-        tool_decorator=server.tool,
-        tool_index_handler=AsyncMock(return_value={}),
-        start_async_tool=AsyncMock(),
-        get_job_status=AsyncMock(),
-        register_tool=Mock(),
-        support_bundle_handler=AsyncMock(return_value={"success": True, "data": {}}),
-        prefix=prefix,
-    )
-
-    execute = await server.call_tool(
-        f"{prefix}_execute",
-        {"tool": f"{prefix}_inner", "arguments": None},
-    )
-
-    assert json.loads(execute.content[0].text) == payload
-
-
 class TestRegisterLoadTools:
     """Tests for lazy direct-tool loading and list-changed notifications."""
 
     @pytest.mark.asyncio
-    async def test_loaded_tools_send_list_changed_notification(self):
+    @pytest.mark.parametrize(
+        ("tools", "load_return", "expected_loaded", "expected_errors", "notified"),
+        [
+            (["unifi_list_clients"], True, ["unifi_list_clients"], None, True),
+            (["unifi_unknown"], True, [], [{"tool": "unifi_unknown", "error": "Unknown tool"}], False),
+            (["unifi_list_clients"], False, [], [{"tool": "unifi_list_clients", "error": "Failed to load"}], False),
+        ],
+    )
+    async def test_load_tools_behavior_and_notifications(
+        self, tools, load_return, expected_loaded, expected_errors, notified
+    ):
         registered, tool_decorator = _capture_tools()
-        lazy_loader = SimpleNamespace(load_tool=AsyncMock(return_value=True))
-        register_tool = Mock()
+        lazy_loader = SimpleNamespace(load_tool=AsyncMock(return_value=load_return))
 
         register_load_tools(
             server=Mock(),
             tool_decorator=tool_decorator,
             lazy_loader=lazy_loader,
-            register_tool=register_tool,
-            tool_module_map={"unifi_list_clients": "unifi_network_mcp.tools.clients"},
-        )
-
-        ctx = _context()
-        result = await registered["unifi_load_tools"]["handler"](["unifi_list_clients"], ctx)
-
-        assert result["loaded"] == ["unifi_list_clients"]
-        assert result["errors"] is None
-        lazy_loader.load_tool.assert_awaited_once_with("unifi_list_clients")
-        ctx.notify_tools_changed.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_unknown_tools_do_not_send_list_changed_notification(self):
-        registered, tool_decorator = _capture_tools()
-        lazy_loader = SimpleNamespace(load_tool=AsyncMock(return_value=True))
-
-        register_load_tools(
-            server=Mock(),
-            tool_decorator=tool_decorator,
-            lazy_loader=lazy_loader,
-            register_tool=Mock(),
-            tool_module_map={"unifi_list_clients": "unifi_network_mcp.tools.clients"},
-        )
-
-        ctx = _context()
-        result = await registered["unifi_load_tools"]["handler"](["unifi_unknown"], ctx)
-
-        assert result["loaded"] == []
-        assert result["errors"] == [{"tool": "unifi_unknown", "error": "Unknown tool"}]
-        lazy_loader.load_tool.assert_not_awaited()
-        ctx.notify_tools_changed.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_failed_load_does_not_send_list_changed_notification(self):
-        registered, tool_decorator = _capture_tools()
-        lazy_loader = SimpleNamespace(load_tool=AsyncMock(return_value=False))
-
-        register_load_tools(
-            server=Mock(),
-            tool_decorator=tool_decorator,
-            lazy_loader=lazy_loader,
-            register_tool=Mock(),
-            tool_module_map={"unifi_list_clients": "unifi_network_mcp.tools.clients"},
-        )
-
-        ctx = _context()
-        result = await registered["unifi_load_tools"]["handler"](["unifi_list_clients"], ctx)
-
-        assert result["loaded"] == []
-        assert result["errors"] == [{"tool": "unifi_list_clients", "error": "Failed to load"}]
-        ctx.notify_tools_changed.assert_not_awaited()
-
-    def test_load_tools_description_uses_standard_notification_name(self):
-        registered, tool_decorator = _capture_tools()
-
-        register_load_tools(
-            server=Mock(),
-            tool_decorator=tool_decorator,
-            lazy_loader=SimpleNamespace(load_tool=AsyncMock(return_value=True)),
             register_tool=Mock(),
             tool_module_map={"unifi_list_clients": "unifi_network_mcp.tools.clients"},
         )
@@ -516,6 +407,20 @@ class TestRegisterLoadTools:
         description = registered["unifi_load_tools"]["description"]
         assert "tools/list" in description
         assert "notifications/tools/list_changed" in description
+
+        ctx = _context()
+        result = await registered["unifi_load_tools"]["handler"](tools, ctx)
+
+        assert result["loaded"] == expected_loaded
+        assert result["errors"] == expected_errors
+        if tools == ["unifi_unknown"]:
+            lazy_loader.load_tool.assert_not_awaited()
+        else:
+            lazy_loader.load_tool.assert_awaited_once_with("unifi_list_clients")
+        if notified:
+            ctx.notify_tools_changed.assert_awaited_once()
+        else:
+            ctx.notify_tools_changed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -540,3 +445,58 @@ async def test_tool_index_forwards_exact_name_and_schemas(prefix):
     assert result["count"] == 0
     registration = next(c for c in registry.call_args_list if c.kwargs["name"] == f"{prefix}_tool_index")
     assert registration.kwargs["input_schema"]["properties"]["name"]["type"] == "string"
+
+
+@pytest.mark.parametrize("prefix", ["unifi", "protect", "access"])
+async def test_execute_and_batch_reach_the_named_tools_policy_gate(prefix, monkeypatch):
+    """The meta-tools are readOnlyHint=false, but they skip no server-side check."""
+    monkeypatch.setenv("UNIFI_POLICY_TEST_CREATE", "false")
+    server = FastMCP(f"{prefix}-test")
+    store = JobStore()
+    calls = []
+    permissioned_tool = create_permissioned_tool(
+        original_tool_decorator=server.tool,
+        policy_gate_checker=PolicyGateChecker(server_prefix="test"),
+        server_prefix="TEST",
+        register_tool_fn=Mock(),
+        diagnostics_enabled_fn=lambda: False,
+        wrap_tool_fn=lambda func, name: func,
+        logger=logging.getLogger("test"),
+    )
+
+    @permissioned_tool(name=f"{prefix}_create_thing", permission_category="things", permission_action="create")
+    async def create_thing(confirm: bool = False) -> dict:
+        calls.append(confirm)
+        return {"success": True, "data": {}}
+
+    async def start_async_tool(executor, arguments):
+        return {"jobId": await store.start(executor(**arguments))}
+
+    register_meta_tools(
+        server=server,
+        tool_decorator=server.tool,
+        tool_index_handler=AsyncMock(return_value={}),
+        start_async_tool=start_async_tool,
+        get_job_status=store.status,
+        register_tool=Mock(),
+        support_bundle_handler=AsyncMock(return_value={"success": True, "data": {}}),
+        prefix=prefix,
+    )
+
+    execute = await server.call_tool(
+        f"{prefix}_execute", {"tool": f"{prefix}_create_thing", "arguments": {"confirm": True}}
+    )
+    assert json.loads(execute.content[0].text)["success"] is False
+    assert "UNIFI_POLICY_TEST_THINGS_CREATE" in execute.content[0].text
+
+    batch = await server.call_tool(
+        f"{prefix}_batch", {"operations": [{"tool": f"{prefix}_create_thing", "arguments": {"confirm": True}}]}
+    )
+    job_id = json.loads(batch.content[0].text)["jobs"][0]["jobId"]
+    for _ in range(10):
+        if (await store.status(job_id))["status"] == "done":
+            break
+        await asyncio.sleep(0)
+    assert (await store.status(job_id))["result"]["success"] is False
+
+    assert calls == []

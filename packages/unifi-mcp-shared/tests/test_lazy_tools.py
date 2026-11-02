@@ -33,17 +33,17 @@ class TestBuildToolModuleMap:
             "unifi_list_devices": "my_app.tools.devices",
         }
 
-    def test_returns_empty_when_no_manifest(self):
-        """Returns empty dict when package not found and no manifest."""
-        result = build_tool_module_map("nonexistent.package.tools")
-        assert result == {}
-
-    def test_returns_empty_when_manifest_missing(self, tmp_path):
-        """Returns empty dict when manifest path does not exist."""
-        result = build_tool_module_map(
-            "nonexistent.package.tools",
-            manifest_path=str(tmp_path / "missing.json"),
-        )
+    @pytest.mark.parametrize("kind", ["none", "missing", "invalid_json"])
+    def test_returns_empty_when_manifest_unavailable_or_invalid(self, tmp_path, kind):
+        """Returns empty dict when package not found and manifest is omitted, missing, or invalid."""
+        if kind == "none":
+            result = build_tool_module_map("nonexistent.package.tools")
+        elif kind == "missing":
+            result = build_tool_module_map("nonexistent.package.tools", manifest_path=str(tmp_path / "missing.json"))
+        else:
+            manifest_path = tmp_path / "bad_manifest.json"
+            manifest_path.write_text("not valid json {{{")
+            result = build_tool_module_map("nonexistent.package.tools", manifest_path=str(manifest_path))
         assert result == {}
 
     def test_scans_tool_files(self, tmp_path):
@@ -92,22 +92,9 @@ async def list_devices():
         finally:
             del sys.modules["fake_tools"]
 
-    def test_manifest_with_invalid_json(self, tmp_path):
-        """Returns empty dict when manifest contains invalid JSON."""
-        manifest_path = tmp_path / "bad_manifest.json"
-        manifest_path.write_text("not valid json {{{")
-
-        result = build_tool_module_map("nonexistent.package.tools", manifest_path=str(manifest_path))
-        assert result == {}
-
 
 class TestLazyToolLoader:
     """Tests for the LazyToolLoader class."""
-
-    def test_is_loaded_returns_false_initially(self):
-        server = MagicMock()
-        loader = LazyToolLoader(server, MagicMock(), {"unifi_test": "my.tools.test"})
-        assert loader.is_loaded("unifi_test") is False
 
     @pytest.mark.asyncio
     async def test_load_tool_unknown(self):
@@ -119,8 +106,10 @@ class TestLazyToolLoader:
     @pytest.mark.asyncio
     async def test_load_tool_marks_as_loaded(self):
         server = MagicMock()
+        assert LazyToolLoader(server, MagicMock(), {"unifi_test": "my.tools.test"}).is_loaded("unifi_test") is False
         tool_map = {"unifi_test": "json"}  # json is always importable
         loader = LazyToolLoader(server, MagicMock(), tool_map)
+        assert loader.is_loaded("unifi_test") is False
         result = await loader.load_tool("unifi_test")
         assert result is True
         assert loader.is_loaded("unifi_test") is True
