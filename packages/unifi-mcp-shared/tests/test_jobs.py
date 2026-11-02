@@ -1,6 +1,7 @@
 """Tests for the shared jobs module."""
 
 import asyncio
+import copy
 
 import pytest
 from unifi_core.jobs import JobStore, get_job_status, start_async_tool
@@ -13,14 +14,6 @@ class TestJobStore:
     def store(self):
         return JobStore()
 
-    async def test_start_returns_job_id(self, store):
-        async def noop():
-            return "done"
-
-        job_id = await store.start(noop())
-        assert isinstance(job_id, str)
-        assert len(job_id) == 16  # secrets.token_hex(8) produces 16 chars
-
     async def test_status_running(self, store):
         event = asyncio.Event()
 
@@ -29,22 +22,32 @@ class TestJobStore:
             return "finished"
 
         job_id = await store.start(wait_for_event())
+        assert isinstance(job_id, str)
+        assert len(job_id) == 16
         status = await store.status(job_id)
         assert status["status"] == "running"
         assert status["result"] is None
         event.set()
         await asyncio.sleep(0.05)
 
-    async def test_status_done(self, store):
+    @pytest.mark.parametrize("result_val", [{"data": "result"}, "ok", "done"])
+    async def test_status_done(self, store, result_val):
+        expected = copy.deepcopy(result_val)
+
         async def quick():
-            return {"data": "result"}
+            return result_val
 
         job_id = await store.start(quick())
+        assert isinstance(job_id, str)
+        assert len(job_id) == 16
         await asyncio.sleep(0.05)  # let task complete
         status = await store.status(job_id)
+        status_copy = await store.status(job_id)
         assert status["status"] == "done"
-        assert status["result"] == {"data": "result"}
+        assert status["result"] == expected
         assert "completed" in status
+        assert status is not status_copy
+        assert status == status_copy
 
     async def test_status_error(self, store):
         async def fail():
@@ -59,17 +62,6 @@ class TestJobStore:
     async def test_status_unknown(self, store):
         status = await store.status("nonexistent")
         assert status["status"] == "unknown"
-
-    async def test_status_returns_copy(self, store):
-        async def quick():
-            return "ok"
-
-        job_id = await store.start(quick())
-        await asyncio.sleep(0.05)
-        s1 = await store.status(job_id)
-        s2 = await store.status(job_id)
-        assert s1 is not s2
-        assert s1 == s2
 
 
 class TestStartAsyncTool:

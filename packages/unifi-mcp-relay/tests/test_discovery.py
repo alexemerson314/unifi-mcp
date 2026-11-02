@@ -176,34 +176,17 @@ async def test_http_client_sends_negotiated_protocol_version_after_initialize():
 
 
 @pytest.mark.asyncio
-async def test_http_client_preserves_older_negotiated_protocol_version():
+@pytest.mark.parametrize(
+    "init_result",
+    [
+        {"protocolVersion": LEGACY_MCP_PROTOCOL_REVISION},
+        {"serverInfo": {"name": "old-server"}},
+    ],
+)
+async def test_http_client_preserves_older_or_omitted_protocol_version(init_result):
     session = FakeSession(
         [
-            FakeResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {"protocolVersion": LEGACY_MCP_PROTOCOL_REVISION},
-                }
-            ),
-            FakeResponse({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}),
-        ]
-    )
-    client = McpHttpClient("http://localhost:3000")
-    client._session = session
-
-    await client.request("initialize", {"protocolVersion": DEFAULT_MCP_PROTOCOL_REVISION})
-    await client.request("tools/list")
-
-    assert client.protocol_version == LEGACY_MCP_PROTOCOL_REVISION
-    assert session.posts[1]["headers"]["MCP-Protocol-Version"] == LEGACY_MCP_PROTOCOL_REVISION
-
-
-@pytest.mark.asyncio
-async def test_http_client_falls_back_when_server_omits_protocol_version():
-    session = FakeSession(
-        [
-            FakeResponse({"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "old-server"}}}),
+            FakeResponse({"jsonrpc": "2.0", "id": 1, "result": init_result}),
             FakeResponse({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}),
         ]
     )

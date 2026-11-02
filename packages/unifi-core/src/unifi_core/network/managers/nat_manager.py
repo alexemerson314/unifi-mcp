@@ -42,6 +42,7 @@ from unifi_core.network.models.nat import (
     normalize_nat_update,
     normalize_nat_verified_write,
 )
+from unifi_core.request_paths import object_id
 from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
@@ -156,7 +157,7 @@ class NatManager:
             UniFiNotFoundError: If the rule does not exist.
         """
         await self.get_nat_rule(rule_id)  # resolves the id; nothing is built from the document
-        await self._mutate(ApiRequestV2(method="delete", path=f"/nat/{rule_id}"), "deleting")
+        await self._mutate(ApiRequestV2(method="delete", path=f"/nat/{object_id(rule_id, 'NAT rule')}"), "deleting")
         return True
 
     async def toggle_nat_rule(self, rule_id: str, enabled: Optional[bool] = None) -> Dict[str, Any]:
@@ -171,7 +172,9 @@ class NatManager:
             return current
         merged = self._prepare_update(current, update, verified=False)
 
-        await self._mutate(ApiRequestV2(method="put", path=f"/nat/{rule_id}", data=merged), "updating")
+        await self._mutate(
+            ApiRequestV2(method="put", path=f"/nat/{object_id(rule_id, 'NAT rule')}", data=merged), "updating"
+        )
         return merged
 
     async def _prepare_create(self, fields: Dict[str, Any], *, verified: bool) -> Dict[str, Any]:
@@ -265,7 +268,9 @@ class NatManager:
         requested = _flat(update)
         requested.update(_retired(current, merged, update))
         try:
-            await self._mutate(ApiRequestV2(method="put", path=f"/nat/{rule_id}", data=merged), "updating")
+            await self._mutate(
+                ApiRequestV2(method="put", path=f"/nat/{object_id(rule_id, 'NAT rule')}", data=merged), "updating"
+            )
         except _NatPreflight:
             return failed_write("NAT update requires Network session access and permissions.", operation="update")
         except _NatRejected as error:
@@ -302,7 +307,7 @@ class NatManager:
         except Exception:
             return failed_write("Failed to prepare NAT delete; check Network session access.", operation="delete")
         try:
-            await self._mutate(ApiRequestV2(method="delete", path=f"/nat/{rule_id}"), "deleting")
+            await self._mutate(ApiRequestV2(method="delete", path=f"/nat/{object_id(rule_id, 'NAT rule')}"), "deleting")
         except _NatPreflight:
             return failed_write("NAT delete requires Network session access and permissions.", operation="delete")
         except _NatRejected as error:

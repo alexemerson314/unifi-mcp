@@ -6,7 +6,7 @@ import { generateToken } from "../lib/tokens.mjs";
 import { ensureWrangler, checkWranglerAuth } from "../lib/prerequisites.mjs";
 import { putSecret, login } from "../lib/wrangler.mjs";
 import { createLocationToken } from "../lib/api.mjs";
-import { showError } from "../lib/display.mjs";
+import { showError, showRotatedToken } from "../lib/display.mjs";
 
 export async function run(flags) {
   const config = loadConfig();
@@ -51,8 +51,9 @@ export async function run(flags) {
       console.log("Rotating AGENT_TOKEN...");
       await putSecret(config.worker_name, "AGENT_TOKEN", newToken);
       config.agent_token = newToken;
-      console.log(chalk.green(`  New AGENT_TOKEN: ${newToken}`));
-      console.log(chalk.dim("  → Update your AI agent configuration with this token.\n"));
+      // The new value is not printed, so persist it before reporting it.
+      saveConfig(config);
+      showRotatedToken("AGENT_TOKEN", "agent_token", newToken, "Update your AI agent configuration with it.");
     }
 
     if (tokenType === "admin" || tokenType === "all") {
@@ -60,8 +61,9 @@ export async function run(flags) {
       console.log("Rotating ADMIN_TOKEN...");
       await putSecret(config.worker_name, "ADMIN_TOKEN", newToken);
       config.admin_token = newToken;
-      console.log(chalk.green(`  New ADMIN_TOKEN: ${newToken}`));
-      console.log(chalk.dim("  → Save this token for location management.\n"));
+      // The new value is not printed, so persist it before reporting it.
+      saveConfig(config);
+      showRotatedToken("ADMIN_TOKEN", "admin_token", newToken, "Used for location management.");
     }
 
     if (tokenType === "relay") {
@@ -101,11 +103,16 @@ export async function run(flags) {
         location.location_name
       );
       config.locations[locationIdx].relay_token = loc.relayToken;
-      console.log(chalk.green(`  New RELAY_TOKEN: ${loc.relayToken}`));
-      console.log(chalk.dim("  → Update your relay sidecar with this token.\n"));
+      // The new value is not printed, so persist it before reporting it.
+      saveConfig(config);
+      showRotatedToken(
+        "RELAY_TOKEN",
+        `locations[${locationIdx}].relay_token`,
+        loc.relayToken,
+        "Update your relay sidecar with it."
+      );
     }
 
-    saveConfig(config);
     console.log(chalk.dim("Config updated."));
   } catch (err) {
     showError(`Token rotation failed: ${err.message}`);

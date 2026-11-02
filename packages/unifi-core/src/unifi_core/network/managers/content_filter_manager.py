@@ -27,6 +27,7 @@ from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
 from unifi_core.network.models.content_filter import to_controller_create
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -124,7 +125,9 @@ class ContentFilterManager:
             return existing
 
         merged_data = deep_merge(existing, update_data)
-        api_request = ApiRequestV2(method="put", path=f"/content-filtering/{filter_id}", data=merged_data)
+        api_request = ApiRequestV2(
+            method="put", path=f"/content-filtering/{object_id(filter_id, 'content filter')}", data=merged_data
+        )
         await self._connection.request(api_request)
         self._invalidate_cache()
         return merged_data
@@ -142,7 +145,9 @@ class ContentFilterManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            api_request = ApiRequestV2(method="delete", path=f"/content-filtering/{filter_id}")
+            api_request = ApiRequestV2(
+                method="delete", path=f"/content-filtering/{object_id(filter_id, 'content filter')}"
+            )
             await self._connection.request(api_request)
 
             self._invalidate_cache()

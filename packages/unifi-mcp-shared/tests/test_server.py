@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
+import pytest
 from mcp.types import CallToolResult
 from pydantic import BaseModel
 from unifi_mcp_shared.server import UniFiMCPServer
@@ -16,34 +18,27 @@ class StructuredResult(BaseModel):
     data: dict[str, Any]
 
 
-async def test_adaptive_server_compacts_supported_client(monkeypatch):
+@pytest.mark.parametrize(
+    ("revision", "data", "compacted"),
+    [("2025-11-25", {"rows": [{"id": 1}]}, True), ("2025-03-26", {}, False)],
+)
+async def test_adaptive_server_compacts_by_protocol_revision(monkeypatch, revision, data, compacted):
+    expected = {"success": True, "data": copy.deepcopy(data)}
     server = UniFiMCPServer("test", mcp_content_mode="adaptive")
-    monkeypatch.setattr("unifi_mcp_shared.server.get_request_protocol_revision", lambda _: "2025-11-25")
+    monkeypatch.setattr("unifi_mcp_shared.server.get_request_protocol_revision", lambda _: revision)
 
     @server.tool(name="unifi_test", structured_output=True)
     async def unifi_test() -> StructuredResult:
-        return StructuredResult(success=True, data={"rows": [{"id": 1}]})
+        return StructuredResult(success=True, data=data)
 
     result = await server.call_tool("unifi_test", {})
 
     assert isinstance(result, CallToolResult)
-    assert result.structured_content == {"success": True, "data": {"rows": [{"id": 1}]}}
-    assert result.content
-    assert "rows" not in result.content[0].text
-
-
-async def test_adaptive_server_preserves_old_client(monkeypatch):
-    server = UniFiMCPServer("test", mcp_content_mode="adaptive")
-    monkeypatch.setattr("unifi_mcp_shared.server.get_request_protocol_revision", lambda _: "2025-03-26")
-
-    @server.tool(name="unifi_test", structured_output=True)
-    async def unifi_test() -> StructuredResult:
-        return StructuredResult(success=True, data={})
-
-    result = await server.call_tool("unifi_test", {})
-
-    assert isinstance(result, CallToolResult)
-    assert json.loads(result.content[0].text) == {"success": True, "data": {}}
+    assert result.structured_content == expected
+    if compacted:
+        assert "rows" not in result.content[0].text
+    else:
+        assert json.loads(result.content[0].text) == expected
 
 
 def test_unifi_server_retains_strict_dispatch_contract():

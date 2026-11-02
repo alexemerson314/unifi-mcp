@@ -21,6 +21,7 @@ from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.mac import normalize_mac
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
@@ -78,7 +79,7 @@ class SwitchManager:
         if not await self._connection.ensure_connected():
             raise ConnectionError("Not connected to controller")
 
-        api_request = ApiRequest(method="get", path=f"/rest/portconf/{profile_id}")
+        api_request = ApiRequest(method="get", path=f"/rest/portconf/{object_id(profile_id, 'port profile')}")
         response = await self._connection.request(api_request)
         data = (
             response if isinstance(response, list) else response.get("data", []) if isinstance(response, dict) else []
@@ -167,7 +168,9 @@ class SwitchManager:
             return noop_write(operation="update", resource=existing, metadata={"profile_id": profile_id})
 
         merged_data = deep_merge(existing, update_data)
-        api_request = ApiRequest(method="put", path=f"/rest/portconf/{profile_id}", data=merged_data)
+        api_request = ApiRequest(
+            method="put", path=f"/rest/portconf/{object_id(profile_id, 'port profile')}", data=merged_data
+        )
         await self._connection.request(api_request)
         self._connection._invalidate_cache(CACHE_PREFIX_PORT_PROFILES)
 
@@ -207,7 +210,7 @@ class SwitchManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            api_request = ApiRequest(method="delete", path=f"/rest/portconf/{profile_id}")
+            api_request = ApiRequest(method="delete", path=f"/rest/portconf/{object_id(profile_id, 'port profile')}")
             await self._connection.request(api_request)
 
             self._connection._invalidate_cache(CACHE_PREFIX_PORT_PROFILES)
@@ -225,7 +228,7 @@ class SwitchManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            api_request = ApiRequest(method="get", path=f"/stat/device/{device_mac}")
+            api_request = ApiRequest(method="get", path=f"/stat/device/{object_id(device_mac, 'device MAC')}")
             response = await self._connection.request(api_request)
             data = (
                 response
@@ -329,7 +332,7 @@ class SwitchManager:
 
         api_request = ApiRequest(
             method="put",
-            path=f"/rest/device/{device_id}",
+            path=f"/rest/device/{object_id(device_id, 'device')}",
             data={"port_overrides": port_overrides},
         )
         await self._connection.request(api_request)
@@ -369,7 +372,7 @@ class SwitchManager:
 
         api_request = ApiRequest(
             method="put",
-            path=f"/rest/device/{device_id}",
+            path=f"/rest/device/{object_id(device_id, 'device')}",
             data=payload,
         )
         await self._connection.request(api_request)

@@ -71,6 +71,8 @@ unifi-mcp-worker rotate-tokens
 unifi-mcp-worker status
 ```
 
+`rotate-tokens` does not print the new secret. It saves it to `~/.unifi-mcp-worker/config.json` (mode `0600`) and shows a masked value and the config key to read it from.
+
 ### Remove
 
 ```bash
@@ -85,7 +87,7 @@ unifi-mcp-worker destroy
 
 | Secret | Purpose |
 |--------|---------|
-| `AGENT_TOKEN` | Bearer token required by cloud agents calling the `/mcp` endpoint |
+| `AGENT_TOKEN` | Bearer token for cloud agents calling the `/mcp` endpoint. Grants every tool at every location; use [scoped agent tokens](#scoped-agent-tokens) for anything narrower |
 | `ADMIN_TOKEN` | Bearer token required for admin API calls (`/api/*`) |
 
 Secrets are set automatically by the CLI and can be rotated with `unifi-mcp-worker rotate-tokens`.
@@ -95,8 +97,15 @@ Secrets are set automatically by the CLI and can be rotated with `unifi-mcp-work
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `TOOL_REGISTRATION_MODE` | `lazy` | Tool registration mode sent to relay clients. `lazy` registers only meta-tools (~200 tokens); `eager` registers all tools upfront (~5,000 tokens) |
+| `CORS_ALLOWED_ORIGINS` | unset | Comma-separated browser origins (for example `https://app.example.com,http://localhost:5173`) allowed to read Worker responses cross-origin. Unset or empty echoes any request Origin; set it to restrict browser access to the listed origins |
 
-Variables are set in `wrangler.toml` under `[vars]` or overridden via the Cloudflare dashboard.
+Variables are set in `wrangler.toml` under `[vars]` or overridden via the Cloudflare dashboard. `wrangler deploy` (and so `unifi-mcp-worker upgrade`) replaces dashboard variables with `wrangler.toml`, so set `CORS_ALLOWED_ORIGINS` as a secret, which survives deploys:
+
+```bash
+echo "https://app.example.com" | wrangler secret put CORS_ALLOWED_ORIGINS --name <worker-name>
+```
+
+Once the list is set, only an origin on it gets `Access-Control-Allow-Origin`; any other origin, a missing Origin, and the opaque `null` origin, including on a preflight, get no CORS headers and the browser refuses the response. Allowed origins may send the Streamable HTTP `Mcp-Session-Id` and `MCP-Protocol-Version` headers and read `Mcp-Session-Id` back.
 
 ---
 
@@ -105,10 +114,13 @@ Variables are set in `wrangler.toml` under `[vars]` or overridden via the Cloudf
 | Route | Method | Auth | Purpose |
 |-------|--------|------|---------|
 | `/health` | GET | None | Health check — returns `{"status":"ok"}` |
-| `/mcp` | POST | `AGENT_TOKEN` | MCP JSON-RPC endpoint for cloud agents |
+| `/mcp` | POST | `AGENT_TOKEN` or a scoped agent token | MCP JSON-RPC endpoint for cloud agents |
 | `/ws` | GET | `relay_token` | WebSocket upgrade for relay client connections |
 | `/api/locations` | GET | `ADMIN_TOKEN` | List registered locations and connection status |
 | `/api/locations/token` | POST | `ADMIN_TOKEN` | Generate a relay token for a new location |
+| `/api/agent-tokens` | GET | `ADMIN_TOKEN` | List scoped agent tokens (never the secrets) |
+| `/api/agent-tokens` | POST | `ADMIN_TOKEN` | Mint or rotate a scoped agent token |
+| `/api/agent-tokens/<token_id or name>` | DELETE | `ADMIN_TOKEN` | Revoke a scoped agent token |
 
 ### MCP Endpoint
 
@@ -130,7 +142,23 @@ The relay always exposes these meta-tools regardless of registration mode:
 | `unifi_tool_index` | List all available UniFi tools with optional category or search filter |
 | `unifi_execute` | Execute any UniFi tool by name; use `__location` to target a specific site |
 | `unifi_batch` | Execute multiple UniFi tools in a single request |
-| `unifi_location_timeline` | Query a unified event timeline across connected locations and products |
+| `unifi_location_timeline` | Collect bounded Network and Protect incident evidence with explicit per-source failures |
+
+The timeline tool accepts `start`/`end` with UTC offsets, exact `device_macs`
+and `camera_ids`, explicit `mappings`, and `max_window_seconds`, `max_events`,
+`max_calls`, `max_elapsed_ms`. `products` defaults to Network and Protect;
+requested Access collection is unsupported. `location_id` selects one location by
+its UUID (from the location list, not its name) and an unknown one is refused before any read;
+a call reads at most 7 sources (locations × products, one Protect source per
+camera ID) and refuses a larger selection before any read.
+It returns `data` as the [client view](../../docs/incident-evidence.md#client-view) of one combined
+[incident evidence document](../../docs/incident-evidence.md#relay-and-worker-consumers), or the whole
+document with `detail: "full"`; `max_records_returned` (1 to 50, default 25) sets the citations in the view,
+which fits one tool result, and `resume_after` (the view's `record_selection.next_cursor`) reads the records after it.
+Check `overall`, `coverage_complete`, source outcomes and exhausted budgets;
+missing or failed sources are retained. Conflicting source IDs fail combination,
+including across locations. Legacy area/name filters and `start_time`/`end_time`
+are no longer supported.
 
 ---
 
@@ -172,6 +200,38 @@ curl https://your-worker.workers.dev/api/locations \
 
 Response includes `connected: true/false` indicating whether the relay client WebSocket is currently active.
 
+### Scoped Agent Tokens
+
+`AGENT_TOKEN` grants every tool at every location. To give an agent less, mint a scoped agent token with the admin API. It is read-only unless you pass `"read_only": false`, and covers every location unless you list some:
+
+```bash
+curl -X POST https://your-worker.workers.dev/api/agent-tokens \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "dashboards", "read_only": true, "locations": ["Home Lab"]}'
+```
+
+Response:
+
+```json
+{
+  "token_id": "e5f6a7b8-...",
+  "name": "dashboards",
+  "read_only": true,
+  "locations": ["a1b2c3d4-..."],
+  "token": "<agent-token>"
+}
+```
+
+`locations` takes location names or IDs and stores IDs; an unknown location is refused. The `token` is returned only once and stored as a SHA-256 hash. Use it as the agent's bearer on `/mcp` exactly like `AGENT_TOKEN`. Minting the same `name` again rotates its secret and replaces its scope. Revoke it with `DELETE /api/agent-tokens/<token_id or name>`.
+
+The Worker enforces the scope itself, before a call reaches a relay client:
+
+- **Read-only:** only tools a location registers with `readOnlyHint: true` run. Any other tool, including through `unifi_execute` and `unifi_batch`, returns an error, as does a read fan-out where one location annotates the same tool as a write. `unifi_tool_index` and the `eager` tool list show only read-only tools.
+- **Locations:** the token sees and calls only its locations. Tools registered elsewhere read as not found, a `__location` outside the scope is refused, read fan-out stays inside the scope, and `unifi_location_timeline` reads only those locations. A token scoped to one location routes like a single-location deployment, so writes need no `__location`.
+
+Read-only depends on the tool annotations each relay client registers, so keep the LAN servers' own permission settings as the second layer.
+
 ---
 
 ## Connecting Cloud Agents
@@ -179,7 +239,7 @@ Response includes `connected: true/false` indicating whether the relay client We
 Use a client that supports MCP JSON-RPC over HTTP POST and a custom bearer authorization header:
 
 - **Endpoint:** `https://your-worker.workers.dev/mcp`
-- **Auth:** `Authorization: Bearer <agent-token>`
+- **Auth:** `Authorization: Bearer <agent-token>` (`AGENT_TOKEN` or a [scoped agent token](#scoped-agent-tokens))
 - **Transport:** HTTP POST (standard MCP JSON-RPC)
 
 Configure the bearer header explicitly in your client. MCP support alone does not establish compatibility with this relay's authentication and transport.
@@ -205,7 +265,9 @@ Read-only operations (tools with `readOnlyHint: true`) are automatically fanned 
 ## Security
 
 - **Timing-safe token comparison** — all token validation uses constant-time comparison to prevent timing attacks
-- **SHA-256 hashed storage** — relay tokens are stored as hashes in SQLite; the plaintext is never persisted
+- **SHA-256 hashed storage** — relay tokens and scoped agent tokens are stored as hashes in SQLite; the plaintext is never persisted
+- **Scoped agent tokens** — read-only and per-location agent tokens are enforced by the Worker, not only by the LAN servers
+- **CORS allowlist** — set `CORS_ALLOWED_ORIGINS` to let browsers read responses only from the listed origins; unset, any origin is echoed
 - **Per-location isolation** — each relay client is identified by its own relay token and location ID; locations cannot access each other's data
 - **HTTPS/WSS transport** — all traffic is encrypted in transit; Cloudflare terminates TLS at the edge
 - **No credentials in config** — tokens and secrets are managed via the CLI or `wrangler secret put`, never committed to source

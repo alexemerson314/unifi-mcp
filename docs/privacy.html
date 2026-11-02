@@ -163,7 +163,7 @@
     <a href="/" class="back-link">&larr; Back to UniFi MCP</a>
 
     <h1>Privacy Policy</h1>
-    <p class="updated">Last updated: July 10, 2026</p>
+    <p class="updated">Last updated: October 28, 2026</p>
 
     <div class="summary">
       UniFi MCP has several independently operated surfaces. Local MCP servers can keep controller traffic on infrastructure you control. The optional self-hosted API stores operator-managed state, the optional Cloud Relay passes tool traffic through Cloudflare and stores routing metadata, and this documentation site makes limited third-party requests.
@@ -203,6 +203,15 @@
       <li>Application code does not persist tool-call arguments or results. It keeps pending calls in memory while forwarding a request and resolving its response.</li>
       <li>Relay traffic uses HTTPS and WSS/TLS. Transport encryption does not change the fact that Cloudflare handles the payload in transit.</li>
       <li>Cloudflare's own platform logging, retention, and privacy behavior is outside this application's storage code. Operators should review the <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare Privacy Policy</a> and their <a href="https://developers.cloudflare.com/workers/observability/logs/">Workers logging and observability settings</a>.</li>
+    </ul>
+
+    <h2>Trace Export (Optional)</h2>
+    <p>The MCP servers can export the MCP SDK's trace spans over OTLP. They do so only when the operator sets an OTLP endpoint (<code>OTEL_EXPORTER_OTLP_ENDPOINT</code>), and only to that collector; without an endpoint, no spans leave the server process. Retention follows the collector's settings.</p>
+    <ul>
+      <li>A span records the MCP method, the tool name, the JSON-RPC request ID, and the timing, not tool arguments or results.</li>
+      <li>A call through the meta tools (<code>unifi_execute</code>, <code>unifi_batch</code>, and their Protect and Access counterparts), which the <code>lazy</code> and <code>meta_only</code> registration modes rely on, carries the meta tool's name, not the name of the tool it runs.</li>
+      <li>A failed request records its error message in the span status. For <code>resources/read</code>, the SDK's message contains the requested resource URI, so a failed Protect camera snapshot read records the camera ID (<code>Error creating resource from template protect://cameras/&lt;camera_id&gt;/snapshot</code>).</li>
+      <li>Tools return their errors as results. If an exception escapes a request handler anyway, the SDK also records its type, message, and stack trace on the span.</li>
     </ul>
 
     <h2>Documentation Site Requests</h2>

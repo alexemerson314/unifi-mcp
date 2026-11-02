@@ -35,3 +35,7 @@ export function maskToken(token) {
 export function getConfigDir() {
   return CONFIG_DIR;
 }
+
+export function getConfigFile() {
+  return CONFIG_FILE;
+}

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from unifi_mcp_relay.protocol import (
     PROTOCOL_VERSION,
     CatalogUpdateMessage,
@@ -116,40 +117,16 @@ def test_heartbeat_ack_serialization():
     assert data["type"] == "heartbeat_ack"
 
 
-def test_parse_unknown_message_type():
-    raw = json.dumps({"type": "unknown_thing", "data": 123})
-    msg = parse_message(raw)
-    assert msg is None
-
-
-def test_parse_malformed_json():
-    msg = parse_message("this is not json {{{")
-    assert msg is None
-
-
-def test_parse_registered_missing_location_id():
-    """Malformed registered message missing required fields returns None instead of raising."""
-    raw = json.dumps({"type": "registered", "location_name": "Test"})
-    msg = parse_message(raw)
-    assert msg is None
-
-
-def test_parse_tool_call_missing_call_id():
-    """Malformed tool_call missing call_id returns None instead of raising."""
-    raw = json.dumps({"type": "tool_call", "tool_name": "some_tool", "arguments": {}})
-    msg = parse_message(raw)
-    assert msg is None
-
-
-def test_parse_tool_call_missing_tool_name():
-    """Malformed tool_call missing tool_name returns None instead of raising."""
-    raw = json.dumps({"type": "tool_call", "call_id": "123", "arguments": {}})
-    msg = parse_message(raw)
-    assert msg is None
-
-
-def test_parse_catalog_update_message():
-    raw = json.dumps({"type": "catalog_update", "tools": []})
-    msg = parse_message(raw)
-    # catalog_update is not an inbound message type, should return None
-    assert msg is None
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps({"type": "unknown_thing", "data": 123}),
+        "this is not json {{{",
+        json.dumps({"type": "registered", "location_name": "Test"}),
+        json.dumps({"type": "tool_call", "tool_name": "some_tool", "arguments": {}}),
+        json.dumps({"type": "tool_call", "call_id": "123", "arguments": {}}),
+        json.dumps({"type": "catalog_update", "tools": []}),
+    ],
+)
+def test_parse_invalid_or_unknown_message_returns_none(raw):
+    assert parse_message(raw) is None

@@ -545,8 +545,23 @@ class PrivacyDataFlowContractTests(unittest.TestCase):
                 self.assertIn(phrase, self.privacy_lower)
         self.assertIn("homepage or sponsor page", self.privacy_lower)
 
+    def test_privacy_discloses_trace_export(self):
+        required = (
+            "otel_exporter_otlp_endpoint",
+            "no spans leave the server process",
+            "not tool arguments or results",
+            "contains the requested resource uri",
+            "records the camera id",
+            "carries the meta tool's name",
+            "stack trace",
+        )
+
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.privacy_lower)
+
     def test_privacy_has_current_revision_date(self):
-        self.assertIn("Last updated: July 10, 2026", self.privacy)
+        self.assertIn("Last updated: October 28, 2026", self.privacy)
 
     def test_privacy_names_only_supported_retention_controls(self):
         self.assertNotIn("delete relay locations", self.privacy_lower)

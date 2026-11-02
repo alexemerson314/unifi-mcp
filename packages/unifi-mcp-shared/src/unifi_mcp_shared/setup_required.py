@@ -78,7 +78,7 @@ async def serve_setup_required(
 ) -> None:
     """Run the server's transports in setup mode until the client disconnects."""
     from unifi_mcp_shared import bootstrap
-    from unifi_mcp_shared.transport import resolve_http_config, run_transports
+    from unifi_mcp_shared.transport import resolve_http_auth_token, resolve_http_config, run_transports
 
     message = setup_required_message(plugin_name=plugin_name, env_prefix=env_prefix, report=bootstrap._SETTINGS_REPORT)
     for line in message.splitlines():
@@ -114,4 +114,9 @@ async def serve_setup_required(
         port=port,
         http_transport=http_transport,
         logger=logger,
+        auth_token=resolve_http_auth_token(
+            env_prefix=env_prefix, logger=logger, configured=config.server.get("http", {}).get("auth_token")
+        )
+        if http_enabled
+        else None,
     )

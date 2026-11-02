@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Private staging and atomic publication for the three plugin setup wrappers.
 
-Values enter on stdin only. Never execute credential providers or start servers.
+Values enter on stdin only. Never execute credential providers. Codex setup starts
+the plugin's server once without any settings, so it reads no credentials and
+contacts no controller.
 Client output and exception text are deliberately excluded from diagnostics.
 Claude Code options are saved through its own CLI. Codex and OpenClaw settings go
 to a private per-user file that the plugin's bundled server reads.
 """
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -18,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
@@ -668,7 +672,8 @@ def claude_main(args, root, name, product):
         merge_env(saved, {}, product, inherited)
         if notice:
             print(notice)
-        others_left = [k for k in legacy_data["env"] if k.startswith(other_prefixes(product))] if legacy_data else []
+        legacy_env = legacy_data.get("env", {}) if legacy_data else {}
+        others_left = [k for k in legacy_env if k.startswith(other_prefixes(product))]
         if shared and not owned and not others_left:
             print(
                 "Notice: no UniFi plugin settings remain in .claude/settings.local.json, but it still holds shared "
@@ -744,8 +749,9 @@ def claude_main(args, root, name, product):
             "dialog. " + outcome + " " + choices
         )
 
-    # Clear a keychain secret alone first on a release newer than the newest known
-    # to keep it: where Claude Code ignores the empty value, nothing changes.
+    # A release newer than the newest known to keep a keychain secret may clear it.
+    # Setup then changes that one credential alone: it saves and verifies the new
+    # settings, then clears the secret, so the credential always has a saved value.
     probe = False
     if cleared:
         version = claude_version(environment)
@@ -755,6 +761,25 @@ def claude_main(args, root, name, product):
                 "Claude Code holds " + ", ".join(cleared) + " in the system keychain, and this Claude Code version "
                 "cannot clear a saved secret: claude plugin configure and the /plugin options dialog ignore an "
                 "empty value. No settings were changed. " + choices
+            )
+        variable_of = {option: variable for variable, option in mapping.items()}
+
+        def credential_of(option):
+            match = secret_base(variable_of[option])
+            return match[1] if match else None
+
+        if len(cleared) > 1:
+            refuse(
+                "Clearing " + ", ".join(cleared) + " from the system keychain needs one setup run per credential, "
+                "with nothing else changed, so a failed or interrupted step cannot leave mixed settings. "
+                "Switch them one at a time. No settings were changed."
+            )
+        others = sorted(variable_of[o] for o in changes if credential_of(o) != cleared[0])
+        if others:
+            refuse(
+                "Clearing " + cleared[0] + " from the system keychain needs a setup run that changes only that "
+                "credential, so a failed or interrupted step cannot leave mixed settings. Change it first, then "
+                "rerun setup for " + ", ".join(others) + ". No settings were changed."
             )
     if args.dry_run:
         print("Validation passed; dry run made no changes. Values are omitted.")
@@ -782,43 +807,97 @@ def claude_main(args, root, name, product):
         )
 
     if changes:
-        cleared_note = ""
-        if probe:
-            configure({mapping[variable]: "" for variable in cleared})
-            current = claude_saved(plugin_id, environment, mapping, schema)
-            kept = [variable for variable in cleared if current.get(variable) == KEYCHAIN]
-            if kept:
-                refuse(kept_message(kept, "No settings were changed."))
-            cleared_note = (
-                " " + ", ".join(cleared) + (" was" if len(cleared) == 1 else " were") + " cleared from the system "
-                "keychain; rerun setup to finish."
+        clears = {mapping[variable]: "" for variable in cleared} if probe else {}
+        staged = {option: value for option, value in changes.items() if option not in clears}
+        if staged:
+            try:
+                configure(staged)
+                after = claude_values(claude_saved(plugin_id, environment, mapping, schema), mapping, schema)
+            except SetupError:
+                if probe:
+                    refuse(
+                        "Claude Code did not confirm saving the new options; " + cleared[0] + " was not cleared from "
+                        "the system keychain. Rerun setup with the same settings to finish; until then the server "
+                        "refuses to start if two spellings of the credential are set."
+                    )
+                raise
+            retained = all(
+                (after[option] == KEYCHAIN) == bool(value)
+                if schema[option].get("sensitive")
+                else after[option] == value
+                for option, value in staged.items()
             )
-        try:
-            configure(changes)
-        except SetupError:
-            if probe:
-                refuse("Claude Code did not save the requested options." + cleared_note)
-            raise
-        after = claude_values(claude_saved(plugin_id, environment, mapping, schema), mapping, schema)
-        retained = all(
-            (after[option] == KEYCHAIN) == bool(value) if schema[option].get("sensitive") else after[option] == value
-            for option, value in changes.items()
-        )
-        if not retained:
-            restore = {o: before[o] for o in changes if before[o] != KEYCHAIN and not schema[o].get("sensitive")}
-            if restore:
-                configure(restore)
-            kept = sorted(
-                variable
-                for variable, option in mapping.items()
-                if schema[option].get("sensitive") and changes.get(option) == "" and after[option] == KEYCHAIN
-            )
-            if kept:
-                refuse(kept_message(kept, "Previous non-secret options were restored."))
-            refuse(
-                "Claude Code did not retain the requested options; previous non-secret options were restored."
-                + cleared_note
-            )
+            if not retained:
+                restore = {o: before[o] for o in staged if before[o] != KEYCHAIN and not schema[o].get("sensitive")}
+                if restore:
+                    try:
+                        configure(restore)
+                        restored = claude_values(claude_saved(plugin_id, environment, mapping, schema), mapping, schema)
+                    except SetupError:
+                        restored = None
+                    if restored is None or any(restored[o] != value for o, value in restore.items()):
+                        refuse(
+                            "Claude Code did not retain the requested options, and restoring the previous options "
+                            "was not confirmed. Check them with claude plugin configure "
+                            + plugin_id
+                            + " --json and rerun setup with the settings you want; set a provider to null to remove it."
+                        )
+                kept = sorted(
+                    variable
+                    for variable, option in mapping.items()
+                    if schema[option].get("sensitive") and staged.get(option) == "" and after[option] == KEYCHAIN
+                )
+                if kept:
+                    refuse(kept_message(kept, "Previous non-secret options were restored."))
+                refuse("Claude Code did not retain the requested options; previous non-secret options were restored.")
+        if clears:
+            variable = cleared[0]
+            try:
+                configure(clears)
+                current = claude_values(claude_saved(plugin_id, environment, mapping, schema), mapping, schema)
+            except SetupError:
+                if any(staged.values()):
+                    refuse(
+                        "Claude Code did not confirm the change. " + variable + " still has a saved value: the "
+                        "keychain secret or its verified replacement. Rerun setup with the same settings to finish; "
+                        "until then the server refuses to start if two spellings of the credential are set."
+                    )
+                refuse(
+                    "Claude Code did not confirm the change. Whether " + variable + " was cleared from the system "
+                    "keychain is unknown. Rerun setup with the same settings to finish."
+                )
+            if current[mapping[variable]] == KEYCHAIN:
+                # Claude Code kept the secret, so a provider beside it, saved now or by an
+                # interrupted earlier run, would stop the server: leave only the secret.
+                spellings = {
+                    o: ""
+                    for o in mapping.values()
+                    if credential_of(o) == variable and o != mapping[variable] and current[o] != ""
+                }
+                unconfirmed = kept_message(
+                    [variable],
+                    "Removing its provider was not confirmed; rerun setup with the provider set to null to remove it.",
+                )
+                if spellings:
+                    try:
+                        configure(spellings)
+                        current = claude_values(claude_saved(plugin_id, environment, mapping, schema), mapping, schema)
+                    except SetupError:
+                        refuse(unconfirmed)
+                    if any(current[o] != "" for o in spellings):
+                        refuse(unconfirmed)
+                removed = set(spellings) | {o for o in staged if staged[o] == "" and before[o] not in ("", KEYCHAIN)}
+                if not spellings and not staged:
+                    outcome = "No settings were changed."
+                elif any(before[o] not in ("", KEYCHAIN) for o in removed):
+                    outcome = (
+                        "The provider saved earlier for "
+                        + variable
+                        + " was removed, so it uses only its keychain secret."
+                    )
+                else:
+                    outcome = "Previous non-secret options were restored."
+                refuse(kept_message([variable], outcome))
     if remaining is not None:
         replace_project_settings(legacy_path, original, remaining)
     if args.migrate:
@@ -932,6 +1011,11 @@ class CodexClient:
     def loaded(self, removed):
         return "Restart Codex to load the settings."
 
+    def warm(self, root, name):
+        # The settings are saved and reported before the server starts.
+        sys.stdout.flush()
+        print(warm_up(root, name), flush=True)
+
 
 class OpenClawClient:
     """openclaw.json, where setup before plugin 1.0.0 wrote an mcp.servers.<plugin> entry."""
@@ -987,10 +1071,117 @@ class OpenClawClient:
             "already open keeps the unconfigured server."
         )
 
+    def warm(self, root, name):
+        pass
+
 
 def backup_path(config, name):
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     return config.with_name(config.name + ".bak-" + name + "-" + stamp)
+
+
+# The variables Codex passes from its own environment to a plugin's stdio server
+# (its core list and the CA bundle uv reads), so uvx uses the same cache and Python.
+CODEX_SERVER_ENV = (
+    "PATH PATHEXT SHELL COMSPEC SYSTEMROOT WINDIR SYSTEMDRIVE USERNAME USERDOMAIN USERPROFILE HOMEDRIVE HOMEPATH "
+    "PROGRAMFILES PROGRAMFILES(X86) PROGRAMW6432 PROGRAMDATA LOCALAPPDATA APPDATA TEMP TMP TMPDIR POWERSHELL PWSH"
+    if os.name == "nt"
+    else "HOME LOGNAME PATH SHELL USER __CF_USER_TEXT_ENCODING LANG LC_ALL TERM TMPDIR TZ"
+).split() + ["SSL_CERT_FILE"]
+WARM_UP_SECONDS = 60
+# Its own process group, so stopping it also stops what uvx started.
+OWN_GROUP = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+
+
+def warm_up(root, name, timeout=WARM_UP_SECONDS):
+    """Start the plugin's server once, as Codex launches it, and stop it after it answers initialize.
+
+    The first launch of a server version builds and compiles its environment, which
+    takes longer than Codex waits for plugin servers before a session's first request.
+    The server gets no settings file and no UNIFI_ variables, so it starts in setup
+    mode: it reads no credentials and contacts no controller. Returns a one-line note
+    and never raises; server output is discarded.
+    """
+    pin = package_pin(root, name, bundled=True)
+    failed = (
+        "Notice: " + pin + " did not start ahead of Codex; the settings are saved, but Codex's first session "
+        "may start without the " + name + " tools."
+    )
+    environment = {key: os.environ[key] for key in CODEX_SERVER_ENV if os.environ.get(key)}
+    try:
+        entry = json_object((root / ".mcp.codex.json").read_text(encoding="utf-8"))["mcpServers"][name]
+        command = [entry["command"], *entry["args"]]
+        executable = shutil.which(command[0], path=environment.get("PATH"))
+        if executable is None or not all(isinstance(part, str) for part in command):
+            return failed
+        process = subprocess.Popen(
+            [executable, *command[1:]],
+            cwd=root,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **OWN_GROUP,
+        )
+    except Exception:
+        return failed
+    answered = threading.Event()
+
+    def read_reply():
+        # At most 1 MiB is read; the reply is the first line with the request's id.
+        for _ in range(16):
+            line = process.stdout.readline(65536)
+            if not line:
+                return
+            try:
+                if json.loads(line).get("id") == 1:
+                    answered.set()
+                    return
+            except (ValueError, AttributeError):
+                continue
+
+    try:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": name + "-setup", "version": "1"},
+            },
+        }
+        reader = threading.Thread(target=read_reply, daemon=True)
+        reader.start()
+        process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+        process.stdin.flush()
+        reader.join(timeout)
+    except OSError:
+        pass  # The server exited before reading the request.
+    finally:
+        stop(process)
+    if not answered.is_set():
+        return failed
+    return "Started " + pin + " once, so Codex's next session starts it quickly."
+
+
+def stop(process):
+    """End a stdio server as an MCP client does: close its input, then terminate, then kill."""
+    steps = [process.stdin.close]
+    if os.name == "nt":
+        steps.append(process.kill)
+    else:
+        steps += [lambda: os.killpg(process.pid, signal.SIGTERM), lambda: os.killpg(process.pid, signal.SIGKILL)]
+    for step in steps:
+        with contextlib.suppress(OSError):
+            step()
+        try:
+            process.wait(5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    with contextlib.suppress(OSError):
+        process.stdout.close()
 
 
 def bundled_main(args, root, name, product, patch, client):
@@ -1039,6 +1230,7 @@ def bundled_main(args, root, name, product, patch, client):
             + str(path)
             + "."
         )
+        client.warm(root, name)
         return
     merged = merge_env(base, patch, product)
     text = settings_text(merged, name).encode("utf-8")
@@ -1082,6 +1274,7 @@ def bundled_main(args, root, name, product, patch, client):
     if auto_notice:
         print(auto_notice)
     print(client.loaded(entry is not None) + " Values are omitted.")
+    client.warm(root, name)
 
 
 def read_patch(args):

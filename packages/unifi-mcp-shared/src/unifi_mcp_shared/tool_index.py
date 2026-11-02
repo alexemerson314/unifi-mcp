@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
+from unifi_mcp_shared.preview_token import add_preview_token_property, preview_token_mode_enabled, takes_preview_token
+
 logger = logging.getLogger(__name__)
 
 _MANIFEST_CACHE: Dict[Path, Dict[str, Any]] = {}
@@ -246,6 +248,8 @@ def get_tool_index(
         if manifest is not None:
             module_map = manifest.get("module_map", {})
             all_tools = manifest.get("tools", [])
+            if preview_token_mode_enabled():
+                all_tools = [_with_preview_token(tool) for tool in all_tools]
         else:
             all_tools = _tools_from_registry()
     else:
@@ -345,6 +349,21 @@ def policy_gates_from_manifest(manifest_path: Path) -> frozenset[tuple[str, str]
         if isinstance(category, str) and isinstance(action, str) and category and action:
             gates.add((category, action))
     return frozenset(gates)
+
+
+def _with_preview_token(tool: Any) -> Any:
+    """Add ``preview_token`` to a manifest entry's input schema when the tool takes one.
+
+    The committed manifest is generated with preview tokens off, so in lazy mode
+    the index has to apply the registration rule itself.
+    """
+    if not isinstance(tool, dict) or not isinstance(tool.get("schema"), dict):
+        return tool
+    input_schema = tool["schema"].get("input")
+    properties = input_schema.get("properties") if isinstance(input_schema, dict) else None
+    if not isinstance(properties, dict) or not takes_preview_token(tool.get("permission_action"), properties):
+        return tool
+    return {**tool, "schema": {**tool["schema"], "input": add_preview_token_property(input_schema)}}
 
 
 def _tools_from_registry() -> list:

@@ -12,6 +12,7 @@ from unifi_core.policy_gate import (
     check_deprecated_env_vars,
     check_unknown_policy_env_vars,
     resolve_permission_mode,
+    resolve_read_only,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,5 +86,6 @@ __all__ = [
     "check_deprecated_env_vars",
     "check_unknown_policy_env_vars",
     "resolve_permission_mode",
+    "resolve_read_only",
     "should_redact_sensitive_fields",
 ]

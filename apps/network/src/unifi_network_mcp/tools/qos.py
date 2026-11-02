@@ -492,11 +492,11 @@ async def create_simple_qos_rule(
 
     # --- Step 3: preview or commit -----------------------------------------
     if not confirm:
-        return {
-            "success": True,
-            "preview": payload,
-            "message": "Set confirm=true to apply.",
-        }
+        return create_preview(
+            resource_type="qos_rule",
+            resource_data=payload,
+            resource_name=r.name,
+        )
 
     created = await qos_manager.create_qos_rule(payload)
     if created is None or not isinstance(created, dict):

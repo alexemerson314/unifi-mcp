@@ -28,6 +28,7 @@ from unifi_core.network.models.vpn import (
     is_vpn_network,
     validate_alternate_address_update,
 )
+from unifi_core.request_paths import object_id
 from unifi_core.write_verification import WriteVerificationResult, failed_write, noop_write, verify_write
 
 logger = logging.getLogger("unifi-network-mcp")
@@ -219,7 +220,7 @@ class VpnManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/networkconf/{config_id}",
+                path=f"/rest/networkconf/{object_id(config_id, 'VPN configuration')}",
                 data=merged_data,
             )
             await self._connection.request(api_request)
@@ -272,7 +273,9 @@ class VpnManager:
         """Delete a VPN client and verify its networkconf entry is absent."""
         client = await self.get_vpn_client_details(client_id)
         try:
-            await self._connection.request(ApiRequest(method="delete", path=f"/rest/networkconf/{client_id}"))
+            await self._connection.request(
+                ApiRequest(method="delete", path=f"/rest/networkconf/{object_id(client_id, 'VPN client')}")
+            )
             self._invalidate_vpn_caches()
             networks = await self._get_all_network_configs()
             if any(network.get("_id") == client_id for network in networks):
@@ -374,7 +377,9 @@ class VpnManager:
         ):
             return noop_write(resource=alternate_address_view(before))
         try:
-            await self._connection.request(ApiRequest(method="put", path=f"/rest/networkconf/{server_id}", data=merged))
+            await self._connection.request(
+                ApiRequest(method="put", path=f"/rest/networkconf/{object_id(server_id, 'VPN server')}", data=merged)
+            )
         except Exception as exc:
             logger.error("Failed to update VPN alternate-address configuration: %s", type(exc).__name__)
             if (

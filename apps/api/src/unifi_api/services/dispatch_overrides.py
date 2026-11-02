@@ -58,6 +58,7 @@ from unifi_core.network.read_views import (
     shape_voucher_list,
     shape_wlan_list,
 )
+from unifi_core.network.time_window import duration_hours, parse_window_bound
 
 from unifi_api.services.action_results import ShapedReadResult
 
@@ -152,10 +153,10 @@ DISPATCH_OVERRIDES: dict[str, tuple[str, str]] = {
     # =========================================================================
     # Protect — preview/execute split (preview_X + X, X + apply_X patterns)
     # =========================================================================
-    "protect_alarm_arm": ("alarm_manager", "arm"),
-    "protect_alarm_disarm": ("alarm_manager", "disarm"),
-    # Alarm rule CRUD uses the facade so v2 UUID rules and legacy ObjectID rules
-    # route through the same family-aware path as the Protect MCP tools.
+    # Arm/disarm and alarm rule CRUD use the facade so Global-mode (v2) consoles
+    # and legacy consoles route through the same path as the Protect MCP tools.
+    "protect_alarm_arm": ("alarm_facade", "arm"),
+    "protect_alarm_disarm": ("alarm_facade", "disarm"),
     "protect_alarm_update_rule": ("alarm_facade", "update_rule"),
     "protect_alarm_delete_rule": ("alarm_facade", "delete_rule"),
     "protect_ptz_move": ("camera_manager", "ptz_move"),
@@ -500,6 +501,28 @@ def _translate_export_clip(args: dict[str, Any]) -> tuple[tuple[Any, ...], dict[
     if "fps" in public:
         kwargs["fps"] = public["fps"]
     return (), kwargs
+
+
+def _translate_event_list(args: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Parse ISO start/end strings and apply the documented range defaults.
+
+    Mirrors the protect event list tools: ``end`` defaults to now and ``start``
+    to 24 hours before ``end``, since the NVR rejects a limit above 100 unless
+    both ends of the range are sent. Naive timestamps are UTC.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    out = dict(args)
+    start = _parse_iso_datetime(out.get("start"))
+    end = _parse_iso_datetime(out.get("end"))
+    if start is not None and start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    end = end or datetime.now(timezone.utc)
+    out["start"] = start or end - timedelta(hours=24)
+    out["end"] = end
+    return (), out
 
 
 def _translate_detection_search(args: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -850,20 +873,26 @@ def _translate_update_device_radio(args: dict[str, Any]) -> tuple[tuple[Any, ...
 # string like "daily") and ``limit``; manager expects ``duration_hours``
 # (an integer).
 
-_DURATION_HOURS: dict[str, int] = {
-    "hourly": 1,
-    "daily": 24,
-    "weekly": 168,
-    "monthly": 720,
-}
+
+def _window_kwargs(out: dict[str, Any]) -> None:
+    """Move the tools' ``start``/``end`` bounds to the managers' epoch-ms arguments."""
+    for source, target in (("start", "start_ms"), ("end", "end_ms")):
+        if source in out:
+            out[target] = parse_window_bound(out.pop(source))
 
 
 def _translate_get_top_clients(args: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
     """Convert ``duration`` string → ``duration_hours`` int for stats_manager.get_top_clients."""
     out = dict(args)
-    duration = out.pop("duration", "daily")
-    duration_hours = _DURATION_HOURS.get(str(duration), 1)
-    return (), {"duration_hours": duration_hours, "limit": out.get("limit", 10)}
+    kwargs: dict[str, Any] = {
+        "duration_hours": duration_hours(out.pop("duration", "daily")),
+        "limit": out.get("limit", 10),
+    }
+    _window_kwargs(out)
+    for key in ("start_ms", "end_ms", "granularity", "sort_by"):
+        if out.get(key) is not None:
+            kwargs[key] = out[key]
+    return (), kwargs
 
 
 def _translate_list_events(args: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -929,7 +958,8 @@ def _translate_duration(
     out = {key: value for key, value in args.items() if key not in drop}
     duration = out.pop("duration", None)
     if duration is not None:
-        out["duration_hours"] = _DURATION_HOURS.get(str(duration), default_hours)
+        out["duration_hours"] = duration_hours(duration)
+    _window_kwargs(out)
     for source, target in (rename or {}).items():
         if source in out:
             out[target] = out.pop(source)
@@ -948,6 +978,11 @@ def _translate_traffic_flows(args: dict[str, Any]) -> tuple[tuple[Any, ...], dic
         if isinstance(value, list):
             return [str(item) for item in value]
         return [str(value)]
+
+    def as_port_list(value: Any) -> list[Any] | None:
+        if value is None:
+            return None
+        return list(value) if isinstance(value, list) else [value]
 
     time_from = args.get("time_from")
     time_to = args.get("time_to")
@@ -975,8 +1010,10 @@ def _translate_traffic_flows(args: dict[str, Any]) -> tuple[tuple[Any, ...], dic
         source_ip=as_list(args.get("source_ip")),
         source_host=as_list(args.get("source_name")),
         source_network_id=as_list(args.get("source_network_id")),
+        source_port=as_port_list(args.get("source_port")),
         destination_domain=as_list(args.get("destination_domain")),
         destination_ip=as_list(args.get("destination_ip")),
+        destination_port=as_port_list(args.get("destination_port")),
         destination_region=as_list(args.get("destination_region")),
     )
     return (), {"query": query}
@@ -1745,6 +1782,27 @@ DISPATCH_ARG_TRANSLATORS: dict[str, ArgTranslatorSpec] = {
     "unifi_create_dynamic_dns": _spec(_translate_create_dynamic_dns, "entry_data"),
     "unifi_update_dynamic_dns": _spec(_translate_update_dynamic_dns, "entry_id", "entry_data"),
     "protect_export_clip": _spec(_translate_export_clip, "camera_id", "start", "end", "channel_index", "fps"),
+    "protect_list_events": _spec(
+        _translate_event_list,
+        "start",
+        "end",
+        "event_type",
+        "camera_id",
+        "limit",
+        "compact",
+        "metadata_fields",
+    ),
+    "protect_list_smart_detections": _spec(
+        _translate_event_list,
+        "start",
+        "end",
+        "camera_id",
+        "detection_type",
+        "min_confidence",
+        "limit",
+        "compact",
+        "metadata_fields",
+    ),
     "protect_search_detections": _spec(
         _translate_detection_search,
         "labels",
@@ -1815,7 +1873,9 @@ DISPATCH_ARG_TRANSLATORS: dict[str, ArgTranslatorSpec] = {
     # Network — device radio update: flatten → (device_mac, radio_id, updates)
     "unifi_update_device_radio": _spec(_translate_radio_update, "device_mac", "radio_id", "updates"),
     # Network — stats: convert duration string to duration_hours integer
-    "unifi_get_top_clients": _spec(_translate_get_top_clients, "duration_hours", "limit"),
+    "unifi_get_top_clients": _spec(
+        _translate_get_top_clients, "duration_hours", "limit", "start_ms", "end_ms", "granularity", "sort_by"
+    ),
     # Network — event tool names differ from the Core manager signatures.
     "unifi_list_events": _spec(
         _translate_list_events, "event_type", "within", "limit", "start", "categories", "severities"
@@ -1898,7 +1958,14 @@ DISPATCH_ARG_TRANSLATORS: dict[str, ArgTranslatorSpec] = {
         "client_mac",
     ),
     "unifi_get_client_dpi_traffic": _spec(
-        _rename_and_drop(rename={"mac_address": "client_mac", "group_by": "by"}), "client_mac", "by"
+        lambda args: _translate_duration(
+            args, default_hours=24, rename={"mac_address": "client_mac", "group_by": "by"}
+        ),
+        "client_mac",
+        "by",
+        "duration_hours",
+        "start_ms",
+        "end_ms",
     ),
     "unifi_get_client_sessions": _spec(
         lambda args: _translate_duration(args, default_hours=24, rename={"mac_address": "client_mac"}),
@@ -1912,6 +1979,8 @@ DISPATCH_ARG_TRANSLATORS: dict[str, ArgTranslatorSpec] = {
         "client_id",
         "duration_hours",
         "granularity",
+        "start_ms",
+        "end_ms",
     ),
     "unifi_get_dashboard": _spec(_rename_and_drop(drop=frozenset({"summary"})), "history_seconds"),
     "unifi_get_device_details": _spec(
@@ -1933,7 +2002,13 @@ DISPATCH_ARG_TRANSLATORS: dict[str, ArgTranslatorSpec] = {
     "unifi_get_network_stats": _spec(
         lambda args: _translate_duration(args, default_hours=1), "duration_hours", "granularity"
     ),
-    "unifi_get_site_dpi_traffic": _spec(_rename_and_drop(rename={"group_by": "by"}), "by"),
+    "unifi_get_site_dpi_traffic": _spec(
+        lambda args: _translate_duration(args, default_hours=24, rename={"group_by": "by"}),
+        "by",
+        "duration_hours",
+        "start_ms",
+        "end_ms",
+    ),
     "unifi_get_snmp_settings": _spec(_rename_and_drop(constants={"section": "snmp"}), "section"),
     "unifi_get_mgmt_settings": _spec(_rename_and_drop(constants={"section": "mgmt"}), "section"),
     "unifi_get_speedtest_results": _spec(lambda args: _translate_duration(args, default_hours=24), "duration_hours"),

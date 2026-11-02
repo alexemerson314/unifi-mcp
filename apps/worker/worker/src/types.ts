@@ -37,7 +37,26 @@ export interface Env {
   AGENT_TOKEN: string;
   ADMIN_TOKEN: string;
   TOOL_REGISTRATION_MODE: string;
+  /** Comma-separated browser origins allowed to call the Worker (unset: none) */
+  CORS_ALLOWED_ORIGINS?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Agent authorization
+// ---------------------------------------------------------------------------
+
+/** What an authenticated /mcp caller may do */
+export interface AgentScope {
+  /** Only tools annotated readOnlyHint=true at the target location may run */
+  readOnly: boolean;
+  /** Location IDs the caller may see and call; null means every location */
+  locations: string[] | null;
+}
+
+/** The static AGENT_TOKEN: every tool at every location */
+export const FULL_AGENT_SCOPE: AgentScope = Object.freeze({ readOnly: false, locations: null });
+
+export const MAX_AGENT_TOKEN_NAME_LENGTH = 128;
 
 // ---------------------------------------------------------------------------
 // Tool metadata
@@ -185,3 +204,11 @@ export interface AggregatedResponse {
   locations_total: number;
   locations_responded: number;
 }
+
+export interface EvidenceTarget {
+  location_id: string;
+  product: "network" | "protect";
+  available: boolean;
+}
+
+export type EvidenceDocument = Record<string, any>;

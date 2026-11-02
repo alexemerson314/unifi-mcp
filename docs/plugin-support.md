@@ -11,12 +11,20 @@ to update an existing install, see the [plugin upgrade guide](plugin-upgrade.md)
 | `unifi-network` | Listed | Listed | `unifi-network-mcp` |
 | `unifi-protect` | Listed | Listed | `unifi-protect-mcp` |
 | `unifi-access` | Listed | Listed | `unifi-access-mcp` |
-| `cross-product` | Not listed | Not listed | None (skills only) |
+| `unifi-intelligence` | Listed | Listed | None (skills only) |
 
 Each plugin has its own semantic version for everything it ships. For example,
 plugin `1.0.0` can launch `unifi-network-mcp==0.37.0`; the plugin version and
-server package pin are independent. The advertised plugins and unlisted
-cross-product bundle start at `1.0.0` with this scheme.
+server package pin are independent. Every plugin started at `1.0.0` with this
+scheme; `unifi-intelligence`, which replaces the unlisted `cross-product`
+bundle, starts there as a new plugin.
+
+**Plugin dependencies.** `unifi-intelligence` requires the `unifi-network` and
+`unifi-protect` plugins. Its Claude Code manifest declares them in
+`dependencies`, so Claude Code installs and enables them with it, and
+`claude plugin prune` removes them once nothing needs them. Codex and OpenClaw
+have no plugin dependencies; there, the plugin's description says to install
+both first.
 
 A plugin release is a plugin version bump merged to `main`; there is no
 separate publish step, and server packages keep their own tagged releases. Each
@@ -142,10 +150,66 @@ the plugin is enabled, and setup saves them with `claude plugin configure`.
   and names them with the reason: other consumers have not been verified as
   migrated. Values are omitted.
 
-The `cross-product` skills can be installed as standalone skills (see the
-[install guide](agent-install.md#standalone-skills-through-npm)), but their
-`unifi_location_timeline` tool is provided only through the
-[relay](../packages/unifi-mcp-relay/). Local stdio servers do not expose it.
+The `unifi-intelligence` skills can also be installed as standalone skills (see the
+[install guide](agent-install.md#standalone-skills-through-npm)). Incident
+Investigation uses the incident evidence tools of the local Network and Protect
+servers and needs no relay. With the pinned servers (`unifi-network-mcp` 0.38.1,
+`unifi-protect-mcp` 0.9.1), lazy mode also lists the read-only lookups it uses
+to tie a camera to the incident device, `protect_get_camera` and
+`unifi_get_client_details`; with an older server or in `meta_only` mode it asks
+the user for that mapping instead. Security Patrol and Visitor Audit need the cloud
+worker: they use `unifi_location_timeline`, which only the cloud worker
+provides, through a connected [relay](../packages/unifi-mcp-relay/); local stdio
+servers do not expose it. The timeline reports Access as unsupported, so those
+skills read Access events separately.
+
+## Codex: tools on the first turn
+
+Codex 0.162.0 waits `mcp_optional_startup_grace_ms` (default 1000 ms) for
+plugin MCP servers when it builds a session's first tool list. A server still
+starting is left out of that model request and is added from a later request,
+once it is ready.
+
+- **Warm `uv` cache:** the servers answer in about 0.5 s in lazy mode and 0.9 s
+  in eager mode, and are in the first request.
+- **First launch of a server version** (after install or a plugin upgrade, or
+  with an empty cache): `uvx` creates a new environment, Python compiles every
+  module it imports, and Protect loads PyAV's native libraries for the first
+  time. This takes about 2 s for Network and 4.5 s for Protect when the
+  dependencies are already cached, and 3 to 10 s with an empty cache. The
+  first request of that session then has no UniFi tools. Later launches of the
+  same version are warm.
+
+Codex setup, and setup with `--refresh`, start the server once the way Codex
+starts it, then stop it as soon as it answers. The server gets none of its
+settings, so it reads no credentials and contacts no controller. The first
+session after setup then finds the server warm. Setup waits up to 60 s; if the
+server does not answer in time, setup says so and keeps the saved settings.
+
+A plugin upgrade that moves the server pin is still a first launch. Codex
+installs the upgrade in the background as a session starts, and the next
+session starts the new server version for the first time. Running setup with
+`--refresh` from the upgraded plugin starts that version ahead of time.
+
+`codex exec` sends its prompt at once, so a one-step task can answer without
+the UniFi tools. A short `codex exec` run can also end before a first launch
+finishes, so the next run may start slowly too. In an interactive session the
+servers usually finish starting while you type the first message.
+
+To make the first request wait for the servers, use either of these:
+
+- Set `mcp_optional_startup_grace_ms = 15000` at the top level of
+  `~/.codex/config.toml`, or pass `-c mcp_optional_startup_grace_ms=15000` to
+  `codex exec`. This applies to every optional MCP server, and only to the
+  first tool list of a session. `0` waits up to each server's own start-up
+  timeout instead.
+- Name the plugin in the prompt, for example
+  `[@unifi-network](plugin://unifi-network@unifi-plugins)`. Codex then waits
+  for that plugin's server for that turn.
+
+The plugins cannot set this for you. Codex reads the grace only from
+`config.toml`. The per-server key that would make Codex wait, `required`,
+also fails every Codex session in which the server cannot start.
 
 ## Client matrix
 
@@ -173,7 +237,22 @@ Those checks do not count as `tested`. To produce `tested` evidence, follow the 
 | Transport: remote HTTP from the plugin | `unsupported` | `unsupported` | `unsupported` |
 | Connection: one UniFi product controller per plugin | `not tested` | `not tested` | `not tested` |
 | Connection: relay | Not required by product plugins | Not required by product plugins | Not required by product plugins |
-| `cross-product` from a marketplace | `unsupported` | `unsupported` | `unsupported` |
+| `unifi-intelligence` from a marketplace | `tested` | `tested` | `tested` |
+| Required plugins installed with `unifi-intelligence` | `tested` | `unsupported` | `unsupported` |
+| Network and Protect plugins already installed are kept as they are | `tested` | Not applicable | Not applicable |
+| Removing `unifi-intelligence` prunes only the plugins it installed | `tested` | Not applicable | Not applicable |
+| `unifi-intelligence` skills with a real model | `not tested` | `not tested` | `not tested` |
+
+The `unifi-intelligence` rows come from installing a release candidate in each
+real client from a local mirror of this marketplace: Claude Code 2.1.296,
+Codex 0.162.0 and OpenClaw 2026.9.9. In Claude Code, installing it on a clean
+profile installed Network and Protect as dependencies, which `claude plugin
+prune` later removed; for a user who already had both, it reinstalled nothing
+and pruned nothing. Codex and OpenClaw installed it alone, as documented. The
+same run exercised the skills, which then changed to stop for confirmation and
+to make no read the user has not agreed to, so the skills row stays
+`not tested`. Security Patrol and Visitor Audit were not run in Codex, and
+OpenClaw ran only with a stub model, never a real one.
 
 No minimum client version has been established for any client.
 

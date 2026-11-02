@@ -677,6 +677,7 @@ class LiveSmokeRunner:
             "protect_update_chime": {"protect_list_chimes"},
             "protect_update_sensor_settings": {"protect_list_sensors"},
             "protect_update_viewer": {"protect_list_viewers", "protect_list_liveviews"},
+            "unifi_update_traffic_route": {"unifi_list_traffic_routes"},
         }
         seed_names: set[str] = set()
         for tool_name, names in dependencies.items():
@@ -898,9 +899,23 @@ class LiveSmokeRunner:
                 return None, "could not discover required argument route_id"
             return {"route_id": route_id, "enabled": True}, ""
         if name == "unifi_update_traffic_route":
-            route_id = self.value_for_param(name, "route_id")
-            if not route_id:
+            routes = self.cache.items_from_tool("unifi_list_traffic_routes", "traffic_routes") or self.cache.items(
+                "traffic_routes"
+            )
+            if not routes:
                 return None, "could not discover required argument route_id"
+            # INTERNET routes must target exactly one explicit CLIENT, so the
+            # ALL_CLIENTS proposal below is only valid for the other route kinds.
+            route_id = next(
+                (
+                    first_value(r, ("_id", "id"))
+                    for r in routes
+                    if str(r.get("matching_target", "")).upper() != "INTERNET"
+                ),
+                None,
+            )
+            if not route_id:
+                return None, "only INTERNET traffic routes found; they reject an ALL_CLIENTS target"
             # Exercise a widened match field (target_devices) in preview. run_previews
             # forces confirm=False, so this only renders a current-vs-proposed diff and
             # runs the tool's client-side target_devices validation — nothing is written.
@@ -1188,6 +1203,24 @@ class LiveSmokeRunner:
             self.record_check(
                 "unifi_update_gateway_settings", "lifecycle:apply", False, f"apply failed: {apply_rec.error}"
             )
+            # The write may have landed even though apply reported failure (e.g. only
+            # the verifying re-read failed). Put the field back so the gateway isn't left changed.
+            try:
+                current = await mgr.get_gateway_settings()
+            except Exception:
+                current = None
+            if current is None or bool(current.get(field, False)) != original:
+                revert_rec = await self.call(
+                    "unifi_update_gateway_settings",
+                    {"update_data": {field: original}, "confirm": True},
+                    "lifecycle:revert",
+                )
+                self.record_check(
+                    "unifi_update_gateway_settings",
+                    "lifecycle:revert",
+                    bool(revert_rec.success),
+                    f"{field} restored to {original} after failed apply",
+                )
             return
 
         after = copy.deepcopy(await mgr.get_gateway_settings())

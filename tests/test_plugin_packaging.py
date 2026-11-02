@@ -38,6 +38,11 @@ KEBAB = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 # Package pins track server versions independently of plugin versions.
 PACKAGE_PIN = re.compile(r"^(unifi-[a-z]+-mcp)==(.+)$")
+# Advisory plugin-directory checks in `claude plugin validate`; the CLI states they don't change the result.
+DIRECTORY_CHECKS = re.compile(
+    r"^Plugin directory checks for .*?^These plugin directory checks do not change the result below\.[^\n]*$",
+    re.MULTILINE | re.DOTALL,
+)
 USER_CONFIG_REFERENCE = re.compile(r"^\$\{user_config\.([A-Za-z_][A-Za-z0-9_]*)\}$")
 # Variables the servers resolve with resolve_env, where an empty value counts as unset.
 EMPTY_IS_UNSET = re.compile(
@@ -329,6 +334,30 @@ def check_skills(bundle: Path, root: Path, errors: list[str]) -> list[str]:
     return names
 
 
+def skills_only(claude_manifest: dict | None, resolved: dict | None, codex_path: Path) -> bool:
+    """A bundle that declares no MCP server for any client ships skills only."""
+    codex_servers = resolved is not None and resolved["identity"].get("mcpServers")
+    return not (claude_manifest or {}).get("mcpServers") and not codex_servers and not codex_path.is_file()
+
+
+def check_skills_only_dependencies(
+    bundle: Path, manifest: dict | None, claude: dict[str, Path], errors: list[str]
+) -> None:
+    """Skills-only bundles name the MCP plugins they need; Claude Code installs them as dependencies."""
+    where = f"{bundle.name}/.claude-plugin/plugin.json"
+    dependencies = (manifest or {}).get("dependencies")
+    if not isinstance(dependencies, list) or not dependencies:
+        errors.append(f"{where}: a skills-only bundle must declare the MCP plugins it needs in dependencies")
+        return
+    for dependency in dependencies:
+        # Bare names resolve in this plugin's own marketplace.
+        target = claude.get(dependency) if isinstance(dependency, str) else None
+        if target is None:
+            errors.append(f"{where}: dependency {dependency!r} is not a plugin in this marketplace")
+        elif not (_load(target / CLAUDE_MANIFEST).get("mcpServers")):
+            errors.append(f"{where}: dependency {dependency!r} ships no MCP server")
+
+
 def packaging_errors(root: Path) -> list[str]:
     errors: list[str] = []
     claude = claude_marketplace_bundles(root, errors)
@@ -356,10 +385,14 @@ def packaging_errors(root: Path) -> list[str]:
             errors.append(f"{name}: root .mcp.json is unsupported; declare Claude Code servers inline")
         resolved = check_codex_manifest(bundle, name, errors)
         portable = resolved is not None and resolved["layout"] == "portable"
-        # Validate Claude Code's inline servers and the Codex launch file independently.
-        pins = check_mcp_servers(bundle / CLAUDE_MANIFEST, root, errors, portable=False)
         codex_path = mcp_config_path(bundle, resolved)
-        portable_pins = check_mcp_servers(codex_path, root, errors, portable=portable, codex=True)
+        if skills_only(claude_manifest, resolved, codex_path):
+            check_skills_only_dependencies(bundle, claude_manifest, claude, errors)
+            pins = portable_pins = {}
+        else:
+            # Validate Claude Code's inline servers and the Codex launch file independently.
+            pins = check_mcp_servers(bundle / CLAUDE_MANIFEST, root, errors, portable=False)
+            portable_pins = check_mcp_servers(codex_path, root, errors, portable=portable, codex=True)
         skills = check_skills(bundle, root, errors)
         if not skills:
             errors.append(f"{name}: bundle ships no skills")
@@ -397,6 +430,14 @@ def _edit_json(path: Path, mutate) -> None:
 
 def _advertised_bundles() -> list[str]:
     return sorted(claude_marketplace_bundles(REPO_ROOT, []))
+
+
+def _claude_manifest(root: Path, name: str) -> Path:
+    return root / "plugins" / name / ".claude-plugin" / "plugin.json"
+
+
+def _mcp_bundles() -> list[str]:
+    return [name for name in _advertised_bundles() if _load(_claude_manifest(REPO_ROOT, name)).get("mcpServers")]
 
 
 def test_repository_packaging_is_consistent() -> None:
@@ -546,11 +587,58 @@ def test_release_workflow_delegates_to_version_module() -> None:
 
 def test_claude_author_string_is_reported(tmp_path: Path) -> None:
     root = _copy_packaging_tree(tmp_path)
-    _edit_json(root / "plugins" / "cross-product" / ".claude-plugin" / "plugin.json", lambda d: d.update(author="x"))
+    _edit_json(
+        root / "plugins" / "unifi-intelligence" / ".claude-plugin" / "plugin.json", lambda d: d.update(author="x")
+    )
 
     errors = packaging_errors(root)
 
-    assert any("cross-product/.claude-plugin/plugin.json: author must be an object" in error for error in errors)
+    assert any("unifi-intelligence/.claude-plugin/plugin.json: author must be an object" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "expected"),
+    [
+        (None, "must declare the MCP plugins it needs in dependencies"),
+        (["unifi-network", "unifi-nonexistent"], "dependency 'unifi-nonexistent' is not a plugin in this marketplace"),
+        (["unifi-network@other-marketplace"], "is not a plugin in this marketplace"),
+    ],
+)
+def test_skills_only_bundle_dependencies_are_checked(tmp_path: Path, dependencies, expected: str) -> None:
+    root = _copy_packaging_tree(tmp_path)
+
+    def mutate(data: dict) -> None:
+        data.pop("dependencies", None)
+        if dependencies is not None:
+            data["dependencies"] = dependencies
+
+    _edit_json(_claude_manifest(root, "unifi-intelligence"), mutate)
+
+    errors = packaging_errors(root)
+
+    assert any(expected in error for error in errors), errors
+
+
+def test_skills_only_bundle_cannot_depend_on_another_skills_only_bundle(tmp_path: Path) -> None:
+    root = _copy_packaging_tree(tmp_path)
+    _edit_json(_claude_manifest(root, "unifi-intelligence"), lambda d: d.update(dependencies=["unifi-intelligence"]))
+
+    errors = packaging_errors(root)
+
+    assert any("dependency 'unifi-intelligence' ships no MCP server" in error for error in errors), errors
+
+
+def test_listed_skills_only_bundle_depends_on_the_network_and_protect_plugins() -> None:
+    manifest = _load(_claude_manifest(REPO_ROOT, "unifi-intelligence"))
+
+    assert manifest["dependencies"] == ["unifi-network", "unifi-protect"]
+    assert "unifi-intelligence" in _advertised_bundles()
+    assert "unifi-intelligence" not in _mcp_bundles()
+    # Codex and OpenClaw install no plugin dependencies; the listing says what to install.
+    codex = _load(REPO_ROOT / "plugins/unifi-intelligence/.codex-plugin/plugin.json")
+    for text in (codex["description"], codex["interface"]["longDescription"]):
+        assert "UniFi Network" in text or "unifi-network" in text
+        assert "UniFi Protect" in text or "unifi-protect" in text
 
 
 def test_legacy_codex_manifest_is_used_without_portable_root(tmp_path: Path) -> None:
@@ -641,7 +729,7 @@ def test_bundle_without_any_codex_manifest_is_reported(tmp_path: Path) -> None:
     assert f"{name}: no portable plugin.json or .codex-plugin/plugin.json for Codex" in errors
 
 
-@pytest.mark.parametrize("name", _advertised_bundles())
+@pytest.mark.parametrize("name", _mcp_bundles())
 def test_codex_launch_avoids_literal_credential_templates(name: str) -> None:
     bundle = REPO_ROOT / "plugins" / name
     resolved = check_codex_manifest(bundle, name, [])
@@ -652,7 +740,7 @@ def test_codex_launch_avoids_literal_credential_templates(name: str) -> None:
         assert "${" not in json.dumps(server)
 
 
-@pytest.mark.parametrize("name", _advertised_bundles())
+@pytest.mark.parametrize("name", _mcp_bundles())
 def test_codex_bundled_server_reads_the_setup_settings_file(name: str) -> None:
     bundle = REPO_ROOT / "plugins" / name
     path = mcp_config_path(bundle, check_codex_manifest(bundle, name, []))
@@ -700,7 +788,7 @@ def test_codex_package_pin_drift_is_reported(tmp_path: Path) -> None:
     assert any("mismatched client pins" in error for error in packaging_errors(root))
 
 
-@pytest.mark.parametrize("name", _advertised_bundles())
+@pytest.mark.parametrize("name", _mcp_bundles())
 @pytest.mark.parametrize("filename", [".mcp.codex.json", ".claude-plugin/plugin.json"])
 def test_every_client_package_pin_agrees(name: str, filename: str) -> None:
     bundle = REPO_ROOT / "plugins" / name
@@ -708,14 +796,6 @@ def test_every_client_package_pin_agrees(name: str, filename: str) -> None:
     pins = check_mcp_servers(bundle / filename, REPO_ROOT, [], portable=False, codex="codex" in filename)
 
     assert pins == expected
-
-
-def _claude_manifest(root: Path, name: str) -> Path:
-    return root / "plugins" / name / ".claude-plugin" / "plugin.json"
-
-
-def _mcp_bundles() -> list[str]:
-    return [name for name in _advertised_bundles() if _load(_claude_manifest(REPO_ROOT, name)).get("mcpServers")]
 
 
 @pytest.mark.parametrize("name", _mcp_bundles())
@@ -771,7 +851,7 @@ def test_claude_plugin_validate_passes(tmp_path: Path, name: str) -> None:
     )
 
     assert result.returncode == 0 and "Validation passed" in result.stdout, result.stdout + result.stderr
-    assert "warning" not in result.stdout.lower(), result.stdout
+    assert "warning" not in DIRECTORY_CHECKS.sub("", result.stdout).lower(), result.stdout
 
 
 def _claude_server_env(name: str, values: dict[str, str]) -> dict[str, str]:

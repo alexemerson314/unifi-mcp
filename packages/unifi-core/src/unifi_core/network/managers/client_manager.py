@@ -12,6 +12,7 @@ from unifi_core.network.managers.connection_manager import (
     controller_error_code,
     response_status,
 )
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -279,7 +280,9 @@ class ClientManager:
         Controller errors propagate as raised; the caller decides whether
         ``api.err.UnknownUser`` means not-found.
         """
-        response = await self._connection.request(ApiRequest(method="get", path=f"/stat/user/{path_mac}"))
+        response = await self._connection.request(
+            ApiRequest(method="get", path=f"/stat/user/{object_id(path_mac, 'client MAC')}")
+        )
         if not isinstance(response, list) or (response and not isinstance(response[0], dict)):
             raise UniFiOperationError(f"/stat/user reply had unexpected shape {type(response).__name__}")
         if not response:
@@ -352,14 +355,18 @@ class ClientManager:
             # Use REST endpoint (consistent with set_client_ip_settings).
             # Fall back to legacy /upd/user/ for older standalone controllers.
             try:
-                api_request = ApiRequest(method="put", path=f"/rest/user/{client_id}", data={"name": name})
+                api_request = ApiRequest(
+                    method="put", path=f"/rest/user/{object_id(client_id, 'client')}", data={"name": name}
+                )
                 await self._connection.request(api_request)
             except Exception as e:
                 logger.debug(
                     "REST endpoint failed for rename, falling back to legacy /upd/user/ for [redacted]: %s",
                     type(e).__name__,
                 )
-                api_request = ApiRequest(method="put", path=f"/upd/user/{client_id}", data={"name": name})
+                api_request = ApiRequest(
+                    method="put", path=f"/upd/user/{object_id(client_id, 'client')}", data={"name": name}
+                )
                 await self._connection.request(api_request)
             logger.info("Rename command sent for client [redacted] to '[redacted]'")
             self._connection._invalidate_cache(f"{CACHE_PREFIX_CLIENTS}")
@@ -391,13 +398,29 @@ class ClientManager:
             raise
 
     async def forget_client(self, client_mac: str) -> bool:
-        """Forget/remove a client from the controller's known client history.
+        """Forget a known client: delete its user-table record.
 
-        Idempotent: forgetting an unknown MAC returns success (the controller
-        also accepts unknown MACs without erroring), preserving the
-        delete-style semantics from spec §6.3.
+        The controller answers ``forget-sta`` with ``rc: ok`` whether or not
+        it removed anything, and a client that appears only in historical
+        statistics has no user-table record to remove. So the record is
+        looked up per MAC before and after the command, and success means it
+        existed and is gone.
+
+        Raises:
+            UniFiNotFoundError: The controller has no known-client record for
+                the MAC, so nothing was sent.
+            UniFiOperationError: The controller still lists the client after
+                accepting the command.
         """
         client_mac = normalize_mac(client_mac) or client_mac
+        path_mac = canonical_mac(client_mac)
+        if path_mac is None or not await self._is_known_client(path_mac):
+            raise UniFiNotFoundError(
+                "client",
+                client_mac,
+                f"client '{client_mac}' has no known-client record, so there is nothing to forget. "
+                "A client that appears only in historical statistics cannot be removed through this API.",
+            )
         try:
             api_request = ApiRequest(
                 method="post",
@@ -407,10 +430,40 @@ class ClientManager:
             await self._connection.request(api_request)
             logger.info("Forget command sent for client [redacted]")
             self._connection._invalidate_cache(f"{CACHE_PREFIX_CLIENTS}")
-            return True
         except Exception as e:
             logger.error("Error forgetting client [redacted]: %s", type(e).__name__)
             raise
+        if await self._is_known_client(path_mac):
+            raise UniFiOperationError(
+                f"the controller accepted the forget command but still lists client '{client_mac}'"
+            )
+        return True
+
+    async def _is_known_client(self, path_mac: str) -> bool:
+        """Whether the controller has a user-table record for the MAC, read per MAC."""
+        try:
+            return await self._get_user_by_mac(path_mac) is not None
+        except Exception as e:
+            if controller_error_code(e) == UNKNOWN_USER_CODE:
+                return False
+            if response_status(e) != 404:
+                raise
+        # The controller does not serve /stat/user: read the user table itself, uncached.
+        users = await self._connection.request(ApiRequest(method="get", path="/rest/user"))
+        if not isinstance(users, list) or not all(isinstance(user, dict) for user in users):
+            raise UniFiOperationError(
+                f"/rest/user reply had unexpected shape {type(users).__name__}; "
+                "whether the client is known could not be determined"
+            )
+        if any(mac_equal(user.get("mac"), path_mac) for user in users):
+            return True
+        if len(users) >= REST_USER_ROW_CAP:
+            # A full window can leave the record out although the controller keeps it.
+            raise UniFiOperationError(
+                f"/rest/user returned its {REST_USER_ROW_CAP}-row cap without this client; "
+                "whether the client is known could not be determined"
+            )
+        return False
 
     async def get_blocked_clients(self) -> List[Client]:
         """Get a list of currently blocked clients."""
@@ -546,7 +599,7 @@ class ClientManager:
                 try:
                     note_request = ApiRequest(
                         method="put",
-                        path=f"/rest/user/{client_id}",
+                        path=f"/rest/user/{object_id(client_id, 'client')}",
                         data=note_payload,
                     )
                     await self._connection.request(note_request)
@@ -584,7 +637,7 @@ class ClientManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/user/{client_id}",
+                path=f"/rest/user/{object_id(client_id, 'client')}",
                 data=payload,
             )
             await self._connection.request(api_request)
@@ -666,7 +719,9 @@ class ClientManager:
             if not persisted.get("noted"):
                 noted = dict(persisted)
                 noted["noted"] = True
-                await self._connection.request(ApiRequest(method="put", path=f"/rest/user/{client_id}", data=noted))
+                await self._connection.request(
+                    ApiRequest(method="put", path=f"/rest/user/{object_id(client_id, 'client')}", data=noted)
+                )
                 persisted = await self._get_user_by_mac(client_mac)
                 if persisted is None or not persisted.get("noted"):
                     raise FixedApOperationError("Controller did not persist the client note before fixed AP update")
@@ -677,7 +732,9 @@ class ClientManager:
             # Empty-string and null MAC values are rejected on Network 10.6.
             if fixed_ap_enabled:
                 update["fixed_ap_mac"] = ap_mac
-            await self._connection.request(ApiRequest(method="put", path=f"/rest/user/{client_id}", data=update))
+            await self._connection.request(
+                ApiRequest(method="put", path=f"/rest/user/{object_id(client_id, 'client')}", data=update)
+            )
             self._connection._invalidate_cache(f"{CACHE_PREFIX_CLIENTS}")
 
             readback = await self._get_user_by_mac(client_mac)

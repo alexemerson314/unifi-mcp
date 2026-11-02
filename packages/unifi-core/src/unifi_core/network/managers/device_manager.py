@@ -9,6 +9,7 @@ from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.mac import mac_equal, normalize_mac
 from unifi_core.network.managers.connection_manager import ConnectionManager
 from unifi_core.network.models.devices import normalize_radio_channel, normalize_radio_ht
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -106,7 +107,9 @@ class DeviceManager:
                 return False
             device_id = device.raw["_id"]
 
-            api_request = ApiRequest(method="put", path=f"/rest/device/{device_id}", data={"name": name})
+            api_request = ApiRequest(
+                method="put", path=f"/rest/device/{object_id(device_id, 'device')}", data={"name": name}
+            )
             await self._connection.request(api_request)
             logger.info("Rename command sent for device [redacted] to '[redacted]'")
             self._connection._invalidate_cache(CACHE_PREFIX_DEVICES)
@@ -292,7 +295,7 @@ class DeviceManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/device/{device_id}",
+                path=f"/rest/device/{object_id(device_id, 'device')}",
                 data={"radio_table": radio_table},
             )
             await self._connection.request(api_request)
@@ -417,7 +420,7 @@ class DeviceManager:
         try:
             api_request = ApiRequest(
                 method="get",
-                path=f"/stat/spectrum-scan/{ap_mac}",
+                path=f"/stat/spectrum-scan/{object_id(ap_mac, 'AP MAC')}",
             )
             response = await self._connection.request(api_request)
             result = response if isinstance(response, list) else []
@@ -471,7 +474,7 @@ class DeviceManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/device/{device_id}",
+                path=f"/rest/device/{object_id(device_id, 'device')}",
                 data={"led_override": led_override},
             )
             await self._connection.request(api_request)
@@ -502,7 +505,7 @@ class DeviceManager:
 
             api_request = ApiRequest(
                 method="put",
-                path=f"/rest/device/{device_id}",
+                path=f"/rest/device/{object_id(device_id, 'device')}",
                 data={"disabled": disabled},
             )
             await self._connection.request(api_request)
@@ -658,7 +661,7 @@ class DeviceManager:
 
         api_request = ApiRequest(
             method="put",
-            path=f"/rest/device/{device_id}",
+            path=f"/rest/device/{object_id(device_id, 'device')}",
             data={"outlet_overrides": overrides},
         )
         await self._connection.request(api_request)

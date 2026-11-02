@@ -16,6 +16,7 @@ from aiounifi.models.api import ApiRequestV2
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -162,7 +163,7 @@ class AclManager:
             side = merged_data.get(side_key)
             if isinstance(side, dict) and side.get("mac_mask", "keep") is None:
                 side.pop("mac_mask", None)
-        api_request = ApiRequestV2(method="put", path=f"/acl-rules/{rule_id}", data=merged_data)
+        api_request = ApiRequestV2(method="put", path=f"/acl-rules/{object_id(rule_id, 'ACL rule')}", data=merged_data)
         await self._connection.request(api_request)
         self._invalidate_cache()
         return merged_data
@@ -180,7 +181,7 @@ class AclManager:
             raise ConnectionError("Not connected to controller")
 
         try:
-            api_request = ApiRequestV2(method="delete", path=f"/acl-rules/{rule_id}")
+            api_request = ApiRequestV2(method="delete", path=f"/acl-rules/{object_id(rule_id, 'ACL rule')}")
             await self._connection.request(api_request)
 
             self._invalidate_cache()

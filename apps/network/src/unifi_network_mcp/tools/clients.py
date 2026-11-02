@@ -5,7 +5,7 @@ This module provides MCP tools to manage network clients/devices on a Unifi Netw
 """
 
 import logging
-from typing import Annotated, Any, Dict, Optional
+from typing import Annotated, Any, Dict, Literal, Optional
 
 from mcp.types import ToolAnnotations
 from pydantic import Field, ValidationError
@@ -94,7 +94,8 @@ async def lookup_by_ip(
 )
 async def list_clients(
     filter_type: Annotated[
-        str, Field(description="Filter clients by connection type: 'all' (default), 'wired', or 'wireless'")
+        Literal["all", "wired", "wireless"],
+        Field(description="Filter clients by connection type: 'all' (default), 'wired', or 'wireless'"),
     ] = "all",
     include_offline: Annotated[
         bool,
@@ -473,7 +474,7 @@ async def force_reconnect_client(
 
 @server.tool(
     name="unifi_forget_client",
-    description="Remove/forget a client from the controller's known client history by MAC address. This permanently deletes the client record including its name, notes, fixed IP settings, and historical stats. The client will reappear as a new unknown device if it reconnects.",
+    description="Remove/forget a client from the controller's known client history by MAC address. This permanently deletes the client record including its name, notes, fixed IP settings, and historical stats. The client will reappear as a new unknown device if it reconnects. Only known clients (with a user-table record) can be forgotten; a client that appears only in historical statistics returns an error and nothing is removed.",
     permission_category="clients",
     permission_action="update",
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),

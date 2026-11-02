@@ -1,12 +1,16 @@
 // src/mcp-handler.ts
-import type { JsonRpcRequest, JsonRpcResponse, ToolInfo, AggregatedResponse } from "./types";
-import { PROJECT_WEBSITE_URL, RELAY_SERVER_ICONS } from "./types";
+import type { JsonRpcRequest, JsonRpcResponse, ToolInfo, AggregatedResponse, AgentScope } from "./types";
+import { FULL_AGENT_SCOPE, PROJECT_WEBSITE_URL, RELAY_SERVER_ICONS } from "./types";
 
 /** Interface that the Durable Object will implement */
 export interface RelayStub {
-  getToolList(mode: string): Promise<ToolInfo[]>;
-  handleToolCall(toolName: string, args: Record<string, unknown>): Promise<Record<string, unknown> | AggregatedResponse>;
-  isMultiLocation(): Promise<boolean>;
+  getToolList(mode: string, scope: AgentScope): Promise<ToolInfo[]>;
+  handleToolCall(
+    toolName: string,
+    args: Record<string, unknown>,
+    scope: AgentScope,
+  ): Promise<Record<string, unknown> | AggregatedResponse>;
+  isMultiLocation(scope: AgentScope): Promise<boolean>;
 }
 
 function jsonRpcError(id: string | number, code: number, message: string): JsonRpcResponse {
@@ -21,6 +25,7 @@ export async function handleMcpRequest(
   body: JsonRpcRequest,
   stub: RelayStub,
   mode: string,
+  scope: AgentScope = FULL_AGENT_SCOPE,
 ): Promise<JsonRpcResponse> {
   const { method, params, id } = body;
 
@@ -43,9 +48,9 @@ export async function handleMcpRequest(
   }
 
   if (method === "tools/list") {
-    const multiLocation = await stub.isMultiLocation();
+    const multiLocation = await stub.isMultiLocation(scope);
     const effectiveMode = multiLocation ? "lazy" : mode;
-    const tools = await stub.getToolList(effectiveMode);
+    const tools = await stub.getToolList(effectiveMode, scope);
     return jsonRpcResult(id, { tools });
   }
 
@@ -58,7 +63,7 @@ export async function handleMcpRequest(
     }
 
     try {
-      const result = await stub.handleToolCall(toolName, args);
+      const result = await stub.handleToolCall(toolName, args, scope);
       return jsonRpcResult(id, {
         content: [{ type: "text", text: JSON.stringify(result) }],
       });

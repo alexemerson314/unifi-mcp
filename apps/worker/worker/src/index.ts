@@ -1,53 +1,35 @@
 // src/index.ts
-import type { Env, JsonRpcRequest } from "./types";
-import { validateBearerToken } from "./auth";
+import type { Env } from "./types";
+import { extractBearerToken, validateBearerToken } from "./auth";
+import { corsHeaders } from "./cors";
 
 // Re-export the Durable Object class (required by wrangler)
 export { RelayObject } from "./relay-object";
 
-function corsHeaders(origin?: string | null): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": origin || "",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-}
-
-function jsonResponse(data: unknown, request: Request, status = 200): Response {
-  const origin = request.headers.get("Origin") || "";
-  return Response.json(data, { status, headers: corsHeaders(origin) });
+function jsonResponse(data: unknown, request: Request, env: Env, status = 200): Response {
+  return Response.json(data, { status, headers: corsHeaders(request, env) });
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const origin = request.headers.get("Origin") || "";
 
     // CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+      return new Response(null, { status: 204, headers: corsHeaders(request, env) });
     }
 
     // Health check (no auth)
     if (url.pathname === "/health") {
-      return jsonResponse({ status: "ok" }, request);
+      return jsonResponse({ status: "ok" }, request, env);
     }
 
-    // MCP endpoint (cloud agents — authenticated with AGENT_TOKEN)
+    // MCP endpoint (cloud agents). The DO validates the bearer: the static
+    // AGENT_TOKEN, or a scoped agent token it stores as a SHA-256 hash.
     if (url.pathname === "/mcp" && request.method === "POST") {
-      if (!validateBearerToken(request, env.AGENT_TOKEN)) {
+      const token = extractBearerToken(request);
+      if (!token) {
         return new Response("Unauthorized", { status: 401 });
-      }
-
-      let body: JsonRpcRequest;
-      try {
-        body = (await request.json()) as JsonRpcRequest;
-      } catch {
-        return jsonResponse(
-          { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
-          request,
-          400,
-        );
       }
 
       // Get DO singleton and forward
@@ -56,13 +38,17 @@ export default {
       const doResponse = await doStub.fetch(
         new Request("https://relay-do/mcp", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: await request.text(),
         }),
       );
 
+      if (doResponse.status === 401) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
       const result = await doResponse.json();
-      return jsonResponse(result, request);
+      return jsonResponse(result, request, env, doResponse.status);
     }
 
     // WebSocket upgrade (relay clients — token validated inside DO)
@@ -82,12 +68,13 @@ export default {
       const doResponse = await doStub.fetch(request);
       // Add CORS headers to DO response
       const responseBody = await doResponse.text();
-      return new Response(responseBody, {
+      // A 204 (agent token revoked) must not carry a body, even an empty one.
+      return new Response(doResponse.status === 204 ? null : responseBody, {
         status: doResponse.status,
-        headers: { ...Object.fromEntries(doResponse.headers), ...corsHeaders(origin) },
+        headers: { ...Object.fromEntries(doResponse.headers), ...corsHeaders(request, env) },
       });
     }
 
-    return new Response("Not Found", { status: 404, headers: corsHeaders(origin) });
+    return new Response("Not Found", { status: 404, headers: corsHeaders(request, env) });
   },
 };

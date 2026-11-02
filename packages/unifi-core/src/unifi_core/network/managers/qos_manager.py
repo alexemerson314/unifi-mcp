@@ -6,6 +6,7 @@ from aiounifi.models.api import ApiRequestV2
 from unifi_core.exceptions import UniFiNotFoundError
 from unifi_core.merge import deep_merge
 from unifi_core.network.managers.connection_manager import ConnectionManager
+from unifi_core.request_paths import object_id
 
 logger = logging.getLogger("unifi-network-mcp")
 
@@ -77,7 +78,7 @@ class QosManager:
         merged_data = deep_merge(existing_rule, update_data)
         api_request = ApiRequestV2(
             method="put",
-            path=f"/qos-rules/{rule_id}",
+            path=f"/qos-rules/{object_id(rule_id, 'QoS rule')}",
             data=merged_data,
         )
         await self._connection.request(api_request)
@@ -138,7 +139,7 @@ class QosManager:
             bool: True if successful, False otherwise
         """
         try:
-            api_request = ApiRequestV2(method="delete", path=f"/qos-rules/{rule_id}")
+            api_request = ApiRequestV2(method="delete", path=f"/qos-rules/{object_id(rule_id, 'QoS rule')}")
             await self._connection.request(api_request)
             logger.info("Delete command sent for QoS rule %s", rule_id)
             self._connection._invalidate_cache(f"{CACHE_PREFIX_QOS}_{self._connection.site}")

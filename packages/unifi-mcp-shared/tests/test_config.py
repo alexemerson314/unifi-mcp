@@ -9,24 +9,20 @@ from unifi_core.config import load_yaml_config, setup_logging
 class TestSetupLogging:
     """Tests for setup_logging."""
 
-    def test_returns_named_logger(self):
-        logger = setup_logging("test-app")
+    @pytest.mark.parametrize(
+        ("level_arg", "expected_level"),
+        [
+            ("DEBUG", logging.DEBUG),
+            (None, logging.INFO),
+            ("NOTAREAL", logging.INFO),
+        ],
+    )
+    def test_setup_logging_returns_named_logger_and_sets_level(self, level_arg, expected_level):
+        logger = setup_logging("test-app") if level_arg is None else setup_logging("test-app", level=level_arg)
         assert logger.name == "test-app"
         assert isinstance(logger, logging.Logger)
-
-    def test_sets_root_level(self):
-        setup_logging("test-app", level="DEBUG")
-        assert logging.getLogger().level == logging.DEBUG
-        # Reset
+        assert logging.getLogger().level == expected_level
         setup_logging("test-app", level="INFO")
-
-    def test_defaults_to_info(self):
-        setup_logging("test-app")
-        assert logging.getLogger().level == logging.INFO
-
-    def test_invalid_level_falls_back_to_info(self):
-        setup_logging("test-app", level="NOTAREAL")
-        assert logging.getLogger().level == logging.INFO
 
 
 class TestLoadYamlConfig:

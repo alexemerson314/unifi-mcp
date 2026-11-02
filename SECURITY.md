@@ -56,9 +56,10 @@ UniFi MCP is designed with a **secure-by-default** posture:
 
 ### MCP Transport Trust Boundary
 
-- MCP HTTP does not authenticate callers. Anyone who can reach it can invoke the enabled tools using the server's controller credentials. Allowed Host/Origin checks protect against DNS rebinding; they do not authenticate a network peer.
+- MCP HTTP does not authenticate callers by default. Anyone who can reach it can invoke the enabled tools using the server's controller credentials. Allowed Host/Origin checks protect against DNS rebinding; they do not authenticate a network peer.
+- Setting `UNIFI_MCP_HTTP_AUTH_TOKEN` makes HTTP require one static bearer token on every request ([details](apps/network/docs/transports.md#http-bearer-token)). It has no scopes, expiry or per-client revocation, and it is not encryption: carry it only over TLS or loopback.
 - Package defaults disable HTTP and use a loopback bind address when enabled. Docker Compose explicitly enables HTTP inside its container network and publishes ports 3000–3002 on host `127.0.0.1` only.
-- Remote MCP clients must use the authenticated Cloud Relay gateway or an authenticated TLS reverse proxy. Restrict direct backend access to that proxy; never publish the backend on a LAN/public interface. Trust every process/container with backend access.
+- Remote MCP clients must use the authenticated Cloud Relay gateway, an authenticated TLS reverse proxy, or a TLS tunnel to a backend with the bearer token set. Restrict direct backend access to that proxy; never publish the backend on a LAN/public interface. Trust every process/container with backend access.
 - Use Docker Engine 28.0.0 or newer with ordinary NAT bridge networking. Older Docker engines can expose localhost-published ports to peers on the same network; direct-routing, host-network, and custom firewall configurations require separate access restrictions. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/).
 
 ### Permission System
@@ -74,7 +75,8 @@ UniFi MCP is designed with a **secure-by-default** posture:
 - All state-changing operations use a two-step flow: preview first, then confirm
 - Default call returns a preview of what would change
 - Explicit `confirm=True` is required to execute the mutation
-- The server does not verify human approval or require a previous preview. A client can supply `confirm=True` directly. Human approval must be enforced by the MCP client; `confirm` is an execution guard, not caller authentication or a prompt-injection defense.
+- By default the server does not verify human approval or require a previous preview. A client can supply `confirm=True` directly. Human approval must be enforced by the MCP client; `confirm` is an execution guard, not caller authentication or a prompt-injection defense.
+- `UNIFI_REQUIRE_PREVIEW_TOKEN=true` makes `confirm=True` require a single-use, short-lived token from a preview of the same tool and arguments ([preview tokens](docs/permissions.md#preview-tokens-opt-in)). It proves the previewed request is the one executed, not that a human approved it.
 - `UNIFI_TOOL_PERMISSION_MODE=bypass` can bypass this for automation workflows
 
 ### No Persistent Storage
